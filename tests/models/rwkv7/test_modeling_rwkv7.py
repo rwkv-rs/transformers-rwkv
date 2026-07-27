@@ -318,11 +318,9 @@ class Rwkv7ModelTest(unittest.TestCase):
             deep = torch.full((config.num_hidden_layers, 1, 1, width), 0.5, device="cuda")
 
             with torch.no_grad():
-                for block in model.rwkv7.blocks:
-                    block.ffn.sparse = False
+                model.config.sparse_channel_mix = False
                 dense = model(input_ids=input_ids, deep_embeds=deep).logits
-                for block in model.rwkv7.blocks:
-                    block.ffn.sparse = True
+                model.config.sparse_channel_mix = True
                 sparse = model(input_ids=input_ids, deep_embeds=deep).logits
 
             torch.testing.assert_close(sparse, dense, rtol=1e-3, atol=1e-3, msg=f"DeepEmbed {width_name}")
@@ -343,8 +341,7 @@ class Rwkv7ModelTest(unittest.TestCase):
             model(input_ids=input_ids)  # populates the cache
             model.rwkv7.blocks[0].ffn.value.weight.mul_(3.0)
             after_update = model(input_ids=input_ids).logits
-            for block in model.rwkv7.blocks:
-                block.ffn.sparse = False
+            model.config.sparse_channel_mix = False
             dense = model(input_ids=input_ids).logits
 
         torch.testing.assert_close(after_update, dense, rtol=1e-3, atol=1e-3)

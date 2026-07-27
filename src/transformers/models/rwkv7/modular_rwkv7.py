@@ -339,7 +339,6 @@ class Rwkv7FeedForward(nn.Module):
         self.x_k = nn.Parameter(torch.zeros(1, 1, C))
         self.key = nn.Linear(C, config.intermediate_size, bias=False)
         self.value = nn.Linear(config.intermediate_size, C, bias=False)
-        self.sparse = config.sparse_channel_mix
         self._value_t = None  # [inter, hidden] copy for the sparse path, built lazily
         self._value_fingerprint = None
         self._accumulator = None
@@ -353,30 +352,38 @@ class Rwkv7FeedForward(nn.Module):
         shifted, new_shift_state = self.time_shift(hidden_states, shift_state)
         xk = hidden_states + self.x_k * (shifted - hidden_states)
         inner = torch.relu(self.key(xk)) ** 2
-        if self.sparse and inner.shape[0] * inner.shape[1] == 1 and inner.is_cuda:
-            # Apply DeepEmbed on the same side the dense path does: the "4x" table
-            # scales the channel-mix INPUT (and cannot break sparsity -- it only
-            # rescales, so a zero stays zero), the "1x" table scales its output.
-            if deep_embed is not None and deep_embed.shape[-1] == inner.shape[-1]:
-                inner = inner * deep_embed
-                deep_embed = None
-            out = self._sparse_value(inner.reshape(-1)).view(1, 1, -1)
-            if deep_embed is not None:
-                out = out * deep_embed
-            return out, new_shift_state
-        # RWKV-8 DeepEmbed hook: a per-layer, per-token vector that channelwise
-        # modulates the channel-mix. `deep_embed` is supplied by the caller rather
-        # than stored as a weight — the design keeps the table in RAM/SSD and
-        # prefetches per token, which is what makes it cheap on VRAM. Width
-        # `intermediate_size` reproduces the reference "4x" variant (modulate the
-        # input), width `hidden_size` the "1x" variant (modulate the output).
+
+        # RWKV-8 DeepEmbed: a per-layer, per-token vector that channelwise modulates
+        # the channel-mix, supplied by the caller rather than stored as a weight
+        # because the design keeps the table in RAM/SSD and prefetches per token.
+        # Its width says which side it attaches to -- `intermediate_size` scales the
+        # projection's INPUT (the reference "4x" variant), `hidden_size` its OUTPUT
+        # ("1x"). Resolved once here so both the dense and sparse projections below
+        # see the same decision; splitting it per branch is how the sparse path
+        # silently dropped the 4x variant once already.
+        scale_output = None
         if deep_embed is not None:
             if deep_embed.shape[-1] == inner.shape[-1]:
-                inner = inner * deep_embed
-                return self.value(inner), new_shift_state
-            out = self.value(inner) * deep_embed
-            return out, new_shift_state
-        return self.value(inner), new_shift_state
+                inner = inner * deep_embed  # only rescales, so exact zeros survive
+            else:
+                scale_output = deep_embed
+
+        out = self._project(inner)
+        if scale_output is not None:
+            out = out * scale_output
+        return out, new_shift_state
+
+    def _project(self, inner: torch.Tensor) -> torch.Tensor:
+        """`value(inner)`, sparsely when that is both enabled and worthwhile.
+
+        The sparse kernel decodes one token at a time on CUDA; anything else (a
+        batch, a prefill, CPU) takes the dense projection, which is also what makes
+        the two paths comparable in tests.
+        """
+        single_token = inner.shape[0] * inner.shape[1] == 1
+        if self.config.sparse_channel_mix and single_token and inner.is_cuda:
+            return self._sparse_value(inner.reshape(-1)).view(1, 1, -1)
+        return self.value(inner)
 
     def _sparse_value(self, activation: torch.Tensor) -> torch.Tensor:
         """Value projection over only the nonzero channels of `relu(key(x))**2`.
