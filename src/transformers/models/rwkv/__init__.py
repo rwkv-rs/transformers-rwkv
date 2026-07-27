@@ -20,8 +20,20 @@ from ...utils.import_utils import define_import_structure
 if TYPE_CHECKING:
     from .configuration_rwkv import *
     from .modeling_rwkv import *
+    from .rwkv7.configuration_rwkv7 import *
+    from .rwkv7.modeling_rwkv7 import *
 else:
     import sys
 
     _file = globals()["__file__"]
-    sys.modules[__name__] = _LazyModule(__name__, _file, define_import_structure(_file), module_spec=__spec__)
+    # Include rwkv7 submodule in the lazy import structure
+    _import_structure = define_import_structure(_file)
+    _rwkv7_structure = define_import_structure(
+        __path__[0] + "/rwkv7", prefix="rwkv7"
+    )
+    for key, value in _rwkv7_structure.items():
+        if key in _import_structure:
+            _import_structure[key].update(value)
+        else:
+            _import_structure[key] = value
+    sys.modules[__name__] = _LazyModule(__name__, _file, _import_structure, module_spec=__spec__)
