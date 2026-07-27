@@ -16,8 +16,25 @@
 Kept out of `modeling_rwkv7.py` so the model file stays importable without Triton;
 `sparse_channel_mix_value` there dispatches here and falls back to a dense matmul.
 
+Registered as a custom op rather than called directly: a raw Triton launch is on
+dynamo's skip list, so calling it from the model breaks the graph at every layer
+(21 breaks in a 7.2B forward, measured) and costs about 8% end to end. As an
+opaque op it stays inside the single captured graph.
+
 The weight is indexed `[inter, hidden]` so one selected input channel reads one
-contiguous row. Cross-tile partials land in an fp32 accumulator through atomics,
+contiguous row.
+
+Each program re-derives which of its own input channels are nonzero. Compacting
+the surviving indices into a shared list first is the obvious improvement and was
+tried: it halves this kernel's GPU time in situ (826 -> 415 us/step on a 7.2B
+decode). It is still slower end to end, by 10%. Decoding is a strict dependency
+chain -- layer N+1's activation comes from layer N's output -- so the extra
+launch, and the barrier its data-dependent trip count forces, costs ~1.3 ms/step
+of pipeline bubbles against the 0.43 ms of work it saves. Measure any variant of
+this end to end, not as a standalone kernel; three different standalone harnesses
+each favoured a configuration that lost in the model, by allowing L2 reuse, by
+letting independent iterations overlap, and by using random weights whose
+`relu(x)**2` is ~50% dense instead of ~7%. Cross-tile partials land in an fp32 accumulator through atomics,
 and the finalize pass re-zeros that accumulator as it casts, so no separate clear
 is ever launched.
 """
@@ -65,7 +82,8 @@ def _sparse_finalize_kernel(acc_ptr, out_ptr, hidden, BLOCK: tl.constexpr):
     tl.store(acc_ptr + offs, tl.zeros([BLOCK], dtype=tl.float32), mask=mask)
 
 
-def triton_sparse_value(activation, weight_t, accumulator):
+@torch.library.custom_op("rwkv7::sparse_channel_mix_value", mutates_args={"accumulator"})
+def triton_sparse_value(activation: torch.Tensor, weight_t: torch.Tensor, accumulator: torch.Tensor) -> torch.Tensor:
     inter, hidden = weight_t.shape
     out = torch.empty(hidden, device=activation.device, dtype=activation.dtype)
     block_h, block_i = 1024, 16
@@ -81,3 +99,8 @@ def triton_sparse_value(activation, weight_t, accumulator):
     )
     _sparse_finalize_kernel[(triton.cdiv(hidden, 256),)](accumulator, out, hidden, BLOCK=256)
     return out
+
+
+@triton_sparse_value.register_fake
+def _(activation, weight_t, accumulator):
+    return torch.empty(weight_t.shape[1], device=activation.device, dtype=activation.dtype)

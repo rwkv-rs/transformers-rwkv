@@ -186,6 +186,24 @@ def rwkv7_chunked(
     return torch.cat(outputs, dim=1).to(dtype), state
 
 
+_SPARSE_OP_READY = False
+
+
+def _ensure_sparse_op() -> bool:
+    """Import the Triton kernels once, outside anything that gets traced.
+
+    A lazy `import` inside the forward is itself on dynamo's skip list, so doing
+    this on the hot path breaks the graph at every layer even when the kernel is a
+    properly registered custom op.
+    """
+    global _SPARSE_OP_READY
+    if not _SPARSE_OP_READY and is_triton_available():
+        from . import sparse_channel_mix  # noqa: F401  (registers the op)
+
+        _SPARSE_OP_READY = True
+    return _SPARSE_OP_READY
+
+
 def sparse_channel_mix_value(
     activation: torch.Tensor, weight_t: torch.Tensor, accumulator: torch.Tensor
 ) -> torch.Tensor:
@@ -201,10 +219,8 @@ def sparse_channel_mix_value(
     launch overhead rather than by the weight stream — measured both ways.
     Falls back to a dense matmul when Triton is unavailable.
     """
-    if is_triton_available():
-        from .sparse_channel_mix import triton_sparse_value
-
-        return triton_sparse_value(activation, weight_t, accumulator)
+    if _SPARSE_OP_READY:
+        return torch.ops.rwkv7.sparse_channel_mix_value(activation, weight_t, accumulator)
     return torch.nn.functional.linear(activation, weight_t.t())
 
 
@@ -395,6 +411,7 @@ class Rwkv7FeedForward(nn.Module):
         """
         weight = self.value.weight
         if not torch.compiler.is_compiling():
+            _ensure_sparse_op()
             # Tie the cache to the weight's identity AND its in-place version, so a
             # `mul_`, a fresh load, or a replaced parameter all invalidate it. A
             # cache that silently survives a weight change is worse than no cache.
