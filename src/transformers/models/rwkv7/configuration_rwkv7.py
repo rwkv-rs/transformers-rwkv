@@ -1,0 +1,148 @@
+# Copyright 2026 The RWKV team and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""RWKV-7 (Goose) model configuration."""
+
+from ...configuration_utils import PreTrainedConfig
+
+
+class Rwkv7Config(PreTrainedConfig):
+    r"""
+    Configuration for [`Rwkv7Model`], an all-recurrent (attention-free) RWKV-7 "Goose"
+    model. Instantiating with the defaults yields the ~0.1B RWKV-7 configuration.
+
+    Parameter names follow the upstream RWKV reference implementation
+    (`BlinkDL/RWKV-LM`) rather than a renamed variant, so converting a native
+    `.pth` checkpoint is close to a rename-free copy.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 65536):
+            Vocabulary size (RWKV "world" tokenizer).
+        hidden_size (`int`, *optional*, defaults to 768):
+            Model width `C`.
+        num_hidden_layers (`int`, *optional*, defaults to 12):
+            Number of blocks.
+        head_dim (`int`, *optional*, defaults to 64):
+            Width of one WKV head. `hidden_size` must be divisible by it.
+        num_heads (`int`, *optional*, defaults to 12):
+            Number of WKV heads; must equal `hidden_size // head_dim`.
+        decay_low_rank_dim (`int`, *optional*, defaults to 64):
+            Rank of the decay (`w`) LoRA.
+        a_low_rank_dim (`int`, *optional*, defaults to 64):
+            Rank of the in-context-learning-rate (`a`) LoRA.
+        v_low_rank_dim (`int`, *optional*, defaults to 32):
+            Rank of the value-residual (`v`) LoRA. Unused on layer 0, which
+            *produces* `v_first` instead of mixing towards it.
+        gate_low_rank_dim (`int`, *optional*, defaults to 128):
+            Rank of the output-gate (`g`) LoRA.
+        intermediate_size (`int`, *optional*, defaults to 3072):
+            Channel-mix inner width (`hidden_ratio * hidden_size` by convention).
+        hidden_ratio (`float`, *optional*, defaults to 4.0):
+            Used to derive `intermediate_size` when it is not given explicitly.
+        hidden_act (`str`, *optional*, defaults to `"sqrelu"`):
+            Channel-mix activation. RWKV-7 uses squared ReLU.
+        norm_eps (`float`, *optional*, defaults to 1e-5):
+            Epsilon of every LayerNorm/GroupNorm in the model.
+        norm_bias (`bool`, *optional*, defaults to `True`):
+            Whether the norms carry a bias.
+        max_position_embeddings (`int`, *optional*, defaults to 8192):
+            Training context length. RWKV is recurrent and not bounded by it at
+            inference; it only sizes generation defaults.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the input embedding and the LM head.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether to return the recurrent state.
+        use_deep_embed (`bool`, *optional*, defaults to `False`):
+            Enable the RWKV-8 "DeepEmbed" hook: a per-layer, per-token vector that
+            channelwise-modulates the channel-mix. The table is deliberately NOT a
+            model weight — it is meant to live in RAM/SSD and be prefetched per
+            token, which is the whole point of the design (VRAM savings) — so it is
+            passed to the forward as `deep_embeds` instead. No RWKV-7 checkpoint
+            carries one; this is an extension point, off by default.
+        deep_embed_size (`int`, *optional*):
+            Width of one layer's DeepEmbed vector. `hidden_size` reproduces the
+            reference "1x" variant (modulating the channel-mix output);
+            `intermediate_size` reproduces "4x" (modulating its input). Defaults to
+            `hidden_size` when `use_deep_embed` is set.
+
+    ```python
+    >>> from transformers import Rwkv7Config, Rwkv7Model
+
+    >>> configuration = Rwkv7Config()
+    >>> model = Rwkv7Model(configuration)
+    >>> configuration = model.config
+    ```"""
+
+    model_type = "rwkv7"
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    def __init__(
+        self,
+        vocab_size=65536,
+        hidden_size=768,
+        num_hidden_layers=12,
+        head_dim=64,
+        num_heads=12,
+        decay_low_rank_dim=64,
+        a_low_rank_dim=64,
+        v_low_rank_dim=32,
+        gate_low_rank_dim=128,
+        intermediate_size=3072,
+        hidden_ratio=4.0,
+        hidden_act="sqrelu",
+        norm_eps=1e-5,
+        norm_bias=True,
+        max_position_embeddings=8192,
+        tie_word_embeddings=False,
+        use_cache=True,
+        use_deep_embed=False,
+        deep_embed_size=None,
+        bos_token_id=0,
+        eos_token_id=0,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.decay_low_rank_dim = decay_low_rank_dim
+        self.a_low_rank_dim = a_low_rank_dim
+        self.v_low_rank_dim = v_low_rank_dim
+        self.gate_low_rank_dim = gate_low_rank_dim
+        self.hidden_ratio = hidden_ratio
+        self.intermediate_size = (
+            intermediate_size if intermediate_size is not None else int(hidden_size * hidden_ratio)
+        )
+        self.hidden_act = hidden_act
+        self.norm_eps = norm_eps
+        self.norm_bias = norm_bias
+        self.max_position_embeddings = max_position_embeddings
+        self.use_cache = use_cache
+        self.use_deep_embed = use_deep_embed
+        self.deep_embed_size = deep_embed_size if deep_embed_size is not None else hidden_size
+
+        if hidden_size % head_dim != 0:
+            raise ValueError(f"hidden_size {hidden_size} must be divisible by head_dim {head_dim}")
+        if num_heads != hidden_size // head_dim:
+            raise ValueError(f"num_heads must be hidden_size // head_dim = {hidden_size // head_dim}, got {num_heads}")
+
+        super().__init__(
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+
+
+__all__ = ["Rwkv7Config"]

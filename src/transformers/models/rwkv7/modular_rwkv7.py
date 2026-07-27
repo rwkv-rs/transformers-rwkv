@@ -1,0 +1,493 @@
+# Copyright 2026 The RWKV team and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch RWKV-7 ("Goose") model.
+
+Attention-free and fully recurrent: state is O(1) in sequence length, so there is
+no KV cache and no attention mask over past tokens.
+
+NAMING. Submodule and parameter names follow the upstream RWKV reference
+(`BlinkDL/RWKV-LM`) — `blocks.N.att.{receptance,key,value,output}`, the LoRA
+factors as raw `w1/w2`-style parameters rather than `nn.Linear` pairs, `emb`,
+`head`, `ln0/ln1/ln2`, `att.ln_x` — so that converting a native `.pth` is a copy
+rather than a rename table. That is a deliberate departure from the `rwkv` (v4)
+port in this repo, whose renamed parameters make every conversion script carry
+its own mapping.
+
+Per-layer time-mix (att):
+    shifted = prev_token(x);  x_* = x + x_*·(shifted - x)     for * in r,w,k,v,a,g
+    r = receptance(xr); k = key(xk); v = value(xv)
+    w_log = -e^-0.5 · sigmoid( tanh(xw @ w1) @ w2 + w0 )              # log decay
+    a     = sigmoid( xa @ a1 @ a2 + a0 )                              # in-context LR
+    g     = sigmoid(xg @ g1) @ g2                                     # output gate
+    v    += (v_first - v) · sigmoid( xv @ v1 @ v2 + v0 )              # layer > 0
+    kk = l2norm_per_head(k · k_k);  k = k + k·(a - 1)·k_a
+    y  = WKV(r, w_log, k, v, kk, a)
+    y  = ln_x(y) + (r·k·r_k).sum(-1, keepdim) · v ;  out = output(y · g)
+
+Channel-mix (ffn):
+    shifted = prev_token(x);  xk = x + x_k·(shifted - x)
+    out = value(relu(key(xk))**2)
+"""
+
+from dataclasses import dataclass
+
+import torch
+import torch.utils.checkpoint
+from torch import nn
+
+from ...generation import GenerationMixin
+from ...modeling_layers import GradientCheckpointingLayer
+from ...modeling_utils import PreTrainedModel
+from ...utils import ModelOutput, auto_docstring, logging
+from .configuration_rwkv7 import Rwkv7Config
+
+
+logger = logging.get_logger(__name__)
+
+# e^-0.5. The decay LoRA emits w_log = -INV_SQRT_E * sigmoid(...), so the
+# per-step decay exp(w_log) lies in (e^-0.5, 1) — see RWKV-7 reference.
+_INV_SQRT_E = 0.6065306597126334
+
+
+def rwkv7_recurrent(
+    r: torch.Tensor,
+    w_log: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kk: torch.Tensor,
+    a: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference RWKV-7 WKV recurrence (generalised delta rule), fp32.
+
+    All inputs are `[batch, seq_len, num_heads, head_dim]`; `state` is
+    `[batch, num_heads, head_dim, head_dim]` and is carried across calls.
+
+    Per token, with `S` the per-head state and every product outer over the two
+    head_dim axes::
+
+        decay = exp(w_log)
+        sa    = (-kk) @ S                 # uses the PRE-update state
+        S     = decay * S + (kk * a) ⊗ sa + k ⊗ v
+        out   = r @ S                     # uses the POST-update state
+
+    The state axes are (key, value); `S[i, j]` accumulates key channel `i` against
+    value channel `j`. Accumulation is fp32 regardless of the activation dtype —
+    the recurrence is unrolled over the whole sequence, so a lower-precision state
+    drifts. This is the portable path; a fused kernel may replace it as long as it
+    reproduces these values.
+    """
+    batch, seq_len, num_heads, head_dim = r.shape
+    dtype = r.dtype
+    r, w_log, k, v, kk, a = (t.float() for t in (r, w_log, k, v, kk, a))
+    state = state.float()
+    out = torch.empty(batch, seq_len, num_heads, head_dim, device=r.device, dtype=torch.float32)
+
+    for t in range(seq_len):
+        decay = torch.exp(w_log[:, t])[..., None]  # [B, H, K, 1]
+        kk_t = kk[:, t]
+        b = (kk_t * a[:, t])[..., None]  # [B, H, K, 1]
+        # sa[b, h, j] = sum_i (-kk[b, h, i]) * S[b, h, i, j]
+        sa = torch.einsum("bhi,bhij->bhj", -kk_t, state)[:, :, None, :]  # [B, H, 1, V]
+        state = decay * state + b * sa + k[:, t][..., None] * v[:, t][:, :, None, :]
+        out[:, t] = torch.einsum("bhi,bhij->bhj", r[:, t], state)
+
+    return out.to(dtype), state
+
+
+class Rwkv7TokenShift(nn.Module):
+    """`prev_token(x)`: the previous token's hidden state, zero at sequence start.
+
+    Carries one vector per layer per stream across forward calls, which is what
+    makes incremental decoding exact rather than approximate.
+    """
+
+    def forward(self, x: torch.Tensor, shift_state: torch.Tensor | None):
+        # x: [batch, seq_len, hidden]; shift_state: [batch, hidden] or None
+        if shift_state is None:
+            prev = torch.zeros_like(x[:, :1])
+        else:
+            prev = shift_state[:, None]
+        shifted = torch.cat([prev, x[:, :-1]], dim=1)
+        return shifted, x[:, -1]
+
+
+class Rwkv7Attention(nn.Module):
+    """RWKV-7 time-mixing block (the recurrent replacement for self-attention)."""
+
+    def __init__(self, config: Rwkv7Config, layer_id: int):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        C = config.hidden_size
+        self.hidden_size = C
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+
+        self.time_shift = Rwkv7TokenShift()
+
+        # per-channel token-shift mixes (kept at Bo's (1, 1, C) shape)
+        self.x_r = nn.Parameter(torch.zeros(1, 1, C))
+        self.x_w = nn.Parameter(torch.zeros(1, 1, C))
+        self.x_k = nn.Parameter(torch.zeros(1, 1, C))
+        self.x_v = nn.Parameter(torch.zeros(1, 1, C))
+        self.x_a = nn.Parameter(torch.zeros(1, 1, C))
+        self.x_g = nn.Parameter(torch.zeros(1, 1, C))
+
+        # LoRA factors as raw tensors, exactly as the reference stores them
+        self.w1 = nn.Parameter(torch.zeros(C, config.decay_low_rank_dim))
+        self.w2 = nn.Parameter(torch.zeros(config.decay_low_rank_dim, C))
+        self.w0 = nn.Parameter(torch.zeros(1, 1, C))
+        self.a1 = nn.Parameter(torch.zeros(C, config.a_low_rank_dim))
+        self.a2 = nn.Parameter(torch.zeros(config.a_low_rank_dim, C))
+        self.a0 = nn.Parameter(torch.zeros(1, 1, C))
+        self.g1 = nn.Parameter(torch.zeros(C, config.gate_low_rank_dim))
+        self.g2 = nn.Parameter(torch.zeros(config.gate_low_rank_dim, C))
+        # The value-residual LoRA exists on every layer in a reference checkpoint,
+        # but layer 0 PRODUCES v_first instead of mixing towards it, so its copy is
+        # never read. It is registered anyway so that loading is lossless.
+        self.v1 = nn.Parameter(torch.zeros(C, config.v_low_rank_dim))
+        self.v2 = nn.Parameter(torch.zeros(config.v_low_rank_dim, C))
+        self.v0 = nn.Parameter(torch.zeros(1, 1, C))
+
+        self.k_k = nn.Parameter(torch.zeros(1, 1, C))
+        self.k_a = nn.Parameter(torch.zeros(1, 1, C))
+        self.r_k = nn.Parameter(torch.zeros(config.num_heads, config.head_dim))
+
+        self.receptance = nn.Linear(C, C, bias=False)
+        self.key = nn.Linear(C, C, bias=False)
+        self.value = nn.Linear(C, C, bias=False)
+        self.output = nn.Linear(C, C, bias=False)
+        # GroupNorm over heads, matching the reference's per-head normalisation.
+        self.ln_x = nn.GroupNorm(config.num_heads, C, eps=config.norm_eps * config.num_heads)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        v_first: torch.Tensor | None,
+        shift_state: torch.Tensor | None,
+        wkv_state: torch.Tensor | None,
+    ):
+        batch, seq_len, C = hidden_states.shape
+        H, N = self.num_heads, self.head_dim
+
+        shifted, new_shift_state = self.time_shift(hidden_states, shift_state)
+        delta = shifted - hidden_states
+        xr = hidden_states + self.x_r * delta
+        xw = hidden_states + self.x_w * delta
+        xk = hidden_states + self.x_k * delta
+        xv = hidden_states + self.x_v * delta
+        xa = hidden_states + self.x_a * delta
+        xg = hidden_states + self.x_g * delta
+
+        r = self.receptance(xr)
+        k = self.key(xk)
+        v = self.value(xv)
+
+        w_log = -_INV_SQRT_E * torch.sigmoid(torch.tanh(xw @ self.w1) @ self.w2 + self.w0)
+        a = torch.sigmoid(xa @ self.a1 @ self.a2 + self.a0)
+        g = torch.sigmoid(xg @ self.g1) @ self.g2
+
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            v = v + (v_first - v) * torch.sigmoid(xv @ self.v1 @ self.v2 + self.v0)
+
+        kk = k * self.k_k
+        kk = torch.nn.functional.normalize(kk.view(batch, seq_len, H, N), dim=-1, p=2.0).view(batch, seq_len, C)
+        k = k * (1 + (a - 1) * self.k_a)
+
+        if wkv_state is None:
+            wkv_state = torch.zeros(batch, H, N, N, device=r.device, dtype=torch.float32)
+
+        def _heads(t):
+            return t.view(batch, seq_len, H, N)
+
+        y, wkv_state = rwkv7_recurrent(
+            _heads(r), _heads(w_log), _heads(k), _heads(v), _heads(kk), _heads(a), wkv_state
+        )
+
+        y = self.ln_x(y.view(batch * seq_len, C)).view(batch, seq_len, C)
+        # r·k·r_k summed per head, broadcast back over the head's value channels
+        bonus = ((_heads(r) * _heads(k) * self.r_k).sum(dim=-1, keepdim=True) * _heads(v)).view(batch, seq_len, C)
+        y = self.output((y + bonus) * g)
+        return y, v_first, new_shift_state, wkv_state
+
+
+class Rwkv7FeedForward(nn.Module):
+    """RWKV-7 channel-mixing block: squared-ReLU over a single token shift."""
+
+    def __init__(self, config: Rwkv7Config, layer_id: int):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        C = config.hidden_size
+        self.time_shift = Rwkv7TokenShift()
+        self.x_k = nn.Parameter(torch.zeros(1, 1, C))
+        self.key = nn.Linear(C, config.intermediate_size, bias=False)
+        self.value = nn.Linear(config.intermediate_size, C, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shift_state: torch.Tensor | None,
+        deep_embed: torch.Tensor | None = None,
+    ):
+        shifted, new_shift_state = self.time_shift(hidden_states, shift_state)
+        xk = hidden_states + self.x_k * (shifted - hidden_states)
+        inner = torch.relu(self.key(xk)) ** 2
+        # RWKV-8 DeepEmbed hook: a per-layer, per-token vector that channelwise
+        # modulates the channel-mix. `deep_embed` is supplied by the caller rather
+        # than stored as a weight — the design keeps the table in RAM/SSD and
+        # prefetches per token, which is what makes it cheap on VRAM. Width
+        # `intermediate_size` reproduces the reference "4x" variant (modulate the
+        # input), width `hidden_size` the "1x" variant (modulate the output).
+        if deep_embed is not None:
+            if deep_embed.shape[-1] == inner.shape[-1]:
+                inner = inner * deep_embed
+                return self.value(inner), new_shift_state
+            out = self.value(inner) * deep_embed
+            return out, new_shift_state
+        return self.value(inner), new_shift_state
+
+
+class Rwkv7Block(GradientCheckpointingLayer):
+    def __init__(self, config: Rwkv7Config, layer_id: int):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        eps, bias = config.norm_eps, config.norm_bias
+        # Layer 0 carries the extra input norm of the reference implementation.
+        if layer_id == 0:
+            self.ln0 = nn.LayerNorm(config.hidden_size, eps=eps, bias=bias)
+        self.ln1 = nn.LayerNorm(config.hidden_size, eps=eps, bias=bias)
+        self.ln2 = nn.LayerNorm(config.hidden_size, eps=eps, bias=bias)
+        self.att = Rwkv7Attention(config, layer_id)
+        self.ffn = Rwkv7FeedForward(config, layer_id)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        v_first: torch.Tensor | None,
+        state: list | None,
+        deep_embed: torch.Tensor | None = None,
+    ):
+        if self.layer_id == 0:
+            hidden_states = self.ln0(hidden_states)
+
+        att_shift = state[0][self.layer_id] if state is not None else None
+        ffn_shift = state[1][self.layer_id] if state is not None else None
+        wkv = state[2][self.layer_id] if state is not None else None
+
+        attn_out, v_first, att_shift, wkv = self.att(self.ln1(hidden_states), v_first, att_shift, wkv)
+        hidden_states = hidden_states + attn_out
+
+        ffn_out, ffn_shift = self.ffn(self.ln2(hidden_states), ffn_shift, deep_embed)
+        hidden_states = hidden_states + ffn_out
+
+        if state is not None:
+            state[0][self.layer_id] = att_shift
+            state[1][self.layer_id] = ffn_shift
+            state[2][self.layer_id] = wkv
+        return hidden_states, v_first, state
+
+
+@dataclass
+class Rwkv7Output(ModelOutput):
+    r"""
+    state (`list[torch.FloatTensor]`, *optional*):
+        The recurrent state: `[att_shift, ffn_shift, wkv]`, where the shifts are
+        `[num_layers, batch, hidden]` and `wkv` is
+        `[num_layers, batch, num_heads, head_dim, head_dim]`. Feed it back to
+        continue a sequence; it replaces the KV cache and is O(1) in length.
+    """
+
+    last_hidden_state: torch.FloatTensor | None = None
+    state: list[torch.FloatTensor] | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+
+
+@dataclass
+class Rwkv7CausalLMOutput(ModelOutput):
+    r"""
+    state (`list[torch.FloatTensor]`, *optional*):
+        The recurrent state, as in [`Rwkv7Output`].
+    """
+
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    state: list[torch.FloatTensor] | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+
+
+@auto_docstring
+class Rwkv7PreTrainedModel(PreTrainedModel):
+    config: Rwkv7Config
+    base_model_prefix = "rwkv7"
+    _no_split_modules = ["Rwkv7Block"]
+    supports_gradient_checkpointing = True
+    _is_stateful = True
+
+
+@auto_docstring
+class Rwkv7Model(Rwkv7PreTrainedModel):
+    def __init__(self, config: Rwkv7Config):
+        super().__init__(config)
+        self.emb = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.blocks = nn.ModuleList([Rwkv7Block(config, i) for i in range(config.num_hidden_layers)])
+        self.ln_out = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+        self.gradient_checkpointing = False
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.emb
+
+    def set_input_embeddings(self, new_embeddings):
+        self.emb = new_embeddings
+
+    def _empty_state(self, batch: int, device, dtype) -> list:
+        cfg = self.config
+        L, C, H, N = cfg.num_hidden_layers, cfg.hidden_size, cfg.num_heads, cfg.head_dim
+        return [
+            torch.zeros(L, batch, C, device=device, dtype=dtype),
+            torch.zeros(L, batch, C, device=device, dtype=dtype),
+            torch.zeros(L, batch, H, N, N, device=device, dtype=torch.float32),
+        ]
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        state: list[torch.FloatTensor] | None = None,
+        deep_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> tuple | Rwkv7Output:
+        r"""
+        state (`list[torch.FloatTensor]`, *optional*):
+            Recurrent state returned by a previous call; pass it back to continue
+            the sequence.
+        deep_embeds (`torch.FloatTensor`, *optional*):
+            RWKV-8 DeepEmbed vectors for this batch, shaped
+            `[num_layers, batch, seq_len, deep_embed_size]` (or broadcastable).
+            Only meaningful when `config.use_deep_embed` is set; the table itself is
+            external to the checkpoint by design.
+        """
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds")
+        if inputs_embeds is None:
+            inputs_embeds = self.emb(input_ids)
+
+        if use_cache and state is None:
+            state = self._empty_state(inputs_embeds.shape[0], inputs_embeds.device, inputs_embeds.dtype)
+
+        hidden_states = inputs_embeds
+        v_first = None
+        all_hidden_states = () if output_hidden_states else None
+
+        for block in self.blocks:
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+            layer_deep_embed = deep_embeds[block.layer_id] if deep_embeds is not None else None
+            hidden_states, v_first, state = block(hidden_states, v_first, state, layer_deep_embed)
+
+        hidden_states = self.ln_out(hidden_states)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(x for x in (hidden_states, state, all_hidden_states) if x is not None)
+        return Rwkv7Output(last_hidden_state=hidden_states, state=state, hidden_states=all_hidden_states)
+
+
+@auto_docstring
+class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"head.weight": "rwkv7.emb.weight"}
+
+    def __init__(self, config: Rwkv7Config):
+        super().__init__(config)
+        self.rwkv7 = Rwkv7Model(config)
+        self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def get_output_embeddings(self):
+        return self.head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.head = new_embeddings
+
+    def prepare_inputs_for_generation(self, input_ids, state=None, inputs_embeds=None, **kwargs):
+        # Recurrent: once a state exists only the newest token is needed.
+        if state is not None:
+            input_ids = input_ids[:, -1:]
+        model_inputs = (
+            {"input_ids": input_ids}
+            if inputs_embeds is None or state is not None
+            else {"inputs_embeds": inputs_embeds}
+        )
+        model_inputs["state"] = state
+        model_inputs.update({k: v for k, v in kwargs.items() if k in ("use_cache", "deep_embeds")})
+        return model_inputs
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        state: list[torch.FloatTensor] | None = None,
+        deep_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> tuple | Rwkv7CausalLMOutput:
+        r"""
+        state (`list[torch.FloatTensor]`, *optional*):
+            Recurrent state returned by a previous call.
+        deep_embeds (`torch.FloatTensor`, *optional*):
+            RWKV-8 DeepEmbed vectors; see [`Rwkv7Model.forward`].
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        outputs = self.rwkv7(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            state=state,
+            deep_embeds=deep_embeds,
+            use_cache=use_cache,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            **kwargs,
+        )
+        logits = self.head(outputs.last_hidden_state)
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits, labels, self.config.vocab_size, **kwargs)
+
+        if not return_dict:
+            return (loss, logits, outputs.state) if loss is not None else (logits, outputs.state)
+        return Rwkv7CausalLMOutput(loss=loss, logits=logits, state=outputs.state, hidden_states=outputs.hidden_states)
+
+
+__all__ = ["Rwkv7PreTrainedModel", "Rwkv7Model", "Rwkv7ForCausalLM"]
