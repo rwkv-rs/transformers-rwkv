@@ -24,7 +24,19 @@ opaque op it stays inside the single captured graph.
 The weight is indexed `[inter, hidden]` so one selected input channel reads one
 contiguous row.
 
-Each program re-derives which of its own input channels are nonzero. Compacting
+The launch geometry below is the best of five structures measured in situ, and
+the two that looked most promising on paper are the two that lost:
+
+  tile-scan, (inter/16, hidden/1024) grid   826 us/step   <- shipped
+  compacted indices, one extra launch       415 us/step   but +1.3 ms of bubbles
+  scalar re-read instead of a reduction     837 us/step
+  input axis moved off the grid (512 prog)  1043 us/step
+  coarse output tiles, few programs         far worse
+
+Cutting the atomic traffic by using fewer, fatter programs makes it *slower*: the
+serial work per program grows faster than the atomics shrink, and a few hundred
+programs cannot cover memory latency on this card. Each program re-derives which
+of its own input channels are nonzero. Compacting
 the surviving indices into a shared list first is the obvious improvement and was
 tried: it halves this kernel's GPU time in situ (826 -> 415 us/step on a 7.2B
 decode). It is still slower end to end, by 10%. Decoding is a strict dependency
