@@ -148,6 +148,89 @@ class Rwkv7ModelTest(unittest.TestCase):
         torch.testing.assert_close(masked, alone, rtol=1e-5, atol=1e-5)
         self.assertGreater(untreated, 100 * max(treated, 1e-9))
 
+    def test_packed_batch_matches_each_sequence_run_alone(self):
+        """A varlen (packed) row must decode exactly like its sequences separately.
+
+        Two things reach across a boundary and both have to be cut: the recurrent
+        state, which restarts per segment, and the token shift, which otherwise
+        hands a segment's first token the *previous* sequence's last hidden state.
+        The control at the end is what makes this test mean something -- it fails
+        if packing happened to be harmless, which would leave the first assertion
+        proving nothing.
+        """
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        lengths = [4, 3, 5]
+        segments = [torch.randint(1, config.vocab_size, (1, n), device=torch_device) for n in lengths]
+        packed = torch.cat(segments, dim=1)
+        cu_seq_lens = torch.tensor([0, 4, 7, 12], device=torch_device)
+
+        with torch.no_grad():
+            together = model(input_ids=packed, cu_seq_lens=cu_seq_lens).logits[0]
+            naive = model(input_ids=packed).logits[0]
+
+        start = 0
+        for segment, n in zip(segments, lengths):
+            with torch.no_grad():
+                alone = model(input_ids=segment).logits[0]
+            torch.testing.assert_close(together[start : start + n], alone, rtol=1e-5, atol=1e-5)
+            start += n
+
+        packing_damage = (naive - together).abs().max().item()
+        self.assertGreater(packing_damage, 1e-6)
+
+    def test_packed_batch_rejects_a_malformed_boundary_list(self):
+        """A wrong `cu_seq_lens` must raise, not split the recurrence somewhere else.
+
+        Nothing downstream can notice a bad boundary list: the model still returns
+        fluent logits, just computed from states that restarted in the wrong places.
+        """
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        ids = torch.randint(1, config.vocab_size, (1, 6), device=torch_device)
+
+        for bad in ([1, 3, 6], [0, 3, 5], [0, 3, 8]):
+            with self.assertRaises(ValueError):
+                model(input_ids=ids, cu_seq_lens=torch.tensor(bad, device=torch_device))
+
+        with self.assertRaises(ValueError):  # packing describes one row, not a batch
+            model(
+                input_ids=ids.repeat(2, 1),
+                cu_seq_lens=torch.tensor([0, 3, 6], device=torch_device),
+            )
+
+    def test_wkv_implementation_is_selectable(self):
+        """The recurrence is looked up by name, so a kernel can be dropped in.
+
+        Registering a wrapper and selecting it must route every call through it and
+        leave the output identical -- that is what makes the registry a seam rather
+        than a second code path.
+        """
+        from transformers.models.rwkv7.modeling_rwkv7 import RWKV7_WKV_FUNCTIONS, rwkv7_eager
+
+        calls = []
+
+        def counting_wkv(*args, **kwargs):
+            calls.append(1)
+            return rwkv7_eager(*args, **kwargs)
+
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        ids = torch.randint(0, config.vocab_size, (1, 5), device=torch_device)
+        with torch.no_grad():
+            expected = model(input_ids=ids).logits
+
+        RWKV7_WKV_FUNCTIONS["counting"] = counting_wkv
+        try:
+            model.config.wkv_implementation = "counting"
+            with torch.no_grad():
+                got = model(input_ids=ids).logits
+        finally:
+            del RWKV7_WKV_FUNCTIONS["counting"]
+
+        self.assertEqual(len(calls), config.num_hidden_layers)
+        self.assertTrue(torch.equal(expected, got))
+
     def test_mask_without_padding_is_a_no_op(self):
         """An all-ones mask must not perturb the unpadded path at all.
 

@@ -75,6 +75,13 @@ class Rwkv7Config(PreTrainedConfig):
             the whole sequence, so a narrow state drifts; `"float32"` with fp16
             activations is the combination the reference implementation uses.
             `"float16"`/`"bfloat16"` trade that for a smaller state.
+        wkv_implementation (`str`, *optional*, defaults to `"eager"`):
+            Which WKV recurrence to use, by name, from
+            `models.rwkv7.modeling_rwkv7.RWKV7_WKV_FUNCTIONS`. `"eager"` is the
+            portable PyTorch path — the sequential step when decoding, the
+            chunk-parallel form otherwise, and per-segment when a packed batch is
+            passed. Register an entry in that mapping to plug in a fused or varlen
+            kernel without forking the model.
         sparse_channel_mix (`bool`, *optional*, defaults to `False`):
             Skip the channel-mix value-projection rows whose input channel is zero.
             The activation is a squared ReLU, so its zeros are exact and skipping
@@ -121,6 +128,7 @@ class Rwkv7Config(PreTrainedConfig):
         use_deep_embed=False,
         deep_embed_size=None,
         wkv_state_dtype="float32",
+        wkv_implementation="eager",
         sparse_channel_mix=False,
         bos_token_id=0,
         eos_token_id=0,
@@ -149,6 +157,7 @@ class Rwkv7Config(PreTrainedConfig):
         if wkv_state_dtype not in ("float32", "float16", "bfloat16"):
             raise ValueError(f"wkv_state_dtype must be float32/float16/bfloat16, got {wkv_state_dtype}")
         self.wkv_state_dtype = wkv_state_dtype
+        self.wkv_implementation = wkv_implementation
         self.sparse_channel_mix = sparse_channel_mix
 
         if hidden_size % head_dim != 0:

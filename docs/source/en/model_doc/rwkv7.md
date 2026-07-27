@@ -63,6 +63,43 @@ row shorter than the longest one. `generate` passes the mask through for you; an
 all-ones mask costs nothing and changes nothing, and a single decoded token skips the
 handling entirely.
 
+### Packed (varlen) batches
+
+When the lengths in a batch vary a lot, padding is expensive twice over for a
+recurrent model — the pads cost time as well as memory, because every one of them
+is a step of the recurrence. Pack the sequences into a single row instead and pass
+`cu_seq_lens`, the cumulative boundaries starting at 0 and ending at `seq_len`:
+
+```python
+packed = torch.cat([a, b, c], dim=1)                     # [1, len(a)+len(b)+len(c)]
+cu_seq_lens = torch.tensor([0, a.shape[1], a.shape[1] + b.shape[1], packed.shape[1]])
+out = model(input_ids=packed, cu_seq_lens=cu_seq_lens)
+```
+
+Each segment then decodes exactly as if it had been run on its own: the recurrent
+state restarts at every boundary, and so does the token shift, which would
+otherwise hand a segment's first token the previous sequence's last hidden state.
+A malformed boundary list raises rather than quietly restarting the recurrence in
+the wrong places.
+
+### Swapping the WKV kernel
+
+The recurrence is the one part worth replacing — everything around it is ordinary
+linear algebra — so it is looked up by name instead of hard-coded:
+
+```python
+from transformers.models.rwkv7.modeling_rwkv7 import RWKV7_WKV_FUNCTIONS
+
+RWKV7_WKV_FUNCTIONS["my_kernel"] = my_wkv
+model = Rwkv7ForCausalLM.from_pretrained(checkpoint, wkv_implementation="my_kernel")
+```
+
+An entry receives `[batch, seq_len, num_heads, head_dim]` tensors for `r, w_log, k,
+v, kk, a`, the `[batch, num_heads, head_dim, head_dim]` state, and `cu_seq_lens` as
+a keyword, and returns `(output, new_state)`. The contract is to reproduce
+`rwkv7_recurrent`, which is also what the test suite checks against — so a fused or
+varlen kernel drops in without forking the model.
+
 ### Performance notes
 
 Prefill runs a chunk-parallel form of the recurrence rather than a per-token loop:

@@ -38,13 +38,26 @@ class Rwkv7TokenShift(nn.Module):
     makes incremental decoding exact rather than approximate.
     """
 
-    def forward(self, x: torch.Tensor, shift_state: torch.Tensor | None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        shift_state: torch.Tensor | None,
+        cu_seq_lens: torch.Tensor | None = None,
+    ):
         # x: [batch, seq_len, hidden]; shift_state: [batch, hidden] or None
         if shift_state is None:
             prev = torch.zeros_like(x[:, :1])
         else:
             prev = shift_state[:, None]
         shifted = torch.cat([prev, x[:, :-1]], dim=1)
+        if cu_seq_lens is not None:
+            # In a packed row the token before a segment's first one belongs to the
+            # PREVIOUS sequence. Resetting the recurrent state per segment does not
+            # cover this — the shift reaches back through it — so the first token of
+            # each segment gets the zero shift a sequence start is supposed to see.
+            positions = torch.arange(x.shape[1], device=x.device)
+            starts = (positions[:, None] == cu_seq_lens[None, :-1]).any(dim=1)
+            shifted = torch.where(starts[None, :, None], torch.zeros_like(shifted), shifted)
         return shifted, x[:, -1]
 
 
@@ -178,6 +191,53 @@ def rwkv7_chunked(
     return torch.cat(outputs, dim=1).to(dtype), state
 
 
+def rwkv7_eager(
+    r: torch.Tensor,
+    w_log: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kk: torch.Tensor,
+    a: torch.Tensor,
+    state: torch.Tensor,
+    cu_seq_lens: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable WKV: the sequential step for a single token, chunk-parallel otherwise.
+
+    With `cu_seq_lens` the row is a *packed* batch — several independent sequences
+    laid end to end, the layout a varlen kernel consumes. Each one has to start
+    from a fresh state, so they are run in turn and their outputs concatenated;
+    the state returned is the last segment's, which is the one a continuation
+    would resume from. This is the reference behaviour, not the fast path: a
+    fused varlen kernel does the same segments in one launch, which is exactly
+    the kind of implementation [`RWKV7_WKV_FUNCTIONS`] exists to let you drop in.
+    """
+    if cu_seq_lens is not None:
+        bounds = cu_seq_lens.tolist()
+        outputs = []
+        for start, stop in zip(bounds[:-1], bounds[1:]):
+            if stop <= start:
+                continue
+            segment_state = torch.zeros_like(state)
+            out, state = rwkv7_eager(
+                r[:, start:stop],
+                w_log[:, start:stop],
+                k[:, start:stop],
+                v[:, start:stop],
+                kk[:, start:stop],
+                a[:, start:stop],
+                segment_state,
+            )
+            outputs.append(out)
+        return torch.cat(outputs, dim=1), state
+
+    kernel = rwkv7_recurrent if r.shape[1] == 1 else rwkv7_chunked
+    return kernel(r, w_log, k, v, kk, a, state)
+
+
+RWKV7_WKV_FUNCTIONS = {"eager": rwkv7_eager}
+
+
 class Rwkv7Attention(nn.Module):
     """RWKV-7 time-mixing block (the recurrent replacement for self-attention)."""
 
@@ -235,11 +295,12 @@ class Rwkv7Attention(nn.Module):
         shift_state: torch.Tensor | None,
         wkv_state: torch.Tensor | None,
         keep: torch.Tensor | None = None,
+        cu_seq_lens: torch.Tensor | None = None,
     ):
         batch, seq_len, C = hidden_states.shape
         H, N = self.num_heads, self.head_dim
 
-        shifted, new_shift_state = self.time_shift(hidden_states, shift_state)
+        shifted, new_shift_state = self.time_shift(hidden_states, shift_state, cu_seq_lens)
         delta = shifted - hidden_states
         xr = hidden_states + self.x_r * delta
         xw = hidden_states + self.x_w * delta
@@ -279,8 +340,17 @@ class Rwkv7Attention(nn.Module):
         def _heads(t):
             return t.view(batch, seq_len, H, N)
 
-        kernel = rwkv7_recurrent if seq_len == 1 else rwkv7_chunked
-        y, wkv_state = kernel(_heads(r), _heads(w_log), _heads(k), _heads(v), _heads(kk), _heads(a), wkv_state)
+        wkv = RWKV7_WKV_FUNCTIONS[self.config.wkv_implementation]
+        y, wkv_state = wkv(
+            _heads(r),
+            _heads(w_log),
+            _heads(k),
+            _heads(v),
+            _heads(kk),
+            _heads(a),
+            wkv_state,
+            cu_seq_lens=cu_seq_lens,
+        )
 
         y = self.ln_x(y.view(batch * seq_len, C)).view(batch, seq_len, C)
         # r·k·r_k summed per head, broadcast back over the head's value channels
@@ -348,8 +418,9 @@ class Rwkv7FeedForward(nn.Module):
         hidden_states: torch.Tensor,
         shift_state: torch.Tensor | None,
         deep_embed: torch.Tensor | None = None,
+        cu_seq_lens: torch.Tensor | None = None,
     ):
-        shifted, new_shift_state = self.time_shift(hidden_states, shift_state)
+        shifted, new_shift_state = self.time_shift(hidden_states, shift_state, cu_seq_lens)
         xk = hidden_states + self.x_k * (shifted - hidden_states)
         inner = torch.relu(self.key(xk)) ** 2
 
@@ -430,6 +501,7 @@ class Rwkv7Block(GradientCheckpointingLayer):
         state: list | None,
         deep_embed: torch.Tensor | None = None,
         keep: torch.Tensor | None = None,
+        cu_seq_lens: torch.Tensor | None = None,
     ):
         if self.layer_id == 0:
             hidden_states = self.ln0(hidden_states)
@@ -445,13 +517,13 @@ class Rwkv7Block(GradientCheckpointingLayer):
         attn_in = self.ln1(hidden_states)
         if keep is not None:
             attn_in = attn_in * keep
-        attn_out, v_first, att_shift, wkv = self.att(attn_in, v_first, att_shift, wkv, keep)
+        attn_out, v_first, att_shift, wkv = self.att(attn_in, v_first, att_shift, wkv, keep, cu_seq_lens)
         hidden_states = hidden_states + attn_out
 
         ffn_in = self.ln2(hidden_states)
         if keep is not None:
             ffn_in = ffn_in * keep
-        ffn_out, ffn_shift = self.ffn(ffn_in, ffn_shift, deep_embed)
+        ffn_out, ffn_shift = self.ffn(ffn_in, ffn_shift, deep_embed, cu_seq_lens)
         hidden_states = hidden_states + ffn_out
 
         if state is not None:
@@ -544,6 +616,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         state: list[torch.FloatTensor] | None = None,
         deep_embeds: torch.FloatTensor | None = None,
+        cu_seq_lens: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
@@ -558,6 +631,13 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             `[num_layers, batch, seq_len, deep_embed_size]` (or broadcastable).
             Only meaningful when `config.use_deep_embed` is set; the table itself is
             external to the checkpoint by design.
+        cu_seq_lens (`torch.LongTensor`, *optional*):
+            Cumulative sequence lengths for a *packed* batch — several sequences
+            concatenated into one row instead of padded to a rectangle, starting at
+            0 and ending at `seq_len`. Each segment then decodes from a fresh
+            recurrent state, as if it had been run on its own. This is the varlen
+            layout; use it instead of padding when the lengths vary a lot, since a
+            recurrent model pays for pad tokens in time as well as memory.
         """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -582,6 +662,21 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         if attention_mask is not None and inputs_embeds.shape[1] > 1:
             keep = attention_mask[:, -inputs_embeds.shape[1] :, None].to(inputs_embeds.dtype)
 
+        if cu_seq_lens is not None:
+            # Checked rather than trusted: a malformed boundary list does not fail,
+            # it silently splits the recurrence in the wrong places and returns
+            # fluent output computed from the wrong states.
+            if inputs_embeds.shape[0] != 1:
+                raise ValueError(
+                    f"cu_seq_lens describes one packed row, but got batch size {inputs_embeds.shape[0]}. "
+                    "Pack the sequences into a single row, or use attention_mask with a padded batch."
+                )
+            if cu_seq_lens.ndim != 1 or cu_seq_lens[0] != 0 or cu_seq_lens[-1] != inputs_embeds.shape[1]:
+                raise ValueError(
+                    f"cu_seq_lens must be 1-D, start at 0 and end at seq_len ({inputs_embeds.shape[1]}); "
+                    f"got {cu_seq_lens.tolist()}"
+                )
+
         hidden_states = inputs_embeds
         v_first = None
         all_hidden_states = () if output_hidden_states else None
@@ -590,7 +685,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             layer_deep_embed = deep_embeds[block.layer_id] if deep_embeds is not None else None
-            hidden_states, v_first, state = block(hidden_states, v_first, state, layer_deep_embed, keep)
+            hidden_states, v_first, state = block(hidden_states, v_first, state, layer_deep_embed, keep, cu_seq_lens)
 
         hidden_states = self.ln_out(hidden_states)
         if output_hidden_states:
