@@ -234,6 +234,7 @@ class Rwkv7Attention(nn.Module):
         v_first: torch.Tensor | None,
         shift_state: torch.Tensor | None,
         wkv_state: torch.Tensor | None,
+        keep: torch.Tensor | None = None,
     ):
         batch, seq_len, C = hidden_states.shape
         H, N = self.num_heads, self.head_dim
@@ -254,6 +255,14 @@ class Rwkv7Attention(nn.Module):
         w_log = -_INV_SQRT_E * torch.sigmoid(torch.tanh(xw @ self.w1) @ self.w2 + self.w0)
         a = torch.sigmoid(xa @ self.a1 @ self.a2 + self.a0)
         g = torch.sigmoid(xg @ self.g1) @ self.g2
+
+        if keep is not None:
+            # A padding position has to leave the recurrent state exactly as it
+            # found it. The caller zeroes those positions, and all three
+            # projections are bias-free, so k, v and kk are already zero there --
+            # the update term k v^T is gone. What survives is the decay, and
+            # w = exp(0) = 1 turns the transition into the identity.
+            w_log = w_log * keep
 
         if self.layer_id == 0:
             v_first = v
@@ -420,6 +429,7 @@ class Rwkv7Block(GradientCheckpointingLayer):
         v_first: torch.Tensor | None,
         state: list | None,
         deep_embed: torch.Tensor | None = None,
+        keep: torch.Tensor | None = None,
     ):
         if self.layer_id == 0:
             hidden_states = self.ln0(hidden_states)
@@ -428,10 +438,20 @@ class Rwkv7Block(GradientCheckpointingLayer):
         ffn_shift = state[1][self.layer_id] if state is not None else None
         wkv = state[2][self.layer_id] if state is not None else None
 
-        attn_out, v_first, att_shift, wkv = self.att(self.ln1(hidden_states), v_first, att_shift, wkv)
+        # Padding is blanked AFTER each norm, not before: a LayerNorm maps the zero
+        # vector to its own bias, so masking the residual stream instead would let
+        # every pad position come back to life on the way into the next mixer -- and
+        # a live pad both moves the state and leaks into the next token's shift.
+        attn_in = self.ln1(hidden_states)
+        if keep is not None:
+            attn_in = attn_in * keep
+        attn_out, v_first, att_shift, wkv = self.att(attn_in, v_first, att_shift, wkv, keep)
         hidden_states = hidden_states + attn_out
 
-        ffn_out, ffn_shift = self.ffn(self.ln2(hidden_states), ffn_shift, deep_embed)
+        ffn_in = self.ln2(hidden_states)
+        if keep is not None:
+            ffn_in = ffn_in * keep
+        ffn_out, ffn_shift = self.ffn(ffn_in, ffn_shift, deep_embed)
         hidden_states = hidden_states + ffn_out
 
         if state is not None:
@@ -520,6 +540,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         state: list[torch.FloatTensor] | None = None,
         deep_embeds: torch.FloatTensor | None = None,
@@ -552,6 +573,15 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         if use_cache and state is None:
             state = self._empty_state(inputs_embeds.shape[0], inputs_embeds.device, inputs_embeds.dtype)
 
+        # An attention-free recurrence has to be told where the padding is: pads are
+        # fed through the recurrence like any other token, so a left-padded batch
+        # (what `generate` produces) would otherwise start every short row from a
+        # state the pads had already moved. A single decoded token is never padding,
+        # so the decode step takes none of this.
+        keep = None
+        if attention_mask is not None and inputs_embeds.shape[1] > 1:
+            keep = attention_mask[:, -inputs_embeds.shape[1] :, None].to(inputs_embeds.dtype)
+
         hidden_states = inputs_embeds
         v_first = None
         all_hidden_states = () if output_hidden_states else None
@@ -560,7 +590,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             layer_deep_embed = deep_embeds[block.layer_id] if deep_embeds is not None else None
-            hidden_states, v_first, state = block(hidden_states, v_first, state, layer_deep_embed)
+            hidden_states, v_first, state = block(hidden_states, v_first, state, layer_deep_embed, keep)
 
         hidden_states = self.ln_out(hidden_states)
         if output_hidden_states:
@@ -597,13 +627,14 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
             else {"inputs_embeds": inputs_embeds}
         )
         model_inputs["state"] = state
-        model_inputs.update({k: v for k, v in kwargs.items() if k in ("use_cache", "deep_embeds")})
+        model_inputs.update({k: v for k, v in kwargs.items() if k in ("use_cache", "deep_embeds", "attention_mask")})
         return model_inputs
 
     @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         state: list[torch.FloatTensor] | None = None,
         deep_embeds: torch.FloatTensor | None = None,
@@ -622,6 +653,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         outputs = self.rwkv7(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             state=state,
             deep_embeds=deep_embeds,

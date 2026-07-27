@@ -118,6 +118,52 @@ class Rwkv7ModelTest(unittest.TestCase):
         torch.testing.assert_close(batched[0], batched[2], rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(batched[0], alone[0], rtol=1e-4, atol=1e-4)
 
+    def test_left_padded_row_matches_the_same_row_alone(self):
+        """Padding must leave the recurrent state exactly where it found it.
+
+        `generate` left-pads a batch, so the pads run through the recurrence
+        *before* the real tokens. There is no per-position attention mask for an
+        all-recurrent model to hide behind: unless the padding is neutralised, a
+        short row starts from a state the pads have already moved. The second
+        assertion keeps this test honest -- it fails if the padding happened to be
+        harmless here, which would make the first assertion prove nothing. It is
+        written as a ratio because an absolute floor only holds for one fixture:
+        every weight here is drawn at 0.05, so the whole model works in small
+        numbers and the untreated damage lands around 1e-6, not 1e-2.
+        """
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        real = torch.randint(1, config.vocab_size, (1, 4), device=torch_device)
+        pads = torch.zeros(1, 3, dtype=real.dtype, device=torch_device)
+        padded = torch.cat([pads, real], dim=1)
+        mask = torch.tensor([[0, 0, 0, 1, 1, 1, 1]], device=torch_device)
+
+        with torch.no_grad():
+            alone = model(input_ids=real).logits[0, -1]
+            masked = model(input_ids=padded, attention_mask=mask).logits[0, -1]
+            ignored = model(input_ids=padded).logits[0, -1]
+
+        treated = (masked - alone).abs().max().item()
+        untreated = (ignored - alone).abs().max().item()
+        torch.testing.assert_close(masked, alone, rtol=1e-5, atol=1e-5)
+        self.assertGreater(untreated, 100 * max(treated, 1e-9))
+
+    def test_mask_without_padding_is_a_no_op(self):
+        """An all-ones mask must not perturb the unpadded path at all.
+
+        `generate` passes a mask on every call, padded or not, so the common case
+        has to come out bit-identical -- not merely close.
+        """
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        ids = torch.randint(0, config.vocab_size, (2, 5), device=torch_device)
+
+        with torch.no_grad():
+            without = model(input_ids=ids).logits
+            with_ones = model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
+
+        self.assertTrue(torch.equal(without, with_ones))
+
     def test_layer_zero_value_residual_lora_is_unused(self):
         """Layer 0 produces `v_first`; it must never mix towards it.
 

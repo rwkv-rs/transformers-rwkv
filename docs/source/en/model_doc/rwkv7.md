@@ -52,6 +52,17 @@ out = model(**inputs, use_cache=True)
 next_out = model(input_ids=next_token, state=out.state, use_cache=True)
 ```
 
+### Padded batches
+
+Pass `attention_mask` whenever a batch is padded. There is no attention to mask here —
+padding is neutralised inside the recurrence instead, by holding the state transition at
+the identity for those positions, so a padded row decodes exactly as if it had been run
+on its own. Without the mask the padding is fed through the recurrence like any other
+token and moves the state before the real tokens arrive, which silently corrupts every
+row shorter than the longest one. `generate` passes the mask through for you; an
+all-ones mask costs nothing and changes nothing, and a single decoded token skips the
+handling entirely.
+
 ### Performance notes
 
 Prefill runs a chunk-parallel form of the recurrence rather than a per-token loop:
