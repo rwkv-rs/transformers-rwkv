@@ -21,7 +21,7 @@ not equivalent to having read the whole prefix. Those are what these tests pin.
 import unittest
 
 from transformers import Rwkv7Config, is_torch_available
-from transformers.testing_utils import require_torch, torch_device
+from transformers.testing_utils import require_torch, require_torch_gpu, torch_device
 
 
 if is_torch_available():
@@ -225,3 +225,126 @@ class Rwkv7ModelTest(unittest.TestCase):
             torch.testing.assert_close(
                 out_state, reference_state, rtol=2e-4, atol=2e-4, msg=f"state chunk={chunk_size}"
             )
+
+    def test_wkv_state_dtype_is_configurable(self):
+        """The state precision is independent of the activation dtype.
+
+        The recurrence is unrolled over the whole sequence, so the state is where
+        precision actually matters; the config exposes it separately for that
+        reason. fp32 must stay closer to a fp64 rollout than fp16 does.
+        """
+        from transformers.models.rwkv7.modeling_rwkv7 import rwkv7_recurrent
+
+        torch.manual_seed(0)
+        shape = (1, 24, 2, 8)
+        r = torch.randn(shape, device=torch_device)
+        w_log = -0.6065306597126334 * torch.sigmoid(torch.randn(shape, device=torch_device))
+        k = torch.randn(shape, device=torch_device)
+        v = torch.randn(shape, device=torch_device)
+        kk = torch.nn.functional.normalize(torch.randn(shape, device=torch_device), dim=-1)
+        a = torch.sigmoid(torch.randn(shape, device=torch_device))
+        state = torch.zeros(1, 2, 8, 8, device=torch_device)
+
+        truth, _ = rwkv7_recurrent(
+            r.double(),
+            w_log.double(),
+            k.double(),
+            v.double(),
+            kk.double(),
+            a.double(),
+            state.double(),
+            compute_dtype=torch.float64,
+        )
+        fp32, s32 = rwkv7_recurrent(r, w_log, k, v, kk, a, state.clone(), compute_dtype=torch.float32)
+        fp16, s16 = rwkv7_recurrent(
+            r.half(),
+            w_log.half(),
+            k.half(),
+            v.half(),
+            kk.half(),
+            a.half(),
+            state.clone().half(),
+            compute_dtype=torch.float16,
+        )
+        self.assertEqual(s32.dtype, torch.float32)
+        self.assertEqual(s16.dtype, torch.float16)
+        err32 = (fp32.double() - truth).abs().max().item()
+        err16 = (fp16.double() - truth).abs().max().item()
+        self.assertLess(err32, err16, f"fp32 state ({err32:.3e}) should beat fp16 ({err16:.3e})")
+
+        for bad in ("float8", "int8"):
+            with self.assertRaises(ValueError):
+                _tiny_config(wkv_state_dtype=bad)
+
+    def test_sparse_channel_mix_matches_dense(self):
+        """Skipping zero channels must be exact, not merely close.
+
+        `relu(x)**2` produces exact zeros and `0 * w == 0`, so the sparse path is
+        the same sum with terms that contribute nothing left out. Only the
+        accumulation dtype differs from the dense reference, so fp32 inputs let
+        this be compared tightly.
+        """
+        from transformers.models.rwkv7.modeling_rwkv7 import sparse_channel_mix_value
+
+        torch.manual_seed(0)
+        inter, hidden = 512, 128
+        weight_t = torch.randn(inter, hidden, device=torch_device) * 0.02
+        act = torch.randn(inter, device=torch_device)
+        act[torch.rand(inter, device=torch_device) > 0.07] = 0.0  # exact zeros, as relu^2 gives
+        accumulator = torch.zeros(hidden, device=torch_device, dtype=torch.float32)
+
+        dense = torch.nn.functional.linear(act, weight_t.t())
+        sparse = sparse_channel_mix_value(act, weight_t, accumulator)
+        torch.testing.assert_close(sparse, dense, rtol=1e-5, atol=1e-5)
+
+        # an all-zero activation must give exactly zero, and leave the accumulator clean
+        zeros = sparse_channel_mix_value(torch.zeros_like(act), weight_t, accumulator)
+        self.assertEqual(zeros.abs().max().item(), 0.0)
+        self.assertEqual(accumulator.abs().max().item(), 0.0)
+
+    @require_torch_gpu
+    def test_sparse_path_agrees_with_dense_including_deep_embed(self):
+        """The sparse channel-mix must be a pure optimisation, DeepEmbed included.
+
+        Both DeepEmbed widths are checked because they attach on opposite sides of
+        the value projection: the `intermediate_size` table scales its input and the
+        `hidden_size` one its output. An implementation that applies only the second
+        passes a plain sparse-vs-dense check and is still wrong.
+        """
+        for width_name, width in (("1x", 32), ("4x", 64)):
+            config = _tiny_config(use_deep_embed=True, deep_embed_size=width, sparse_channel_mix=True)
+            model = _randomised(Rwkv7ForCausalLM(config)).to("cuda")
+            input_ids = torch.randint(0, config.vocab_size, (1, 1), device="cuda")
+            deep = torch.full((config.num_hidden_layers, 1, 1, width), 0.5, device="cuda")
+
+            with torch.no_grad():
+                for block in model.rwkv7.blocks:
+                    block.ffn.sparse = False
+                dense = model(input_ids=input_ids, deep_embeds=deep).logits
+                for block in model.rwkv7.blocks:
+                    block.ffn.sparse = True
+                sparse = model(input_ids=input_ids, deep_embeds=deep).logits
+
+            torch.testing.assert_close(sparse, dense, rtol=1e-3, atol=1e-3, msg=f"DeepEmbed {width_name}")
+
+    @require_torch_gpu
+    def test_sparse_cache_follows_weight_updates(self):
+        """The transposed copy the sparse path keeps must not outlive its weight.
+
+        A cache that silently survives a weight change turns every later forward
+        into a wrong answer with no error, which is the worst failure mode
+        available here.
+        """
+        config = _tiny_config(sparse_channel_mix=True)
+        model = _randomised(Rwkv7ForCausalLM(config)).to("cuda")
+        input_ids = torch.randint(0, config.vocab_size, (1, 1), device="cuda")
+
+        with torch.no_grad():
+            model(input_ids=input_ids)  # populates the cache
+            model.rwkv7.blocks[0].ffn.value.weight.mul_(3.0)
+            after_update = model(input_ids=input_ids).logits
+            for block in model.rwkv7.blocks:
+                block.ffn.sparse = False
+            dense = model(input_ids=input_ids).logits
+
+        torch.testing.assert_close(after_update, dense, rtol=1e-3, atol=1e-3)

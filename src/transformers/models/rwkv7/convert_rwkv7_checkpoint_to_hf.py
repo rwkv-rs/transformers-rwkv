@@ -42,9 +42,11 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 
 import torch
+from safetensors.torch import save_file
 
 from transformers.models.rwkv7 import Rwkv7Config, Rwkv7ForCausalLM
 
@@ -154,16 +156,29 @@ def convert(checkpoint, flavour, config_path, output_dir, dtype="float32"):
     else:
         config = _infer_config(converted)
 
-    model = Rwkv7ForCausalLM(config)
-    missing, unexpected = model.load_state_dict(converted, strict=False)
+    # Check the key set against a meta-device skeleton rather than a real model:
+    # a 7B checkpoint would otherwise need the full weights twice over in RAM.
+    with torch.device("meta"):
+        skeleton = Rwkv7ForCausalLM(config)
+    expected = set(skeleton.state_dict())
+    unexpected = sorted(set(converted) - expected)
     # layer 0's value-residual LoRA is legitimately absent from `fla` checkpoints
-    missing = [k for k in missing if not re.search(r"blocks\.0\.att\.v[012]$", k)]
+    missing = sorted(k for k in expected - set(converted) if not re.search(r"blocks\.0\.att\.v[012]$", k))
     if missing or unexpected:
         raise RuntimeError(f"state dict mismatch: missing={missing}, unexpected={unexpected}")
+    for key in expected - set(converted):  # fill the legitimately-absent ones
+        converted[key] = torch.zeros(skeleton.state_dict()[key].shape)
 
-    model = model.to(getattr(torch, dtype))
-    model.save_pretrained(output_dir)
-    print(f"wrote {output_dir} ({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params)")
+    target = getattr(torch, dtype)
+    converted = {k: v.to(target).contiguous() for k, v in converted.items()}
+
+    os.makedirs(output_dir, exist_ok=True)
+    save_file(converted, os.path.join(output_dir, "model.safetensors"), metadata={"format": "pt"})
+    config.architectures = ["Rwkv7ForCausalLM"]
+    config.dtype = dtype
+    config.save_pretrained(output_dir)
+    total = sum(v.numel() for v in converted.values())
+    print(f"wrote {output_dir} ({total / 1e6:.1f}M params, {dtype})")
 
 
 def _infer_config(converted):

@@ -69,6 +69,19 @@ class Rwkv7Config(PreTrainedConfig):
             token, which is the whole point of the design (VRAM savings) — so it is
             passed to the forward as `deep_embeds` instead. No RWKV-7 checkpoint
             carries one; this is an extension point, off by default.
+        wkv_state_dtype (`str`, *optional*, defaults to `"float32"`):
+            Precision the recurrent WKV state is carried and accumulated in,
+            independently of the activation dtype. The recurrence is unrolled over
+            the whole sequence, so a narrow state drifts; `"float32"` with fp16
+            activations is the combination the reference implementation uses.
+            `"float16"`/`"bfloat16"` trade that for a smaller state.
+        sparse_channel_mix (`bool`, *optional*, defaults to `False`):
+            Skip the channel-mix value-projection rows whose input channel is zero.
+            The activation is a squared ReLU, so its zeros are exact and skipping
+            them is exact too; on a 7.2B checkpoint only ~7% of channels are
+            nonzero, and that projection is a third of the model's bytes. Costs a
+            transposed copy of the value weight (about +30% weights), built lazily,
+            and only pays once launches are captured — see the model doc.
         deep_embed_size (`int`, *optional*):
             Width of one layer's DeepEmbed vector. `hidden_size` reproduces the
             reference "1x" variant (modulating the channel-mix output);
@@ -107,6 +120,8 @@ class Rwkv7Config(PreTrainedConfig):
         use_cache=True,
         use_deep_embed=False,
         deep_embed_size=None,
+        wkv_state_dtype="float32",
+        sparse_channel_mix=False,
         bos_token_id=0,
         eos_token_id=0,
         **kwargs,
@@ -131,6 +146,10 @@ class Rwkv7Config(PreTrainedConfig):
         self.use_cache = use_cache
         self.use_deep_embed = use_deep_embed
         self.deep_embed_size = deep_embed_size if deep_embed_size is not None else hidden_size
+        if wkv_state_dtype not in ("float32", "float16", "bfloat16"):
+            raise ValueError(f"wkv_state_dtype must be float32/float16/bfloat16, got {wkv_state_dtype}")
+        self.wkv_state_dtype = wkv_state_dtype
+        self.sparse_channel_mix = sparse_channel_mix
 
         if hidden_size % head_dim != 0:
             raise ValueError(f"hidden_size {hidden_size} must be divisible by head_dim {head_dim}")

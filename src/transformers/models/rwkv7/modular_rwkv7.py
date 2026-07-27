@@ -50,6 +50,7 @@ from ...generation import GenerationMixin
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel
 from ...utils import ModelOutput, auto_docstring, logging
+from ...utils.import_utils import is_triton_available
 from .configuration_rwkv7 import Rwkv7Config
 
 
@@ -68,8 +69,9 @@ def rwkv7_recurrent(
     kk: torch.Tensor,
     a: torch.Tensor,
     state: torch.Tensor,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference RWKV-7 WKV recurrence (generalised delta rule), fp32.
+    """Reference RWKV-7 WKV recurrence (generalised delta rule).
 
     All inputs are `[batch, seq_len, num_heads, head_dim]`; `state` is
     `[batch, num_heads, head_dim, head_dim]` and is carried across calls.
@@ -90,9 +92,9 @@ def rwkv7_recurrent(
     """
     batch, seq_len, num_heads, head_dim = r.shape
     dtype = r.dtype
-    r, w_log, k, v, kk, a = (t.float() for t in (r, w_log, k, v, kk, a))
-    state = state.float()
-    out = torch.empty(batch, seq_len, num_heads, head_dim, device=r.device, dtype=torch.float32)
+    r, w_log, k, v, kk, a = (t.to(compute_dtype) for t in (r, w_log, k, v, kk, a))
+    state = state.to(compute_dtype)
+    out = torch.empty(batch, seq_len, num_heads, head_dim, device=r.device, dtype=compute_dtype)
 
     for t in range(seq_len):
         decay = torch.exp(w_log[:, t])[..., None]  # [B, H, K, 1]
@@ -115,6 +117,7 @@ def rwkv7_chunked(
     a: torch.Tensor,
     state: torch.Tensor,
     chunk_size: int = 16,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunk-parallel form of [`rwkv7_recurrent`], for sequences.
 
@@ -140,8 +143,8 @@ def rwkv7_chunked(
     """
     batch, seq_len, num_heads, head_dim = r.shape
     dtype = r.dtype
-    r, w_log, k, v, kk, a = (t.float() for t in (r, w_log, k, v, kk, a))
-    state = state.float()
+    r, w_log, k, v, kk, a = (t.to(compute_dtype) for t in (r, w_log, k, v, kk, a))
+    state = state.to(compute_dtype)
     outputs = []
 
     for start in range(0, seq_len, chunk_size):
@@ -183,6 +186,28 @@ def rwkv7_chunked(
     return torch.cat(outputs, dim=1).to(dtype), state
 
 
+def sparse_channel_mix_value(
+    activation: torch.Tensor, weight_t: torch.Tensor, accumulator: torch.Tensor
+) -> torch.Tensor:
+    """`out = activation @ weight_t`, reading only the rows the input selects.
+
+    `activation` is `relu(key(x))**2`, so its zeros are EXACT and a zero channel
+    contributes exactly nothing — skipping its weight row is not an approximation.
+    On a 7.2B checkpoint ~93% of channels are zero while this projection is a third
+    of the model's bytes, which is why it is worth a kernel at all.
+
+    Only pays when kernel launches are captured (`torch.compile` with CUDA graphs).
+    Eagerly it LOSES to one dense cuBLAS call, because the step is then bound by
+    launch overhead rather than by the weight stream — measured both ways.
+    Falls back to a dense matmul when Triton is unavailable.
+    """
+    if is_triton_available():
+        from .sparse_channel_mix import triton_sparse_value
+
+        return triton_sparse_value(activation, weight_t, accumulator)
+    return torch.nn.functional.linear(activation, weight_t.t())
+
+
 class Rwkv7TokenShift(nn.Module):
     """`prev_token(x)`: the previous token's hidden state, zero at sequence start.
 
@@ -211,6 +236,7 @@ class Rwkv7Attention(nn.Module):
         self.hidden_size = C
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
+        self.state_dtype = getattr(torch, config.wkv_state_dtype)
 
         self.time_shift = Rwkv7TokenShift()
 
@@ -286,7 +312,7 @@ class Rwkv7Attention(nn.Module):
         k = k * (1 + (a - 1) * self.k_a)
 
         if wkv_state is None:
-            wkv_state = torch.zeros(batch, H, N, N, device=r.device, dtype=torch.float32)
+            wkv_state = torch.zeros(batch, H, N, N, device=r.device, dtype=self.state_dtype)
 
         def _heads(t):
             return t.view(batch, seq_len, H, N)
@@ -313,6 +339,10 @@ class Rwkv7FeedForward(nn.Module):
         self.x_k = nn.Parameter(torch.zeros(1, 1, C))
         self.key = nn.Linear(C, config.intermediate_size, bias=False)
         self.value = nn.Linear(config.intermediate_size, C, bias=False)
+        self.sparse = config.sparse_channel_mix
+        self._value_t = None  # [inter, hidden] copy for the sparse path, built lazily
+        self._value_fingerprint = None
+        self._accumulator = None
 
     def forward(
         self,
@@ -323,6 +353,17 @@ class Rwkv7FeedForward(nn.Module):
         shifted, new_shift_state = self.time_shift(hidden_states, shift_state)
         xk = hidden_states + self.x_k * (shifted - hidden_states)
         inner = torch.relu(self.key(xk)) ** 2
+        if self.sparse and inner.shape[0] * inner.shape[1] == 1 and inner.is_cuda:
+            # Apply DeepEmbed on the same side the dense path does: the "4x" table
+            # scales the channel-mix INPUT (and cannot break sparsity -- it only
+            # rescales, so a zero stays zero), the "1x" table scales its output.
+            if deep_embed is not None and deep_embed.shape[-1] == inner.shape[-1]:
+                inner = inner * deep_embed
+                deep_embed = None
+            out = self._sparse_value(inner.reshape(-1)).view(1, 1, -1)
+            if deep_embed is not None:
+                out = out * deep_embed
+            return out, new_shift_state
         # RWKV-8 DeepEmbed hook: a per-layer, per-token vector that channelwise
         # modulates the channel-mix. `deep_embed` is supplied by the caller rather
         # than stored as a weight — the design keeps the table in RAM/SSD and
@@ -336,6 +377,28 @@ class Rwkv7FeedForward(nn.Module):
             out = self.value(inner) * deep_embed
             return out, new_shift_state
         return self.value(inner), new_shift_state
+
+    def _sparse_value(self, activation: torch.Tensor) -> torch.Tensor:
+        """Value projection over only the nonzero channels of `relu(key(x))**2`.
+
+        The transposed weight is built on first use rather than stored: the sparse
+        read needs one contiguous row per input channel, which the `nn.Linear`
+        layout does not give, and materialising it eagerly would cost every user
+        the memory whether or not they enable this.
+        """
+        weight = self.value.weight
+        if not torch.compiler.is_compiling():
+            # Tie the cache to the weight's identity AND its in-place version, so a
+            # `mul_`, a fresh load, or a replaced parameter all invalidate it. A
+            # cache that silently survives a weight change is worse than no cache.
+            # Skipped while compiling: `data_ptr()` would break the graph, and the
+            # weights cannot change inside a captured region anyway.
+            fingerprint = (weight.data_ptr(), weight._version, weight.dtype)
+            if self._value_t is None or self._value_fingerprint != fingerprint:
+                self._value_t = weight.t().contiguous()
+                self._accumulator = torch.zeros(weight.shape[0], device=weight.device, dtype=torch.float32)
+                self._value_fingerprint = fingerprint
+        return sparse_channel_mix_value(activation, self._value_t, self._accumulator)
 
 
 class Rwkv7Block(GradientCheckpointingLayer):
@@ -373,9 +436,13 @@ class Rwkv7Block(GradientCheckpointingLayer):
         hidden_states = hidden_states + ffn_out
 
         if state is not None:
-            state[0][self.layer_id] = att_shift
-            state[1][self.layer_id] = ffn_shift
-            state[2][self.layer_id] = wkv
+            # Write into the pre-allocated slots rather than rebinding them: the
+            # buffers then keep fixed addresses across steps, which is what lets a
+            # captured CUDA graph replay the decode loop. Index assignment on the
+            # list entries defeats that and silently drops the graph.
+            state[0][self.layer_id].copy_(att_shift)
+            state[1][self.layer_id].copy_(ffn_shift)
+            state[2][self.layer_id].copy_(wkv)
         return hidden_states, v_first, state
 
 
@@ -435,11 +502,20 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
     def _empty_state(self, batch: int, device, dtype) -> list:
         cfg = self.config
         L, C, H, N = cfg.num_hidden_layers, cfg.hidden_size, cfg.num_heads, cfg.head_dim
-        return [
+        state = [
             torch.zeros(L, batch, C, device=device, dtype=dtype),
             torch.zeros(L, batch, C, device=device, dtype=dtype),
-            torch.zeros(L, batch, H, N, N, device=device, dtype=torch.float32),
+            torch.zeros(L, batch, H, N, N, device=device, dtype=getattr(torch, cfg.wkv_state_dtype)),
         ]
+        # The recurrence writes into these buffers every step. Left as ordinary
+        # inputs that would make the compiled region "mutate its inputs", which
+        # disqualifies it from CUDA graphs -- and a recurrent decode is exactly the
+        # workload that needs them. Pinning the addresses is what `StaticCache`
+        # does for the same reason.
+        if not torch.compiler.is_compiling():
+            for buffer in state:
+                torch._dynamo.mark_static_address(buffer)
+        return state
 
     @auto_docstring
     def forward(
