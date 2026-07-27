@@ -196,3 +196,32 @@ class Rwkv7ModelTest(unittest.TestCase):
             if param.requires_grad and name not in dead and (param.grad is None or param.grad.abs().sum() == 0)
         ]
         self.assertEqual(missing, [], f"parameters received no gradient: {missing}")
+
+    def test_chunked_matches_sequential_recurrence(self):
+        """The chunk-parallel prefill must reproduce the sequential recurrence.
+
+        They are two forms of the same step, so any disagreement is a bug in the
+        chunked derivation rather than a tolerance question. Several chunk sizes
+        are checked, including ones that do not divide the sequence length.
+        """
+        from transformers.models.rwkv7.modeling_rwkv7 import rwkv7_chunked, rwkv7_recurrent
+
+        torch.manual_seed(0)
+        batch, seq_len, heads, dim = 2, 37, 3, 8
+        shape = (batch, seq_len, heads, dim)
+        r = torch.randn(shape, device=torch_device)
+        # w_log is a log-decay in (-e^-0.5, 0), as the decay LoRA produces
+        w_log = -0.6065306597126334 * torch.sigmoid(torch.randn(shape, device=torch_device))
+        k = torch.randn(shape, device=torch_device)
+        v = torch.randn(shape, device=torch_device)
+        kk = torch.nn.functional.normalize(torch.randn(shape, device=torch_device), dim=-1)
+        a = torch.sigmoid(torch.randn(shape, device=torch_device))
+        state = torch.randn(batch, heads, dim, dim, device=torch_device)
+
+        reference, reference_state = rwkv7_recurrent(r, w_log, k, v, kk, a, state.clone())
+        for chunk_size in (1, 4, 16, 64):
+            out, out_state = rwkv7_chunked(r, w_log, k, v, kk, a, state.clone(), chunk_size=chunk_size)
+            torch.testing.assert_close(out, reference, rtol=2e-4, atol=2e-4, msg=f"chunk={chunk_size}")
+            torch.testing.assert_close(
+                out_state, reference_state, rtol=2e-4, atol=2e-4, msg=f"state chunk={chunk_size}"
+            )

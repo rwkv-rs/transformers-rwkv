@@ -52,6 +52,17 @@ out = model(**inputs, use_cache=True)
 next_out = model(input_ids=next_token, state=out.state, use_cache=True)
 ```
 
+### Performance notes
+
+Prefill runs a chunk-parallel form of the recurrence rather than a per-token loop:
+the running decay is factored out, which turns each chunk into one unit-lower-triangular
+solve plus a few matmuls, leaving only the chunk-to-chunk carry serial. Decoding a
+single token takes the plain sequential step, which is what it already is.
+
+The model is `torch.compile`-friendly and benefits substantially from it, because the
+time-mix is many small elementwise and low-rank operations whose per-op overhead
+dominates at small batch.
+
 ### DeepEmbed
 
 `config.use_deep_embed` enables the RWKV-8 "DeepEmbed" hook: a per-layer, per-token

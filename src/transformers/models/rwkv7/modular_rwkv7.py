@@ -106,6 +106,83 @@ def rwkv7_recurrent(
     return out.to(dtype), state
 
 
+def rwkv7_chunked(
+    r: torch.Tensor,
+    w_log: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kk: torch.Tensor,
+    a: torch.Tensor,
+    state: torch.Tensor,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunk-parallel form of [`rwkv7_recurrent`], for sequences.
+
+    The step is `S_t = A_t S_{t-1} + k_t v_t^T` with `A_t = diag(w_t) - b_t kk_t^T`
+    and `b_t = kk_t * a_t`, i.e. diagonal-plus-rank-one. Substituting
+    `S_t = diag(c_t) P_t` with the running decay `c_t = prod_{s<=t} w_s` removes the
+    diagonal part and leaves a plain delta rule::
+
+        P_t = (I - b~_t q~_t^T) P_{t-1} + k~_t v_t^T
+        b~ = b / c,  k~ = k / c,  q~ = kk * c_{t-1},  r~ = r * c
+
+    Writing `u_t = q~_t^T P_{t-1}` turns a whole chunk into one unit-lower-triangular
+    system, so the chunk is a handful of matmuls instead of `chunk_size` sequential
+    steps; only the chunk-to-chunk carry stays serial::
+
+        (I + tril(Q~ B~^T, -1)) U = Q~ P_0 + tril(Q~ K~^T, -1) V
+        O   = R~ P_0 + tril(R~ K~^T, 0) V - tril(R~ B~^T, 0) U
+        P_C = P_0 + K~^T V - B~^T U
+
+    `chunk_size` is bounded by that division by `c`: the per-step decay is at least
+    `e^-0.5`, so `1/c` grows like `e^(0.5 * chunk_size)` and 16 keeps it near 1e3 —
+    comfortable in fp32, which is what this runs in regardless of activation dtype.
+    """
+    batch, seq_len, num_heads, head_dim = r.shape
+    dtype = r.dtype
+    r, w_log, k, v, kk, a = (t.float() for t in (r, w_log, k, v, kk, a))
+    state = state.float()
+    outputs = []
+
+    for start in range(0, seq_len, chunk_size):
+        stop = min(start + chunk_size, seq_len)
+        span = stop - start
+        w_c = torch.exp(w_log[:, start:stop])
+        c = torch.cumprod(w_c, dim=1)
+        c_prev = c / w_c
+        b = kk[:, start:stop] * a[:, start:stop]
+
+        b_t = b / c
+        k_t = k[:, start:stop] / c
+        q_t = kk[:, start:stop] * c_prev
+        r_t = r[:, start:stop] * c
+        v_c = v[:, start:stop]
+
+        strict = torch.ones(span, span, device=r.device, dtype=r.dtype).tril(-1)
+        causal = torch.ones(span, span, device=r.device, dtype=r.dtype).tril(0)
+
+        qb = torch.einsum("bthn,bshn->bhts", q_t, b_t) * strict
+        qk = torch.einsum("bthn,bshn->bhts", q_t, k_t) * strict
+        eye = torch.eye(span, device=r.device, dtype=r.dtype)
+        rhs = torch.einsum("bthn,bhnv->bhtv", q_t, state) + torch.einsum("bhts,bshv->bhtv", qk, v_c)
+        u = torch.linalg.solve_triangular(eye + qb, rhs, upper=False, unitriangular=True)
+
+        rk = torch.einsum("bthn,bshn->bhts", r_t, k_t) * causal
+        rb = torch.einsum("bthn,bshn->bhts", r_t, b_t) * causal
+        out_c = (
+            torch.einsum("bthn,bhnv->bhtv", r_t, state)
+            + torch.einsum("bhts,bshv->bhtv", rk, v_c)
+            - torch.einsum("bhts,bhsv->bhtv", rb, u)
+        )
+        outputs.append(out_c.permute(0, 2, 1, 3))
+
+        state = c[:, -1].unsqueeze(-1) * (
+            state + torch.einsum("bthn,bthv->bhnv", k_t, v_c) - torch.einsum("bthn,bhtv->bhnv", b_t, u)
+        )
+
+    return torch.cat(outputs, dim=1).to(dtype), state
+
+
 class Rwkv7TokenShift(nn.Module):
     """`prev_token(x)`: the previous token's hidden state, zero at sequence start.
 
@@ -214,9 +291,8 @@ class Rwkv7Attention(nn.Module):
         def _heads(t):
             return t.view(batch, seq_len, H, N)
 
-        y, wkv_state = rwkv7_recurrent(
-            _heads(r), _heads(w_log), _heads(k), _heads(v), _heads(kk), _heads(a), wkv_state
-        )
+        kernel = rwkv7_recurrent if seq_len == 1 else rwkv7_chunked
+        y, wkv_state = kernel(_heads(r), _heads(w_log), _heads(k), _heads(v), _heads(kk), _heads(a), wkv_state)
 
         y = self.ln_x(y.view(batch * seq_len, C)).view(batch, seq_len, C)
         # r·k·r_k summed per head, broadcast back over the head's value channels
