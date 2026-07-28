@@ -700,6 +700,25 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _is_stateful = True
 
+    @staticmethod
+    def _reorder_cache(state: list, beam_idx: torch.LongTensor) -> list:
+        """Permute the recurrent state onto the beams that survived this step.
+
+        Beam search needs the cache to follow the beams, and a recurrent state is
+        the easy case: it is O(1) in length, so there is nothing to gather along a
+        time axis -- one `index_select` over the batch and the whole history moves
+        with it. Batch is dim 1 on every entry (dim 0 indexes the layer).
+
+        Done in place. `allocate_state` pins these buffers with
+        `mark_static_address` so the compiled decode can hold CUDA graphs, and
+        returning freshly allocated tensors here would quietly drop that pinning
+        for the rest of the generation. The `index_select` temporary is the price;
+        the buffers a caller handed in are still the buffers it gets back.
+        """
+        for entry in state:
+            entry.copy_(entry.index_select(1, beam_idx.to(entry.device)))
+        return state
+
 
 @auto_docstring
 class Rwkv7Model(Rwkv7PreTrainedModel):

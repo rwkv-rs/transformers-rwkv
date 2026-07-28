@@ -348,6 +348,89 @@ class Rwkv7ModelTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(first, second))
 
+    def test_reorder_cache_moves_the_state_onto_the_beams(self):
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        state = model.rwkv7.allocate_state(4, device=torch_device)
+        # Give every batch row a value only that row has, so a permutation that
+        # lands on the wrong source cannot pass by looking plausible.
+        for entry in state:
+            for row in range(4):
+                entry[:, row] = row + 1
+        addresses = [entry.data_ptr() for entry in state]
+
+        # 2 appears twice: a reorder that aliased its source into its destination
+        # would corrupt the second copy.
+        beams = [2, 2, 0, 3]
+        reordered = model._reorder_cache(state, torch.tensor(beams, device=torch_device))
+
+        for entry in reordered:
+            for row, source in enumerate(beams):
+                self.assertTrue(torch.all(entry[:, row] == source + 1))
+        # In place, so the addresses `allocate_state` pinned are still pinned.
+        self.assertEqual([entry.data_ptr() for entry in reordered], addresses)
+
+    def test_beam_search_score_survives_an_independent_rescore(self):
+        """Beam search accumulated a score through the state; rescore it fresh.
+
+        "It ran without raising" is not evidence. Beam search keeps running when
+        the state follows the wrong beam -- it just searches with a history that
+        belongs to some other candidate, and reports a cumulative score built from
+        that wrong history. So the check is a consistency one: `sequences_scores`
+        is accumulated step by step through the recurrent state, and rescoring the
+        very same tokens in one full forward has to reproduce it. Only a state that
+        tracked the surviving beams makes those two numbers agree.
+
+        Two things here were measured rather than assumed, both after a first
+        version of this test passed with the reorder stubbed out entirely:
+
+        * The obvious property -- beam scoring at least as well as greedy -- is not
+          a theorem and is not used. Greedy's path can be pruned out of the top-k
+          part way through and still be the better sequence at the end, which is
+          exactly what this model does (beam -41.81 vs greedy -39.45, with a
+          correct reorder). A control run on Llama in the same checkout happens to
+          come out the other way, +3.37, which is what made the false premise look
+          confirmed.
+        * The sharper init is load-bearing. At `_randomised`'s 0.05 the tiny
+          model's next-token distribution is nearly uniform, every beam is
+          interchangeable, and a stubbed reorder still agrees to 1.5e-05 -- no
+          discrimination at all. At 0.5 over 16 tokens and 4 beams: 3.8e-06 with
+          the reorder, 15.9 without it. The 1e-3 tolerance sits between those.
+        """
+        config = _tiny_config()
+        torch.manual_seed(0)
+        model = Rwkv7ForCausalLM(config)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.normal_(0.0, 0.5)
+        model = model.eval().to(torch_device)
+        prompt = torch.randint(0, config.vocab_size, (1, 4), device=torch_device)
+
+        with torch.no_grad():
+            beamed = model.generate(
+                prompt,
+                max_new_tokens=16,
+                num_beams=4,
+                do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
+            sequence = beamed.sequences
+            logits = model(sequence).logits.float()
+
+        generated = sequence.shape[1] - prompt.shape[1]
+        rescored = (
+            torch.log_softmax(logits[:, :-1], dim=-1)
+            .gather(-1, sequence[:, 1:, None])[:, prompt.shape[1] - 1 :]
+            .sum()
+            .item()
+        )
+        # `sequences_scores` is the length-normalised beam score; length_penalty
+        # defaults to 1.0, so multiplying by the generated length undoes it.
+        accumulated = beamed.sequences_scores.item() * generated
+
+        self.assertAlmostEqual(accumulated, rescored, delta=1e-3)
+
     def test_gradients_reach_every_parameter(self):
         config = _tiny_config()
         model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
