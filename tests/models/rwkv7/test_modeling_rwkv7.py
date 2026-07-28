@@ -256,7 +256,10 @@ class Rwkv7ModelTest(unittest.TestCase):
         model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
         ids = torch.randint(1, config.vocab_size, (1, 6), device=torch_device)
 
-        for bad in ([1, 3, 6], [0, 3, 5], [0, 3, 8]):
+        # First three fail on the endpoints; the last two have correct endpoints and
+        # fail only on ordering. [0, 4, 2, 6] is the one that used to get through:
+        # the backwards pair was skipped, so six tokens in came back as eight.
+        for bad in ([1, 3, 6], [0, 3, 5], [0, 3, 8], [0, 4, 2, 6], [0, 3, 3, 6]):
             with self.assertRaises(ValueError):
                 model(input_ids=ids, cu_seq_lens=torch.tensor(bad, device=torch_device))
 
@@ -265,6 +268,61 @@ class Rwkv7ModelTest(unittest.TestCase):
                 input_ids=ids.repeat(2, 1),
                 cu_seq_lens=torch.tensor([0, 3, 6], device=torch_device),
             )
+
+    def test_packed_batch_ignores_a_carried_state_and_says_so(self):
+        """Packing means "these are new sequences", so a carried state is not history.
+
+        The state argument is still read for its shape and dtype, so a caller may
+        hand in a pre-allocated cache; what it must not do is quietly resume from
+        it, since there is no segment a previous row's state would belong to. This
+        is a contract worth pinning rather than an accident: the same call with a
+        state carrying real history has to give the same logits as one starting
+        cold, and the docstring promises exactly that.
+        """
+        config = _tiny_config()
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
+        ids = torch.randint(1, config.vocab_size, (1, 6), device=torch_device)
+        bounds = torch.tensor([0, 2, 6], device=torch_device)
+
+        with torch.no_grad():
+            warmed = model(
+                input_ids=torch.randint(1, config.vocab_size, (1, 5), device=torch_device),
+                use_cache=True,
+            ).state
+            self.assertGreater(max(s.abs().max().item() for s in self._every_state(warmed)), 0.0)
+
+            cold = model(input_ids=ids, cu_seq_lens=bounds).logits
+            carried = model(input_ids=ids, cu_seq_lens=bounds, state=warmed).logits
+
+        torch.testing.assert_close(carried, cold, rtol=1e-5, atol=1e-5)
+
+    def test_loading_weights_drops_the_sparse_cache(self):
+        """A warm transposed copy must not survive the weights it was made from.
+
+        The fingerprint catches a version bump, and `load_state_dict` happens to
+        produce one on current torch -- but that is how it copies today, not a
+        promise, and the failure it guards against is silent: the projection keeps
+        using a transpose of weights the model no longer has. Runs on CPU because
+        it checks the bookkeeping, not the kernel.
+        """
+        config = _tiny_config(sparse_channel_mix=True)
+        model = Rwkv7ForCausalLM(config)
+        ffn = model.rwkv7.blocks[0].ffn
+        ffn._value_fingerprint = ("pretend a cache was built",)
+
+        model.load_state_dict(model.state_dict())
+
+        self.assertIsNone(ffn._value_fingerprint)
+
+    def test_invalidate_sparse_cache_forces_a_rebuild(self):
+        config = _tiny_config(sparse_channel_mix=True)
+        model = Rwkv7ForCausalLM(config)
+        ffn = model.rwkv7.blocks[0].ffn
+        ffn._value_fingerprint = ("pretend a cache was built",)
+
+        ffn.invalidate_sparse_cache()
+
+        self.assertIsNone(ffn._value_fingerprint)
 
     def test_wkv_implementation_is_selectable(self):
         """The recurrence is looked up by name, so a kernel can be dropped in.

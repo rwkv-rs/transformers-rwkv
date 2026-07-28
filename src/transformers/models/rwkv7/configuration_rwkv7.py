@@ -89,6 +89,14 @@ class Rwkv7Config(PreTrainedConfig):
             nonzero, and that projection is a third of the model's bytes. Costs a
             transposed copy of the value weight (about +30% weights), built lazily,
             and only pays once launches are captured — see the model doc.
+
+            Exact but not bit-reproducible: the surviving channels are summed across
+            several partitions that combine through an atomic add, so the order the
+            partitions arrive in — and therefore the last unit in the last place of
+            each output — varies between runs of identical input. Same rounding
+            class as a split-K GEMM. Greedy decoding can turn that into a different
+            token at a near-tie, so leave this off when you need a run to reproduce
+            itself exactly.
         deep_embed_size (`int`, *optional*):
             Width of one layer's DeepEmbed vector. `hidden_size` reproduces the
             reference "1x" variant (modulating the channel-mix output);

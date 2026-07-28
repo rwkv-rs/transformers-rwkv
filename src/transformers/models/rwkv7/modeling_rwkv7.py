@@ -558,6 +558,16 @@ class Rwkv7FeedForward(nn.Module):
         # Tie the cache to the weight's identity AND its in-place version, so a
         # `mul_`, a fresh load, or a replaced parameter all invalidate it. A cache
         # that silently survives a weight change is worse than no cache.
+        #
+        # One mutation this does NOT see, stated because it is the one people write:
+        # `weight.data.copy_(...)`. Going through `.data` is what detaches from the
+        # autograd version counter, so the version is unchanged, the storage is
+        # unchanged, and the fingerprint matches a weight that no longer exists.
+        # Measured on torch 2.13: `mul_` steps the version, `.data.copy_` does not,
+        # `load_state_dict` does (it copies through the parameter). Quantisation and
+        # adapter-merging code is where `.data.copy_` shows up. Call
+        # [`invalidate_sparse_cache`] after doing that -- there is no cheap way to
+        # notice from here, and the expensive way is a device sync per decoded token.
         fingerprint = (weight.data_ptr(), weight._version, weight.dtype)
         if self._value_t is None or self._value_fingerprint != fingerprint:
             inter, hidden = weight.shape[1], weight.shape[0]
@@ -572,6 +582,23 @@ class Rwkv7FeedForward(nn.Module):
             self._compact_value = torch.zeros(inter, device=weight.device, dtype=torch.float32)
             self._compact_counter = torch.zeros(1, device=weight.device, dtype=torch.int32)
             self._value_fingerprint = fingerprint
+
+    def invalidate_sparse_cache(self) -> None:
+        """Drop the transposed weight, so the next call rebuilds it.
+
+        The escape hatch for a weight change the fingerprint cannot see -- see
+        [`build_sparse_cache`] for which those are. Rebuilding allocates, so do it
+        before compiling, not between decode steps.
+        """
+        self._value_fingerprint = None
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        # Loading replaces the projection under a cache that may already be warm.
+        # The version counter happens to catch this on current torch, but that is a
+        # property of how `load_state_dict` copies rather than a promise, and the
+        # cost of being wrong is a silently stale projection.
+        super()._load_from_state_dict(*args, **kwargs)
+        self.invalidate_sparse_cache()
 
 
 class Rwkv7CacheLayer(LinearAttentionLayer):
@@ -849,9 +876,18 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         **kwargs,
     ) -> tuple | Rwkv7Output:
         r"""
+        attention_mask (`torch.LongTensor`, *optional*):
+            1 on real tokens, 0 on padding. Read as the **tail** of whatever is
+            given, so a decode step may hand over the whole conversation's mask and
+            only the last position is used. A prefix chunk must therefore slice its
+            own mask to match the `input_ids` it passes, or it silently masks the
+            wrong positions. There is nothing here for a mask to hide behind: an
+            all-recurrent model feeds pads through the recurrence like any other
+            token unless they are neutralised.
         state (`Rwkv7Cache`, *optional*):
             Recurrent state returned by a previous call; pass it back to continue
-            the sequence. Allocated on the first forward if omitted.
+            the sequence. Allocated on the first forward if omitted. Ignored as a
+            *history* when `cu_seq_lens` is given -- see there.
         deep_embeds (`torch.FloatTensor`, *optional*):
             RWKV-8 DeepEmbed vectors for this batch, shaped
             `[num_layers, batch, seq_len, deep_embed_size]` (or broadcastable).
@@ -860,10 +896,16 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         cu_seq_lens (`torch.LongTensor`, *optional*):
             Cumulative sequence lengths for a *packed* batch — several sequences
             concatenated into one row instead of padded to a rectangle, starting at
-            0 and ending at `seq_len`. Each segment then decodes from a fresh
-            recurrent state, as if it had been run on its own. This is the varlen
-            layout; use it instead of padding when the lengths vary a lot, since a
-            recurrent model pays for pad tokens in time as well as memory.
+            0 and ending at `seq_len`, and non-decreasing. Each segment then decodes
+            from a fresh recurrent state, as if it had been run on its own. This is
+            the varlen layout; use it instead of padding when the lengths vary a
+            lot, since a recurrent model pays for pad tokens in time as well as
+            memory.
+
+            A packed batch is a set of *new* sequences, not a continuation, so a
+            `state` passed alongside contributes its shape and dtype and nothing
+            else -- its contents are not read. What comes back is the last segment's
+            state, which is the one a continuation of this row would resume from.
         """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -908,6 +950,16 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             if cu_seq_lens.ndim != 1 or cu_seq_lens[0] != 0 or cu_seq_lens[-1] != inputs_embeds.shape[1]:
                 raise ValueError(
                     f"cu_seq_lens must be 1-D, start at 0 and end at seq_len ({inputs_embeds.shape[1]}); "
+                    f"got {cu_seq_lens.tolist()}"
+                )
+            # Endpoints alone do not pin the list down. A pair that goes backwards
+            # is skipped rather than rejected further in, so the segments emit fewer
+            # tokens than came in and the row silently changes length -- and one that
+            # merely repeats a boundary contributes an empty segment, which is
+            # harmless but is never what the caller meant.
+            if bool((cu_seq_lens[1:] <= cu_seq_lens[:-1]).any()):
+                raise ValueError(
+                    "cu_seq_lens must be strictly increasing (each segment needs at least one token); "
                     f"got {cu_seq_lens.tolist()}"
                 )
 
