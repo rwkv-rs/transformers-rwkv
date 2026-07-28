@@ -43,6 +43,7 @@ class Rwkv7TokenShift(nn.Module):
         x: torch.Tensor,
         shift_state: torch.Tensor | None,
         cu_seq_lens: torch.Tensor | None = None,
+        keep: torch.Tensor | None = None,
     ):
         # x: [batch, seq_len, hidden]; shift_state: [batch, hidden] or None
         if shift_state is None:
@@ -58,7 +59,15 @@ class Rwkv7TokenShift(nn.Module):
             positions = torch.arange(x.shape[1], device=x.device)
             starts = (positions[:, None] == cu_seq_lens[None, :-1]).any(dim=1)
             shifted = torch.where(starts[None, :, None], torch.zeros_like(shifted), shifted)
-        return shifted, x[:, -1]
+        if keep is None:
+            return shifted, x[:, -1]
+        # The state handed back must be the last REAL token, not the last position.
+        # They coincide under left padding, which is why this went unnoticed; under
+        # right padding `x[:, -1]` is a blanked pad, so a continuation resumes from
+        # zero instead of from where the sequence actually got to.
+        flags = keep.squeeze(-1)
+        last_real = (flags * torch.arange(x.shape[1], device=x.device)).argmax(dim=-1)
+        return shifted, x[torch.arange(x.shape[0], device=x.device), last_real]
 
 
 # e^-0.5. The decay LoRA emits w_log = -INV_SQRT_E * sigmoid(...), so the
@@ -300,7 +309,7 @@ class Rwkv7Attention(nn.Module):
         batch, seq_len, C = hidden_states.shape
         H, N = self.num_heads, self.head_dim
 
-        shifted, new_shift_state = self.time_shift(hidden_states, shift_state, cu_seq_lens)
+        shifted, new_shift_state = self.time_shift(hidden_states, shift_state, cu_seq_lens, keep)
         delta = shifted - hidden_states
         xr = hidden_states + self.x_r * delta
         xw = hidden_states + self.x_w * delta
@@ -317,11 +326,21 @@ class Rwkv7Attention(nn.Module):
 
         if keep is not None:
             # A padding position has to leave the recurrent state exactly as it
-            # found it. The caller zeroes those positions, and all three
-            # projections are bias-free, so k, v and kk are already zero there --
-            # the update term k v^T is gone. What survives is the decay, and
-            # w = exp(0) = 1 turns the transition into the identity.
+            # found it, which takes three things and not one.
+            #
+            # The decay is held at w = exp(0) = 1, so the transition is the identity.
+            #
+            # `k` and `v` are zeroed EXPLICITLY. An earlier version relied on the
+            # blanked hidden state making them zero, since the projections are
+            # bias-free -- but that is only true for a pad with nothing before it.
+            # A pad that FOLLOWS a real token still receives that token's hidden
+            # state through the token shift, so `delta = shifted - 0` is non-zero,
+            # and so are `k` and `v`. The update term `k v^T` then entered the state
+            # on every right-padded batch and on any left-padded batch continued
+            # from a carried shift state.
             w_log = w_log * keep
+            k = k * keep
+            v = v * keep
 
         if self.layer_id == 0:
             v_first = v
@@ -457,8 +476,9 @@ class Rwkv7FeedForward(nn.Module):
         shift_state: torch.Tensor | None,
         deep_embed: torch.Tensor | None = None,
         cu_seq_lens: torch.Tensor | None = None,
+        keep: torch.Tensor | None = None,
     ):
-        shifted, new_shift_state = self.time_shift(hidden_states, shift_state, cu_seq_lens)
+        shifted, new_shift_state = self.time_shift(hidden_states, shift_state, cu_seq_lens, keep)
         xk = hidden_states + self.x_k * (shifted - hidden_states)
         inner = torch.relu(self.key(xk)) ** 2
 
@@ -587,7 +607,7 @@ class Rwkv7Block(GradientCheckpointingLayer):
         ffn_in = self.ln2(hidden_states)
         if keep is not None:
             ffn_in = ffn_in * keep
-        ffn_out, ffn_shift = self.ffn(ffn_in, ffn_shift, deep_embed, cu_seq_lens)
+        ffn_out, ffn_shift = self.ffn(ffn_in, ffn_shift, deep_embed, cu_seq_lens, keep)
         hidden_states = hidden_states + ffn_out
 
         if state is not None:
@@ -746,7 +766,15 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         # state the pads had already moved. A single decoded token is never padding,
         # so the decode step takes none of this.
         keep = None
-        if attention_mask is not None and inputs_embeds.shape[1] > 1:
+        if attention_mask is not None:
+            # The mask is taken as the TAIL of whatever is passed, so a decode step
+            # can hand over the whole conversation's mask. A prefix chunk must slice
+            # its own mask to match, or it silently reads the wrong positions.
+            #
+            # Applied at seq_len == 1 as well. It used to be skipped there, on the
+            # theory that a single decoded token is never padding -- true of
+            # `generate`, but an assumption about the caller rather than a property
+            # of the model, and a fully-masked 1-token row was moving the state.
             keep = attention_mask[:, -inputs_embeds.shape[1] :, None].to(inputs_embeds.dtype)
 
         if cu_seq_lens is not None:
@@ -771,7 +799,12 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         for block in self.blocks:
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-            layer_deep_embed = deep_embeds[block.layer_id] if deep_embeds is not None else None
+            # Gated on the config flag as well as on the argument: passing
+            # `deep_embeds` to a model configured without them used to modulate the
+            # channel-mix anyway, which is a silently different model.
+            layer_deep_embed = (
+                deep_embeds[block.layer_id] if deep_embeds is not None and self.config.use_deep_embed else None
+            )
             hidden_states, v_first, state = block(hidden_states, v_first, state, layer_deep_embed, keep, cu_seq_lens)
 
         hidden_states = self.ln_out(hidden_states)

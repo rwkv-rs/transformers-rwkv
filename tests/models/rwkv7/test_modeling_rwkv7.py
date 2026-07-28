@@ -169,15 +169,21 @@ class Rwkv7ModelTest(unittest.TestCase):
             together = model(input_ids=packed, cu_seq_lens=cu_seq_lens).logits[0]
             naive = model(input_ids=packed).logits[0]
 
-        start = 0
+        start, treated = 0, 0.0
         for segment, n in zip(segments, lengths):
             with torch.no_grad():
                 alone = model(input_ids=segment).logits[0]
             torch.testing.assert_close(together[start : start + n], alone, rtol=1e-5, atol=1e-5)
+            treated = max(treated, (together[start : start + n] - alone).abs().max().item())
             start += n
 
-        packing_damage = (naive - together).abs().max().item()
-        self.assertGreater(packing_damage, 1e-6)
+        # A ratio, not an absolute floor. Every weight in this fixture is drawn at
+        # 0.05, so the untreated damage sits around 1e-6 and a bare 1e-6 threshold
+        # would be a coin flip on the very quantity it is meant to bound. What has to
+        # hold is that honouring the boundaries removes most of the damage, at
+        # whatever scale the fixture happens to put it.
+        untreated = (naive - together).abs().max().item()
+        self.assertGreater(untreated, 100 * max(treated, 1e-9))
 
     def test_packed_batch_rejects_a_malformed_boundary_list(self):
         """A wrong `cu_seq_lens` must raise, not split the recurrence somewhere else.
@@ -491,6 +497,7 @@ class Rwkv7ModelTest(unittest.TestCase):
         for block in model.rwkv7.blocks:
             self.assertIsNone(block.ffn._value_t)
 
+    @require_torch_gpu
     def test_sparse_channel_mix_matches_dense(self):
         """Skipping zero channels must be exact, not merely close.
 
@@ -498,8 +505,18 @@ class Rwkv7ModelTest(unittest.TestCase):
         the same sum with terms that contribute nothing left out. Only the
         accumulation dtype differs from the dense reference, so fp32 inputs let
         this be compared tightly.
+
+        GPU-gated, and the gate is the point. `sparse_channel_mix_value` falls back
+        to `F.linear(activation, weight_t.t())` when the Triton op is unavailable --
+        character for character the `dense` expression below -- so without a GPU this
+        compared an expression to itself and passed while measuring nothing. The
+        kernel is also only registered as a side effect of some other test having
+        called `build_sparse_cache`, so it was order-dependent as well; that is fixed
+        by arming it here explicitly.
         """
-        from transformers.models.rwkv7.modeling_rwkv7 import sparse_channel_mix_value
+        from transformers.models.rwkv7.modeling_rwkv7 import _ensure_sparse_op, sparse_channel_mix_value
+
+        self.assertTrue(_ensure_sparse_op(), "sparse op unavailable; this test would compare dense to dense")
 
         torch.manual_seed(0)
         inter, hidden = 512, 128
