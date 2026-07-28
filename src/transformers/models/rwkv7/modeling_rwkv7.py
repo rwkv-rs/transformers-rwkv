@@ -330,6 +330,15 @@ class Rwkv7Attention(nn.Module):
 
         kk = k * self.k_k
         kk = torch.nn.functional.normalize(kk.view(batch, seq_len, H, N), dim=-1, p=2.0).view(batch, seq_len, C)
+        if keep is not None:
+            # A blanked padding position makes `k` exactly zero, so this normalises a
+            # zero vector. `F.normalize` divides by `max(norm, 1e-12)`, and 1e-12 is
+            # below the smallest fp16 subnormal -- so in fp16 the divisor really is
+            # zero and every padded row comes out NaN. (In fp32 it is representable
+            # and the whole thing looks fine, which is why a test on a small fp32
+            # model missed it entirely.) `where` is used rather than a multiply
+            # because NaN * 0 is still NaN.
+            kk = torch.where(keep.bool().expand_as(kk), kk, torch.zeros_like(kk))
         k = k * (1 + (a - 1) * self.k_a)
 
         if wkv_state is None:

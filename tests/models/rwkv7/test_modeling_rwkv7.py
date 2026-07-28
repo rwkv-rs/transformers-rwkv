@@ -231,6 +231,38 @@ class Rwkv7ModelTest(unittest.TestCase):
         self.assertEqual(len(calls), config.num_hidden_layers)
         self.assertTrue(torch.equal(expected, got))
 
+    @require_torch_gpu
+    def test_heavily_padded_fp16_batch_is_finite(self):
+        """Padding in fp16, at a realistic pad fraction, must not produce NaN.
+
+        This is the configuration every real user is in and the one the other padding
+        test is not: it runs fp32 on a tiny model, where `F.normalize`'s 1e-12 epsilon
+        is representable. In fp16 it is below the smallest subnormal, so normalising
+        the zero vector a blanked pad position produces divides by a true zero and the
+        whole row comes out NaN. Caught on real prompts, not here — hence the pad
+        fraction below is 90%, like a short prompt batched with a long one, rather
+        than the three pad tokens the other test uses.
+        """
+        config = _tiny_config(sparse_channel_mix=False)
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device).half()
+        short = torch.randint(1, config.vocab_size, (1, 6), device=torch_device)
+        long = torch.randint(1, config.vocab_size, (1, 60), device=torch_device)
+        width = 60
+        padded = torch.cat(
+            [torch.cat([torch.zeros(1, width - 6, dtype=short.dtype, device=torch_device), short], dim=1), long],
+            dim=0,
+        )
+        mask = torch.zeros(2, width, dtype=torch.long, device=torch_device)
+        mask[0, -6:] = 1
+        mask[1, :] = 1
+
+        with torch.no_grad():
+            out = model(input_ids=padded, attention_mask=mask).logits
+            alone = model(input_ids=short).logits[0, -1]
+
+        self.assertTrue(torch.isfinite(out).all(), "padded fp16 batch produced non-finite logits")
+        self.assertEqual(int(out[0, -1].argmax()), int(alone.argmax()))
+
     def test_mask_without_padding_is_a_no_op(self):
         """An all-ones mask must not perturb the unpadded path at all.
 
