@@ -313,9 +313,7 @@ class Rwkv7Attention(nn.Module):
         k = self.key(xk)
         v = self.value(xv)
 
-        w_log = -_INV_SQRT_E * torch.sigmoid(torch.tanh(xw @ self.w1) @ self.w2 + self.w0)
-        a = torch.sigmoid(xa @ self.a1 @ self.a2 + self.a0)
-        g = torch.sigmoid(xg @ self.g1) @ self.g2
+        w_log, a, g, v_gate = self.lora_gates(xw, xa, xg, None if self.layer_id == 0 else xv)
 
         if keep is not None:
             # A padding position has to leave the recurrent state exactly as it
@@ -328,7 +326,7 @@ class Rwkv7Attention(nn.Module):
         if self.layer_id == 0:
             v_first = v
         else:
-            v = v + (v_first - v) * torch.sigmoid(xv @ self.v1 @ self.v2 + self.v0)
+            v = v + (v_first - v) * v_gate
 
         kk = k * self.k_k
         kk = torch.nn.functional.normalize(kk.view(batch, seq_len, H, N), dim=-1, p=2.0).view(batch, seq_len, C)
@@ -358,6 +356,27 @@ class Rwkv7Attention(nn.Module):
         y = self.output((y + bonus) * g)
         return y, v_first, new_shift_state, wkv_state
 
+    def lora_gates(self, xw, xa, xg, xv):
+        """The four low-rank chains, as one unit.
+
+        Each is a rank-r down projection, an activation, and an up projection, and
+        they differ only in where the activation sits: `w` has `tanh` between the
+        two, `g` has `sigmoid` between them and nothing after, `a` and `v` have
+        nothing between and `sigmoid` after. Together they are a dozen tiny
+        matrix-vector products per layer whose weights are a rounding error of the
+        model's bytes -- so at batch 1 they cost latency, not bandwidth, which is
+        the shape a fused kernel improves and a portable implementation cannot.
+
+        Kept as one method for exactly that reason: it is the unit worth replacing,
+        and replacing it should not need a fork. `xv` is None on layer 0, which
+        produces `v_first` rather than mixing towards it and never reads that chain.
+        """
+        w_log = -_INV_SQRT_E * torch.sigmoid(torch.tanh(xw @ self.w1) @ self.w2 + self.w0)
+        a = torch.sigmoid(xa @ self.a1 @ self.a2 + self.a0)
+        g = torch.sigmoid(xg @ self.g1) @ self.g2
+        v_gate = None if xv is None else torch.sigmoid(xv @ self.v1 @ self.v2 + self.v0)
+        return w_log, a, g, v_gate
+
 
 _SPARSE_OP_READY = False
 
@@ -378,14 +397,21 @@ def _ensure_sparse_op() -> bool:
 
 
 def sparse_channel_mix_value(
-    activation: torch.Tensor, weight_t: torch.Tensor, accumulator: torch.Tensor
+    activation: torch.Tensor,
+    weight_t: torch.Tensor,
+    accumulator: torch.Tensor,
+    index: torch.Tensor,
+    value: torch.Tensor,
+    counter: torch.Tensor,
 ) -> torch.Tensor:
     """`out = activation @ weight_t`, reading only the rows the input selects.
 
     `activation` is `relu(key(x))**2`, so its zeros are EXACT and a zero channel
     contributes exactly nothing — skipping its weight row is not an approximation.
-    On a 7.2B checkpoint ~93% of channels are zero while this projection is a third
-    of the model's bytes, which is why it is worth a kernel at all.
+    On a 7.2B checkpoint ~90% of channels are zero at any step (10.07% density,
+    measured over 16 decode steps) while this projection is a third of the model's
+    bytes, which is why it is worth a kernel at all. `index`/`value`/`counter` are
+    the scratch the kernel compacts the surviving channels into.
 
     Only pays when kernel launches are captured (`torch.compile` with CUDA graphs).
     Eagerly it LOSES to one dense cuBLAS call, because the step is then bound by
@@ -393,7 +419,7 @@ def sparse_channel_mix_value(
     Falls back to a dense matmul when Triton is unavailable.
     """
     if _SPARSE_OP_READY:
-        return torch.ops.rwkv7.sparse_channel_mix_value(activation, weight_t, accumulator)
+        return torch.ops.rwkv7.sparse_channel_mix_value(activation, weight_t, accumulator, index, value, counter)
     return torch.nn.functional.linear(activation, weight_t.t())
 
 
@@ -412,6 +438,9 @@ class Rwkv7FeedForward(nn.Module):
         self._value_t = None  # [inter, hidden] copy for the sparse path, built lazily
         self._value_fingerprint = None
         self._accumulator = None
+        self._compact_index = None
+        self._compact_value = None
+        self._compact_counter = None
 
     def forward(
         self,
@@ -466,7 +495,14 @@ class Rwkv7FeedForward(nn.Module):
         """
         if not torch.compiler.is_compiling():
             self.build_sparse_cache()
-        return sparse_channel_mix_value(activation, self._value_t, self._accumulator)
+        return sparse_channel_mix_value(
+            activation,
+            self._value_t,
+            self._accumulator,
+            self._compact_index,
+            self._compact_value,
+            self._compact_counter,
+        )
 
     def build_sparse_cache(self) -> None:
         """Materialise the transposed weight and the accumulator the sparse path needs.
@@ -485,8 +521,17 @@ class Rwkv7FeedForward(nn.Module):
         # that silently survives a weight change is worse than no cache.
         fingerprint = (weight.data_ptr(), weight._version, weight.dtype)
         if self._value_t is None or self._value_fingerprint != fingerprint:
+            inter, hidden = weight.shape[1], weight.shape[0]
             self._value_t = weight.t().contiguous()
-            self._accumulator = torch.zeros(weight.shape[0], device=weight.device, dtype=torch.float32)
+            self._accumulator = torch.zeros(hidden, device=weight.device, dtype=torch.float32)
+            # The projection compacts the surviving channels into these before
+            # walking them. Allocated here with everything else rather than on
+            # first use: a buffer that first appears inside a compiled region
+            # cannot be pinned, and CUDA graphs are then declined for the whole
+            # region -- which costs far more than the projection saves.
+            self._compact_index = torch.zeros(inter, device=weight.device, dtype=torch.int32)
+            self._compact_value = torch.zeros(inter, device=weight.device, dtype=torch.float32)
+            self._compact_counter = torch.zeros(1, device=weight.device, dtype=torch.int32)
             self._value_fingerprint = fingerprint
 
 

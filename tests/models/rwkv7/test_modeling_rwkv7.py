@@ -405,6 +405,25 @@ class Rwkv7ModelTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _tiny_config(wkv_state_dtype=bad)
 
+    def test_sparse_scratch_does_not_shadow_the_projection(self):
+        """The cache attributes must not collide with the methods around them.
+
+        Runs on CPU deliberately: the sparse projection itself is CUDA-only, so
+        every test that exercises it is skipped on a machine without a GPU -- and a
+        scratch buffer named after the method that uses it then passes the whole
+        suite and fails on the first real decode with `'Tensor' object is not
+        callable`. Which is exactly what happened.
+        """
+        config = _tiny_config(sparse_channel_mix=True)
+        model = Rwkv7ForCausalLM(config)
+        ffn = model.rwkv7.blocks[0].ffn
+        ffn.build_sparse_cache()
+
+        self.assertTrue(callable(ffn._sparse_value))
+        self.assertTrue(callable(ffn._project))
+        for name in ("_compact_index", "_compact_value", "_compact_counter", "_accumulator"):
+            self.assertIsInstance(getattr(ffn, name), torch.Tensor, name)
+
     @require_torch_gpu
     def test_allocate_state_warms_the_sparse_caches(self):
         """Everything the compiled decode needs must exist before compiling.
@@ -456,15 +475,28 @@ class Rwkv7ModelTest(unittest.TestCase):
         act = torch.randn(inter, device=torch_device)
         act[torch.rand(inter, device=torch_device) > 0.07] = 0.0  # exact zeros, as relu^2 gives
         accumulator = torch.zeros(hidden, device=torch_device, dtype=torch.float32)
+        index = torch.zeros(inter, device=torch_device, dtype=torch.int32)
+        value = torch.zeros(inter, device=torch_device, dtype=torch.float32)
+        counter = torch.zeros(1, device=torch_device, dtype=torch.int32)
+        scratch = (accumulator, index, value, counter)
 
         dense = torch.nn.functional.linear(act, weight_t.t())
-        sparse = sparse_channel_mix_value(act, weight_t, accumulator)
+        sparse = sparse_channel_mix_value(act, weight_t, *scratch)
         torch.testing.assert_close(sparse, dense, rtol=1e-5, atol=1e-5)
 
-        # an all-zero activation must give exactly zero, and leave the accumulator clean
-        zeros = sparse_channel_mix_value(torch.zeros_like(act), weight_t, accumulator)
+        # an all-zero activation must give exactly zero, and leave every scratch
+        # buffer clean -- the projection reuses them across layers and steps, so a
+        # finalize pass that forgot to re-zero one would only show up on the call
+        # after the one being checked
+        zeros = sparse_channel_mix_value(torch.zeros_like(act), weight_t, *scratch)
         self.assertEqual(zeros.abs().max().item(), 0.0)
         self.assertEqual(accumulator.abs().max().item(), 0.0)
+        self.assertEqual(counter.abs().max().item(), 0)
+
+        # and a repeat of the first call must reproduce it exactly, which it cannot
+        # if anything above was left dirty
+        again = sparse_channel_mix_value(act, weight_t, *scratch)
+        torch.testing.assert_close(again, sparse, rtol=0, atol=0)
 
     @require_torch_gpu
     def test_sparse_path_agrees_with_dense_including_deep_embed(self):
