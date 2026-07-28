@@ -80,6 +80,26 @@ class Rwkv7ModelTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _tiny_config(hidden_size=30, head_dim=8, num_heads=4)
 
+    def test_group_norm_epsilon_follows_head_dim_not_head_count(self):
+        """The reference's `64e-5` is `head_dim * 1e-5`, and the two look alike.
+
+        `num_heads * norm_eps` gives the same number as `head_dim * norm_eps` when
+        a model has exactly as many heads as channels per head -- at head_dim 64,
+        that is hidden_size 4096 and nothing else. Every accuracy measurement this
+        port has been through ran on the 7.2B, which is precisely that width, so
+        the wrong multiplier reproduced the reference to four decimals and the
+        conversion check compared two routes that shared the mistake.
+
+        The config here is deliberately not square (4 heads of 8), so the two
+        candidates differ and the assertion has something to say.
+        """
+        config = _tiny_config()
+        self.assertNotEqual(config.num_heads, config.head_dim)  # else this proves nothing
+        model = Rwkv7Model(config)
+
+        for block in model.blocks:
+            self.assertAlmostEqual(block.att.ln_x.eps, config.norm_eps * config.head_dim, places=12)
+
     def test_forward_shapes_and_state(self):
         config = _tiny_config()
         model = _randomised(Rwkv7Model(config)).to(torch_device)

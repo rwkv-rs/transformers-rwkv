@@ -296,7 +296,16 @@ class Rwkv7Attention(nn.Module):
         self.value = nn.Linear(C, C, bias=False)
         self.output = nn.Linear(C, C, bias=False)
         # GroupNorm over heads, matching the reference's per-head normalisation.
-        self.ln_x = nn.GroupNorm(config.num_heads, C, eps=config.norm_eps * config.num_heads)
+        #
+        # The reference hardcodes `eps=64e-5`, which is `head_dim * 1e-5` at its
+        # head_dim of 64 -- NOT `num_heads * 1e-5`. The two coincide only when a
+        # model happens to have as many heads as channels per head, which for
+        # head_dim 64 means hidden_size 4096 exactly. Scaling by `num_heads` is
+        # therefore right on the 7.2B and wrong everywhere else: 2x low on the 1.5B,
+        # 5.33x low on the 0.1B. It is written against `head_dim` because that is
+        # the axis GroupNorm actually reduces over, so the constant tracks the
+        # reference at any width.
+        self.ln_x = nn.GroupNorm(config.num_heads, C, eps=config.norm_eps * config.head_dim)
 
     def forward(
         self,
