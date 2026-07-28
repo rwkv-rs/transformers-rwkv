@@ -100,6 +100,39 @@ a keyword, and returns `(output, new_state)`. The contract is to reproduce
 `rwkv7_recurrent`, which is also what the test suite checks against — so a fused or
 varlen kernel drops in without forking the model.
 
+### Reaching the quoted decode throughput
+
+Single-stream decode on the 7.2B checkpoint, RTX 5090, fp16, measured five times
+per row (spread ≤ 0.1%):
+
+| how it is run | tok/s |
+|---|---:|
+| eager | ~62 |
+| `torch.compile()` | 91.9 |
+| `torch.compile(mode="reduce-overhead")` + sparse channel-mix | 110.4 |
+| `torch.compile(mode="max-autotune")` + sparse channel-mix | **126.4** |
+
+The top row is 4× the bottom one's cost, so it is worth being explicit that three
+things have to line up — none of them is the default:
+
+```python
+model = Rwkv7ForCausalLM.from_pretrained(checkpoint, dtype=torch.float16, sparse_channel_mix=True)
+model = model.eval().cuda()
+state = model.rwkv7.allocate_state(batch_size=1)      # BEFORE compiling, not state=None
+compiled = torch.compile(model, mode="max-autotune", dynamic=False)
+```
+
+1. **`sparse_channel_mix=True`.** No checkpoint config carries this flag, so it
+   defaults to off and the dense path runs. It is worth +20%, and it is exact —
+   the activation is a squared ReLU, so the rows it skips contribute nothing.
+2. **`mode="max-autotune"`.** Plain `torch.compile()` gives 91.9 and
+   `"reduce-overhead"` 110.4; the decode is a long chain of small kernels, which is
+   what autotuning has the most to work with.
+3. **Allocate the state before compiling**, with `allocate_state`. Starting from
+   `state=None` creates the buffers inside the compiled region where they cannot be
+   pinned, and CUDA graphs are then skipped for mutating their inputs — on some
+   torch builds the cudagraph pass does not merely skip but segfaults.
+
 ### Performance notes
 
 Prefill runs a chunk-parallel form of the recurrence rather than a per-token loop:

@@ -633,6 +633,23 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.emb = new_embeddings
 
+    def allocate_state(self, batch: int, device=None, dtype=None) -> list:
+        """A zeroed recurrent state, with its buffers pinned for CUDA graphs.
+
+        Allocate this yourself and pass it in as `state=` before compiling with a
+        cudagraph mode. The pinning below only happens outside tracing --
+        `mark_static_address` is not callable during compilation -- so a call that
+        starts from `state=None` creates the buffers *inside* the compiled region,
+        where they stay unpinned. Inductor then reports `skipping cudagraphs due to
+        mutated inputs (3 instances)`, three being these buffers, and the decode
+        loses the graphs it most needs.
+        """
+        return self._empty_state(
+            batch,
+            device if device is not None else self.emb.weight.device,
+            dtype if dtype is not None else self.emb.weight.dtype,
+        )
+
     def _empty_state(self, batch: int, device, dtype) -> list:
         cfg = self.config
         L, C, H, N = cfg.num_hidden_layers, cfg.hidden_size, cfg.num_heads, cfg.head_dim
