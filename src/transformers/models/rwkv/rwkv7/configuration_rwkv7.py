@@ -13,8 +13,34 @@
 # limitations under the License.
 """RWKV-7 configuration"""
 
-from ...configuration_utils import PreTrainedConfig
-from ...utils import auto_docstring
+try:
+    from ....configuration_utils import PreTrainedConfig
+    from ....utils import auto_docstring
+except ImportError:
+    # Fallback stubs for standalone usage (testing without full transformers)
+    from dataclasses import dataclass
+
+    class PreTrainedConfig:
+        model_type: str = ""
+        is_encoder_decoder: bool = False
+        return_dict: bool = True
+        output_attentions: bool = False
+        output_hidden_states: bool = False
+        use_cache: bool = True
+
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+        def __post_init__(self, **kwargs):
+            pass
+
+    def auto_docstring(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        def decorator(c):
+            return c
+        return decorator
 
 
 @auto_docstring(checkpoint="BlinkDL/rwkv-7-world")
@@ -100,6 +126,12 @@ class Rwkv7Config(PreTrainedConfig):
     use_cache: bool = True
     deep_embedding: bool = True
     activation_precision: str = "fp32io16"
+    # Kernel backend: "auto" | "cuda" | "pytorch"
+    wkv_backend: str = "auto"
+    # Training kernel chunk length
+    wkv_chunk_len: int = 16
+    # Whether to auto-compile CUDA kernels at model init
+    auto_compile_kernels: bool = True
 
     def __post_init__(self, **kwargs):
         if self.intermediate_size is None:

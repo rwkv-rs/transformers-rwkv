@@ -229,10 +229,14 @@ def convert_state_dict(
             ln0_b = new_state_dict[ln0_b_key]
 
             # Fuse: emb = LayerNorm(emb, weight=ln0_w, bias=ln0_b)
+            # Block 0's ln0 is SKIPPED at runtime (deep_embedding=True),
+            # because nn.LayerNorm with identity weights still normalizes:
+            #   (x - mean) / std * 1 + 0 != x
+            # So we absorb ln0 into the embedding matrix.
             emb_fused = F.layer_norm(emb.float(), (hidden_size,), weight=ln0_w.float(), bias=ln0_b.float())
             new_state_dict[emb_key] = emb_fused.to(emb.dtype)
 
-            # Set ln0 to identity (output = input)
+            # ln0 weights are kept (loaded but unused at runtime)
             new_state_dict[ln0_w_key] = torch.ones(hidden_size, dtype=ln0_w.dtype)
             new_state_dict[ln0_b_key] = torch.zeros(hidden_size, dtype=ln0_b.dtype)
 
