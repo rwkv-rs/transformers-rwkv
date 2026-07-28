@@ -165,6 +165,10 @@ RWKV-7 checkpoint carries such a table; this is an extension point, off by defau
 
 [[autodoc]] Rwkv7Config
 
+## Rwkv7Cache
+
+[[autodoc]] Rwkv7Cache
+
 ## Rwkv7Model
 
 [[autodoc]] Rwkv7Model

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from ...cache_utils import Cache, LinearAttentionLayer
 from ...generation import GenerationMixin
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel
@@ -564,6 +565,134 @@ class Rwkv7FeedForward(nn.Module):
             self._value_fingerprint = fingerprint
 
 
+class Rwkv7CacheLayer(LinearAttentionLayer):
+    """One block's slice of the recurrent state: the WKV matrix and two token shifts.
+
+    Everything a beam search or a batched generate needs to do to a cache is a
+    permutation of its batch axis, and for RWKV-7 that is the whole job -- the state
+    is O(1) in sequence length, so there is no time axis to gather along and no
+    length bookkeeping to keep consistent.
+
+    The slot layout is [`Rwkv7Cache`]'s; this class only moves whatever is in them.
+    """
+
+    def lazy_initialization(self, conv_states=None, recurrent_states=None, state_idx: int = 0, **kwargs) -> None:
+        super().lazy_initialization(conv_states, recurrent_states, state_idx, **kwargs)
+        # Upstream records device/dtype only on the conv branch, since a linear
+        # attention layer normally has a convolution in front of it. This model has
+        # none, so without this every recurrent-only layer would keep `device=None`
+        # and `reorder_cache`'s `beam_idx.to(self.device)` would fail.
+        if recurrent_states is not None and self.device is None:
+            self.dtype, self.device = recurrent_states.dtype, recurrent_states.device
+
+    def allocate(
+        self, batch: int, shapes: dict[int, tuple], device, dtypes: dict[int, torch.dtype], state_dtype
+    ) -> None:
+        """Create every slot up front, zeroed, at pinned addresses.
+
+        The lazy path allocates a slot the first time it is written, which is inside
+        the compiled region -- and a buffer that first appears there cannot be given
+        a static address, so inductor declines CUDA graphs for a recurrent decode,
+        the one workload that most needs them.
+        """
+        for slot, shape in shapes.items():
+            buffer = torch.zeros((batch, *shape), device=device, dtype=dtypes[slot])
+            if not torch.compiler.is_compiling():
+                torch._dynamo.mark_static_address(buffer)
+            self.recurrent_states[slot] = buffer
+            self.is_recurrent_states_initialized[slot] = True
+            self.has_previous_state[slot] = True
+        self.dtype, self.device = state_dtype, device
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        """Permute the batch onto the beams that survived, without moving house.
+
+        Upstream rebinds each slot to the `index_select` result. That is correct but
+        it hands back a freshly allocated tensor, so the address pinned at allocation
+        is gone for the rest of the generation and the compiled decode quietly loses
+        its CUDA graphs. Copying back into the same buffer costs one temporary and
+        keeps the pinning.
+        """
+        for slot in range(self.number_of_states):
+            if self.is_recurrent_states_initialized[slot]:
+                buffer = self.recurrent_states[slot]
+                buffer.copy_(buffer.index_select(0, beam_idx.to(buffer.device)))
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        """Fan each sequence's state out to `repeats` copies, for one-prompt-many-samples.
+
+        This changes the batch size, so unlike `reorder_cache` it cannot preserve the
+        pinned addresses -- the buffers are necessarily new ones. Callers that then
+        compile should re-pin, which `Rwkv7Model.allocate_state` does.
+        """
+        for slot in range(self.number_of_states):
+            if self.is_recurrent_states_initialized[slot]:
+                self.recurrent_states[slot] = self.recurrent_states[slot].repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        """Keep only the given batch rows. Same address caveat as `batch_repeat_interleave`."""
+        for slot in range(self.number_of_states):
+            if self.is_recurrent_states_initialized[slot]:
+                self.recurrent_states[slot] = self.recurrent_states[slot][indices, ...]
+
+
+class Rwkv7Cache(Cache):
+    """The recurrent state of every block, as a `Cache`.
+
+    It replaces a KV cache and is a constant size: one `[num_heads, head_dim,
+    head_dim]` matrix and two `[hidden]` token shifts per layer per sequence,
+    whatever the context length. That is the property the architecture is for, so
+    `get_max_length()` is -1 (no limit) and nothing here grows as tokens arrive.
+    """
+
+    # Slot numbering inside one block's layer. All three are recurrent states:
+    # RWKV-7's token shift is a one-token history, not a convolution window, so it
+    # lives in a recurrent slot, where the update is a plain copy rather than the
+    # rolling concatenate a conv slot would do.
+    WKV, ATT_SHIFT, FFN_SHIFT = 0, 1, 2
+
+    def __init__(
+        self,
+        config: Rwkv7Config,
+        batch_size: int | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__(layers=[Rwkv7CacheLayer(number_of_states=3) for _ in range(config.num_hidden_layers)])
+        self.config = config
+        if batch_size is not None:
+            self.allocate(batch_size, device, dtype)
+
+    def allocate(self, batch_size: int, device=None, dtype=None) -> "Rwkv7Cache":
+        config = self.config
+        shapes = {
+            self.WKV: (config.num_heads, config.head_dim, config.head_dim),
+            self.ATT_SHIFT: (config.hidden_size,),
+            self.FFN_SHIFT: (config.hidden_size,),
+        }
+        # The WKV state carries the whole history and is the one place where a
+        # narrower dtype actually costs accuracy, so it is configured separately
+        # from the activation dtype the shifts follow.
+        dtypes = {
+            self.WKV: getattr(torch, config.wkv_state_dtype),
+            self.ATT_SHIFT: dtype,
+            self.FFN_SHIFT: dtype,
+        }
+        for layer in self.layers:
+            layer.allocate(batch_size, shapes, device, dtypes, dtypes[self.WKV])
+        return self
+
+    def read(self, layer_idx: int):
+        """This block's `(att_shift, ffn_shift, wkv)`, each None before allocation."""
+        states = self.layers[layer_idx].recurrent_states
+        return states[self.ATT_SHIFT], states[self.FFN_SHIFT], states[self.WKV]
+
+    def write(self, layer_idx: int, att_shift: torch.Tensor, ffn_shift: torch.Tensor, wkv: torch.Tensor) -> None:
+        self.update_recurrent_state(att_shift, layer_idx, self.ATT_SHIFT)
+        self.update_recurrent_state(ffn_shift, layer_idx, self.FFN_SHIFT)
+        self.update_recurrent_state(wkv, layer_idx, self.WKV)
+
+
 class Rwkv7Block(GradientCheckpointingLayer):
     def __init__(self, config: Rwkv7Config, layer_id: int):
         super().__init__()
@@ -582,7 +711,7 @@ class Rwkv7Block(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         v_first: torch.Tensor | None,
-        state: list | None,
+        state: Cache | None,
         deep_embed: torch.Tensor | None = None,
         keep: torch.Tensor | None = None,
         cu_seq_lens: torch.Tensor | None = None,
@@ -590,9 +719,7 @@ class Rwkv7Block(GradientCheckpointingLayer):
         if self.layer_id == 0:
             hidden_states = self.ln0(hidden_states)
 
-        att_shift = state[0][self.layer_id] if state is not None else None
-        ffn_shift = state[1][self.layer_id] if state is not None else None
-        wkv = state[2][self.layer_id] if state is not None else None
+        att_shift, ffn_shift, wkv = state.read(self.layer_id) if state is not None else (None, None, None)
 
         # Padding is blanked AFTER each norm, not before: a LayerNorm maps the zero
         # vector to its own bias, so masking the residual stream instead would let
@@ -611,41 +738,36 @@ class Rwkv7Block(GradientCheckpointingLayer):
         hidden_states = hidden_states + ffn_out
 
         if state is not None:
-            # Write into the pre-allocated slots rather than rebinding them: the
-            # buffers then keep fixed addresses across steps, which is what lets a
-            # captured CUDA graph replay the decode loop. Index assignment on the
-            # list entries defeats that and silently drops the graph.
-            state[0][self.layer_id].copy_(att_shift)
-            state[1][self.layer_id].copy_(ffn_shift)
-            state[2][self.layer_id].copy_(wkv)
+            # `update_recurrent_state` copies into the pre-allocated slot rather than
+            # rebinding it, so the buffers keep fixed addresses across steps -- which
+            # is what lets a captured CUDA graph replay the decode loop.
+            state.write(self.layer_id, att_shift, ffn_shift, wkv)
         return hidden_states, v_first, state
 
 
 @dataclass
 class Rwkv7Output(ModelOutput):
     r"""
-    state (`list[torch.FloatTensor]`, *optional*):
-        The recurrent state: `[att_shift, ffn_shift, wkv]`, where the shifts are
-        `[num_layers, batch, hidden]` and `wkv` is
-        `[num_layers, batch, num_heads, head_dim, head_dim]`. Feed it back to
-        continue a sequence; it replaces the KV cache and is O(1) in length.
+    state (`Rwkv7Cache`, *optional*):
+        The recurrent state of every block. Feed it back to continue a sequence; it
+        replaces the KV cache and is a constant size, whatever the context length.
     """
 
     last_hidden_state: torch.FloatTensor | None = None
-    state: list[torch.FloatTensor] | None = None
+    state: Rwkv7Cache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
 
 
 @dataclass
 class Rwkv7CausalLMOutput(ModelOutput):
     r"""
-    state (`list[torch.FloatTensor]`, *optional*):
+    state (`Rwkv7Cache`, *optional*):
         The recurrent state, as in [`Rwkv7Output`].
     """
 
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
-    state: list[torch.FloatTensor] | None = None
+    state: Rwkv7Cache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
 
 
@@ -656,25 +778,9 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
     _no_split_modules = ["Rwkv7Block"]
     supports_gradient_checkpointing = True
     _is_stateful = True
-
-    @staticmethod
-    def _reorder_cache(state: list, beam_idx: torch.LongTensor) -> list:
-        """Permute the recurrent state onto the beams that survived this step.
-
-        Beam search needs the cache to follow the beams, and a recurrent state is
-        the easy case: it is O(1) in length, so there is nothing to gather along a
-        time axis -- one `index_select` over the batch and the whole history moves
-        with it. Batch is dim 1 on every entry (dim 0 indexes the layer).
-
-        Done in place. `allocate_state` pins these buffers with
-        `mark_static_address` so the compiled decode can hold CUDA graphs, and
-        returning freshly allocated tensors here would quietly drop that pinning
-        for the rest of the generation. The `index_select` temporary is the price;
-        the buffers a caller handed in are still the buffers it gets back.
-        """
-        for entry in state:
-            entry.copy_(entry.index_select(1, beam_idx.to(entry.device)))
-        return state
+    # Beam search reorders through `Rwkv7Cache.reorder_cache`. Defining
+    # `_reorder_cache` here instead would take precedence over it in `generate` and
+    # bypass the cache's own bookkeeping, so it is deliberately absent.
 
 
 @auto_docstring
@@ -693,18 +799,18 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.emb = new_embeddings
 
-    def allocate_state(self, batch: int, device=None, dtype=None) -> list:
-        """A zeroed recurrent state, plus everything else the decode path builds lazily.
+    def allocate_state(self, batch: int, device=None, dtype=None) -> Rwkv7Cache:
+        """A zeroed cache, plus everything else the decode path would build lazily.
 
         Call this before compiling, and pass the result in as `state=`. Two kinds of
         buffer have to exist by then, and for the same reason: `mark_static_address`
         cannot run during tracing, so anything first allocated *inside* the compiled
         region stays unpinned, and inductor declines CUDA graphs for a region that
-        mutates its inputs. Starting from `state=None` loses them to three unpinned
-        state buffers; leaving the sparse path cold loses them to one unpinned
-        transposed weight. Either way the decode runs several times slower and says
-        so only in a line of warning, so both are handled here rather than left to
-        the caller to remember.
+        mutates its inputs. Starting from `state=None` loses them to the state
+        buffers; leaving the sparse path cold loses them to one unpinned transposed
+        weight. Either way the decode runs several times slower and says so only in
+        a line of warning, so both are handled here rather than left to the caller
+        to remember.
         """
         state = self._empty_state(
             batch,
@@ -716,23 +822,8 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
                 block.ffn.build_sparse_cache()
         return state
 
-    def _empty_state(self, batch: int, device, dtype) -> list:
-        cfg = self.config
-        L, C, H, N = cfg.num_hidden_layers, cfg.hidden_size, cfg.num_heads, cfg.head_dim
-        state = [
-            torch.zeros(L, batch, C, device=device, dtype=dtype),
-            torch.zeros(L, batch, C, device=device, dtype=dtype),
-            torch.zeros(L, batch, H, N, N, device=device, dtype=getattr(torch, cfg.wkv_state_dtype)),
-        ]
-        # The recurrence writes into these buffers every step. Left as ordinary
-        # inputs that would make the compiled region "mutate its inputs", which
-        # disqualifies it from CUDA graphs -- and a recurrent decode is exactly the
-        # workload that needs them. Pinning the addresses is what `StaticCache`
-        # does for the same reason.
-        if not torch.compiler.is_compiling():
-            for buffer in state:
-                torch._dynamo.mark_static_address(buffer)
-        return state
+    def _empty_state(self, batch: int, device, dtype) -> Rwkv7Cache:
+        return Rwkv7Cache(self.config, batch_size=batch, device=device, dtype=dtype)
 
     @auto_docstring
     def forward(
@@ -740,7 +831,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        state: list[torch.FloatTensor] | None = None,
+        state: Rwkv7Cache | None = None,
         deep_embeds: torch.FloatTensor | None = None,
         cu_seq_lens: torch.LongTensor | None = None,
         use_cache: bool | None = None,
@@ -749,9 +840,9 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         **kwargs,
     ) -> tuple | Rwkv7Output:
         r"""
-        state (`list[torch.FloatTensor]`, *optional*):
+        state (`Rwkv7Cache`, *optional*):
             Recurrent state returned by a previous call; pass it back to continue
-            the sequence.
+            the sequence. Allocated on the first forward if omitted.
         deep_embeds (`torch.FloatTensor`, *optional*):
             RWKV-8 DeepEmbed vectors for this batch, shaped
             `[num_layers, batch, seq_len, deep_embed_size]` (or broadcastable).
@@ -870,7 +961,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        state: list[torch.FloatTensor] | None = None,
+        state: Rwkv7Cache | None = None,
         deep_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
@@ -879,7 +970,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> tuple | Rwkv7CausalLMOutput:
         r"""
-        state (`list[torch.FloatTensor]`, *optional*):
+        state (`Rwkv7Cache`, *optional*):
             Recurrent state returned by a previous call.
         deep_embeds (`torch.FloatTensor`, *optional*):
             RWKV-8 DeepEmbed vectors; see [`Rwkv7Model.forward`].
@@ -907,4 +998,4 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         return Rwkv7CausalLMOutput(loss=loss, logits=logits, state=outputs.state, hidden_states=outputs.hidden_states)
 
 
-__all__ = ["Rwkv7PreTrainedModel", "Rwkv7Model", "Rwkv7ForCausalLM"]
+__all__ = ["Rwkv7Cache", "Rwkv7PreTrainedModel", "Rwkv7Model", "Rwkv7ForCausalLM"]

@@ -27,7 +27,7 @@ from transformers.testing_utils import require_torch, require_torch_gpu, torch_d
 if is_torch_available():
     import torch
 
-    from transformers import Rwkv7ForCausalLM, Rwkv7Model
+    from transformers import Rwkv7Cache, Rwkv7ForCausalLM, Rwkv7Model
 
 
 def _tiny_config(**kwargs):
@@ -55,6 +55,23 @@ def _randomised(model):
     return model.eval()
 
 
+def _sharpened(model):
+    """Same, but at a scale where a broken recurrent state actually shows.
+
+    0.05 keeps the whole model in small numbers, which is what
+    `test_left_padded_row_matches_the_same_row_alone` needs and reasons about. It is
+    the wrong scale for anything that checks the state *carry*: at 0.05, deleting
+    the WKV write-back entirely moves the logits by 6.8e-06, which sails under a
+    1e-4 tolerance -- the test would be green with the recurrence dead. At 0.5 the
+    same sabotage moves them by 6.8e-01, five orders of magnitude clear of the noise
+    floor of 3.3e-06. Measured, not guessed; see the sabotage matrix in the commit.
+    """
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0.0, 0.5)
+    return model.eval()
+
+
 @require_torch
 class Rwkv7ModelTest(unittest.TestCase):
     def test_config_rejects_inconsistent_heads(self):
@@ -70,23 +87,47 @@ class Rwkv7ModelTest(unittest.TestCase):
 
         out = model(input_ids=input_ids, use_cache=True)
         self.assertEqual(out.last_hidden_state.shape, (2, 7, config.hidden_size))
-        att_shift, ffn_shift, wkv = out.state
-        self.assertEqual(att_shift.shape, (config.num_hidden_layers, 2, config.hidden_size))
-        self.assertEqual(ffn_shift.shape, (config.num_hidden_layers, 2, config.hidden_size))
-        self.assertEqual(
-            wkv.shape,
-            (config.num_hidden_layers, 2, config.num_heads, config.head_dim, config.head_dim),
-        )
+
+        cache = out.state
+        self.assertIsInstance(cache, Rwkv7Cache)
+        self.assertEqual(len(cache), config.num_hidden_layers)
+        # No sequence axis anywhere in here, at any layer -- that is the architecture's
+        # whole claim, and the shapes are where it is either true or not.
+        for layer_idx in range(config.num_hidden_layers):
+            att_shift, ffn_shift, wkv = cache.read(layer_idx)
+            self.assertEqual(att_shift.shape, (2, config.hidden_size))
+            self.assertEqual(ffn_shift.shape, (2, config.hidden_size))
+            self.assertEqual(wkv.shape, (2, config.num_heads, config.head_dim, config.head_dim))
+
+    def test_state_size_does_not_grow_with_context(self):
+        """The O(1) claim, measured in bytes rather than asserted in a docstring."""
+        config = _tiny_config()
+        model = _randomised(Rwkv7Model(config)).to(torch_device)
+
+        def cache_bytes(length):
+            ids = torch.randint(0, config.vocab_size, (1, length), device=torch_device)
+            with torch.no_grad():
+                cache = model(input_ids=ids, use_cache=True).state
+            return sum(
+                state.numel() * state.element_size()
+                for layer in cache.layers
+                for state in layer.recurrent_states.values()
+                if state is not None
+            )
+
+        self.assertEqual(cache_bytes(4), cache_bytes(256))
+        self.assertEqual(cache_bytes(4), cache_bytes(1024))
 
     def test_prefill_matches_incremental_decoding(self):
         """Reading a prefix in one go must equal reading it one token at a time.
 
         This is the property that makes the carried state a real cache rather than
         an approximation; it fails loudly if the token shift, the WKV recurrence or
-        the v_first hand-off is wired wrong.
+        the v_first hand-off is wired wrong -- but only at a weight scale where the
+        state contributes more than the tolerance, hence `_sharpened`.
         """
         config = _tiny_config()
-        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
         input_ids = torch.randint(0, config.vocab_size, (2, 9), device=torch_device)
 
         with torch.no_grad():
@@ -348,27 +389,111 @@ class Rwkv7ModelTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(first, second))
 
+    @staticmethod
+    def _signed_cache(model, batch, device):
+        """A cache whose every batch row carries a value only that row has.
+
+        Every test below permutes the batch and then asks where each row went, which
+        only means something if the rows were told apart to begin with.
+        """
+        cache = model.rwkv7.allocate_state(batch, device=device)
+        for row in range(batch):
+            for layer in cache.layers:
+                for state in layer.recurrent_states.values():
+                    state[row] = row + 1
+        return cache
+
+    @staticmethod
+    def _every_state(cache):
+        return [state for layer in cache.layers for state in layer.recurrent_states.values()]
+
     def test_reorder_cache_moves_the_state_onto_the_beams(self):
         config = _tiny_config()
         model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
-        state = model.rwkv7.allocate_state(4, device=torch_device)
-        # Give every batch row a value only that row has, so a permutation that
-        # lands on the wrong source cannot pass by looking plausible.
-        for entry in state:
-            for row in range(4):
-                entry[:, row] = row + 1
-        addresses = [entry.data_ptr() for entry in state]
+        cache = self._signed_cache(model, 4, torch_device)
+        addresses = [state.data_ptr() for state in self._every_state(cache)]
 
         # 2 appears twice: a reorder that aliased its source into its destination
         # would corrupt the second copy.
         beams = [2, 2, 0, 3]
-        reordered = model._reorder_cache(state, torch.tensor(beams, device=torch_device))
+        cache.reorder_cache(torch.tensor(beams, device=torch_device))
 
-        for entry in reordered:
+        for state in self._every_state(cache):
             for row, source in enumerate(beams):
-                self.assertTrue(torch.all(entry[:, row] == source + 1))
+                self.assertTrue(torch.all(state[row] == source + 1))
         # In place, so the addresses `allocate_state` pinned are still pinned.
-        self.assertEqual([entry.data_ptr() for entry in reordered], addresses)
+        self.assertEqual([state.data_ptr() for state in self._every_state(cache)], addresses)
+
+    def test_cache_batch_repeat_and_select(self):
+        """The two batch edits `generate` makes outside beam search.
+
+        `num_return_sequences` fans one prompt's state out to several rows before
+        sampling; assisted and contrastive decoding drop rows again. Both change the
+        batch size, which is why -- unlike `reorder_cache` -- they cannot keep the
+        pinned buffers, and that is asserted rather than left as a surprise.
+        """
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        cache = self._signed_cache(model, 2, torch_device)
+
+        cache.batch_repeat_interleave(3)
+        for state in self._every_state(cache):
+            self.assertEqual(state.shape[0], 6)
+            # interleaved, so rows read 1,1,1,2,2,2 -- not 1,2,1,2,1,2
+            self.assertTrue(torch.all(state[:3] == 1))
+            self.assertTrue(torch.all(state[3:] == 2))
+
+        cache.batch_select_indices(torch.tensor([0, 4], device=torch_device))
+        for state in self._every_state(cache):
+            self.assertEqual(state.shape[0], 2)
+            self.assertTrue(torch.all(state[0] == 1))
+            self.assertTrue(torch.all(state[1] == 2))
+
+    def test_allocate_state_pins_every_buffer(self):
+        """Unpinned state buffers cost CUDA graphs, and say so only in a log line.
+
+        The whole reason `allocate_state` exists is that a buffer first allocated
+        inside a compiled region cannot be given a static address, after which
+        inductor declines CUDA graphs for a recurrent decode. Nothing throws; the
+        decode just runs several times slower. Checking the mark directly is the
+        only way that failure becomes visible without a GPU and a compile.
+
+        `_dynamo_static_input_type` is private to torch. If it is renamed this test
+        breaks loudly, which is the right failure -- the alternative is a silent
+        performance regression nobody notices for a release.
+        """
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        cache = model.rwkv7.allocate_state(2, device=torch_device)
+
+        for state in self._every_state(cache):
+            self.assertEqual(getattr(state, "_dynamo_static_input_type", None), "unguarded")
+
+    def test_cache_reset_clears_every_slot(self):
+        config = _tiny_config()
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        cache = self._signed_cache(model, 2, torch_device)
+        addresses = [state.data_ptr() for state in self._every_state(cache)]
+
+        cache.reset()
+
+        for state in self._every_state(cache):
+            self.assertTrue(torch.all(state == 0))
+        # Reset means "forget the sequence", not "throw the buffers away".
+        self.assertEqual([state.data_ptr() for state in self._every_state(cache)], addresses)
+
+    def test_cache_carries_a_sequence_the_same_as_a_plain_rerun(self):
+        """The cache is only useful if continuing through it equals never stopping."""
+        config = _tiny_config()
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
+        ids = torch.randint(1, config.vocab_size, (2, 9), device=torch_device)
+
+        with torch.no_grad():
+            whole = model(input_ids=ids).logits
+            cache = model(input_ids=ids[:, :4], use_cache=True).state
+            rest = model(input_ids=ids[:, 4:], state=cache, use_cache=True).logits
+
+        torch.testing.assert_close(rest, whole[:, 4:], rtol=1e-4, atol=1e-4)
 
     def test_beam_search_score_survives_an_independent_rescore(self):
         """Beam search accumulated a score through the state; rescore it fresh.
@@ -399,11 +524,7 @@ class Rwkv7ModelTest(unittest.TestCase):
         """
         config = _tiny_config()
         torch.manual_seed(0)
-        model = Rwkv7ForCausalLM(config)
-        with torch.no_grad():
-            for parameter in model.parameters():
-                parameter.normal_(0.0, 0.5)
-        model = model.eval().to(torch_device)
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
         prompt = torch.randint(0, config.vocab_size, (1, 4), device=torch_device)
 
         with torch.no_grad():
