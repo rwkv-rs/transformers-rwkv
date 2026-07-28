@@ -128,10 +128,17 @@ compiled = torch.compile(model, mode="max-autotune", dynamic=False)
 2. **`mode="max-autotune"`.** Plain `torch.compile()` gives 91.9 and
    `"reduce-overhead"` 110.4; the decode is a long chain of small kernels, which is
    what autotuning has the most to work with.
-3. **Allocate the state before compiling**, with `allocate_state`. Starting from
-   `state=None` creates the buffers inside the compiled region where they cannot be
-   pinned, and CUDA graphs are then skipped for mutating their inputs — on some
-   torch builds the cudagraph pass does not merely skip but segfaults.
+3. **Call `allocate_state` before compiling.** Anything first allocated *inside* the
+   compiled region cannot have its address pinned — `mark_static_address` does not run
+   during tracing — and inductor then declines CUDA graphs for a region that mutates
+   its inputs. Both the recurrent state and the sparse path's transposed weight are in
+   that category, which is why one call handles both; on some torch builds the
+   cudagraph pass does not merely skip but segfaults. Passing `state=None` and letting
+   the model allocate is correct, just several times slower.
+
+For more than this, the kernels are a separate, optional package rather than part of
+the model: `transformers` keeps the portable implementation that builds and runs
+anywhere and that these are checked against.
 
 ### Performance notes
 

@@ -405,6 +405,41 @@ class Rwkv7ModelTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _tiny_config(wkv_state_dtype=bad)
 
+    @require_torch_gpu
+    def test_allocate_state_warms_the_sparse_caches(self):
+        """Everything the compiled decode needs must exist before compiling.
+
+        The caches are built lazily by the projection, which is fine eagerly and a
+        2.7x loss under compilation: allocated inside the traced region they cannot
+        be pinned, so CUDA graphs are declined for mutating inputs -- a slowdown that
+        announces itself only as a warning line. `allocate_state` is the one call the
+        compiled path already requires, so it warms them too.
+        """
+        config = _tiny_config(sparse_channel_mix=True)
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device).half()
+
+        for block in model.rwkv7.blocks:
+            self.assertIsNone(block.ffn._value_t)
+
+        model.rwkv7.allocate_state(1)
+
+        for block in model.rwkv7.blocks:
+            self.assertIsNotNone(block.ffn._value_t)
+            self.assertIsNotNone(block.ffn._accumulator)
+            # transposed: the sparse read needs one contiguous row per input channel
+            self.assertEqual(tuple(block.ffn._value_t.shape), tuple(block.ffn.value.weight.shape[::-1]))
+
+    def test_allocate_state_leaves_the_dense_path_cold(self):
+        """With the sparse path off, nothing extra should be materialised -- the
+        transposed copy costs about 30% more weight memory."""
+        config = _tiny_config(sparse_channel_mix=False)
+        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+
+        model.rwkv7.allocate_state(1)
+
+        for block in model.rwkv7.blocks:
+            self.assertIsNone(block.ffn._value_t)
+
     def test_sparse_channel_mix_matches_dense(self):
         """Skipping zero channels must be exact, not merely close.
 

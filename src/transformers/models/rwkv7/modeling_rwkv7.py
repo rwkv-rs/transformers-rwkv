@@ -464,20 +464,30 @@ class Rwkv7FeedForward(nn.Module):
         layout does not give, and materialising it eagerly would cost every user
         the memory whether or not they enable this.
         """
-        weight = self.value.weight
         if not torch.compiler.is_compiling():
-            _ensure_sparse_op()
-            # Tie the cache to the weight's identity AND its in-place version, so a
-            # `mul_`, a fresh load, or a replaced parameter all invalidate it. A
-            # cache that silently survives a weight change is worse than no cache.
-            # Skipped while compiling: `data_ptr()` would break the graph, and the
-            # weights cannot change inside a captured region anyway.
-            fingerprint = (weight.data_ptr(), weight._version, weight.dtype)
-            if self._value_t is None or self._value_fingerprint != fingerprint:
-                self._value_t = weight.t().contiguous()
-                self._accumulator = torch.zeros(weight.shape[0], device=weight.device, dtype=torch.float32)
-                self._value_fingerprint = fingerprint
+            self.build_sparse_cache()
         return sparse_channel_mix_value(activation, self._value_t, self._accumulator)
+
+    def build_sparse_cache(self) -> None:
+        """Materialise the transposed weight and the accumulator the sparse path needs.
+
+        Called lazily from the projection, and eagerly by
+        [`Rwkv7Model.allocate_state`] — which is what makes it safe to compile. Built
+        for the first time *inside* a compiled region these buffers cannot have their
+        addresses pinned, inductor declines CUDA graphs for a region that mutates its
+        inputs, and the decode runs 2.7x slower while reporting nothing but a single
+        line of warning.
+        """
+        weight = self.value.weight
+        _ensure_sparse_op()
+        # Tie the cache to the weight's identity AND its in-place version, so a
+        # `mul_`, a fresh load, or a replaced parameter all invalidate it. A cache
+        # that silently survives a weight change is worse than no cache.
+        fingerprint = (weight.data_ptr(), weight._version, weight.dtype)
+        if self._value_t is None or self._value_fingerprint != fingerprint:
+            self._value_t = weight.t().contiguous()
+            self._accumulator = torch.zeros(weight.shape[0], device=weight.device, dtype=torch.float32)
+            self._value_fingerprint = fingerprint
 
 
 class Rwkv7Block(GradientCheckpointingLayer):
@@ -591,21 +601,27 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         self.emb = new_embeddings
 
     def allocate_state(self, batch: int, device=None, dtype=None) -> list:
-        """A zeroed recurrent state, with its buffers pinned for CUDA graphs.
+        """A zeroed recurrent state, plus everything else the decode path builds lazily.
 
-        Allocate this yourself and pass it in as `state=` before compiling with a
-        cudagraph mode. The pinning below only happens outside tracing --
-        `mark_static_address` is not callable during compilation -- so a call that
-        starts from `state=None` creates the buffers *inside* the compiled region,
-        where they stay unpinned. Inductor then reports `skipping cudagraphs due to
-        mutated inputs (3 instances)`, three being these buffers, and the decode
-        loses the graphs it most needs.
+        Call this before compiling, and pass the result in as `state=`. Two kinds of
+        buffer have to exist by then, and for the same reason: `mark_static_address`
+        cannot run during tracing, so anything first allocated *inside* the compiled
+        region stays unpinned, and inductor declines CUDA graphs for a region that
+        mutates its inputs. Starting from `state=None` loses them to three unpinned
+        state buffers; leaving the sparse path cold loses them to one unpinned
+        transposed weight. Either way the decode runs several times slower and says
+        so only in a line of warning, so both are handled here rather than left to
+        the caller to remember.
         """
-        return self._empty_state(
+        state = self._empty_state(
             batch,
             device if device is not None else self.emb.weight.device,
             dtype if dtype is not None else self.emb.weight.dtype,
         )
+        if self.config.sparse_channel_mix:
+            for block in self.blocks:
+                block.ffn.build_sparse_cache()
+        return state
 
     def _empty_state(self, batch: int, device, dtype) -> list:
         cfg = self.config
