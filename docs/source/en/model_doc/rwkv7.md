@@ -100,6 +100,55 @@ a keyword, and returns `(output, new_state)`. The contract is to reproduce
 `rwkv7_recurrent`, which is also what the test suite checks against — so a fused or
 varlen kernel drops in without forking the model.
 
+A worked example, against `vllm-rwkv`'s varlen WKV. Its calling convention is not
+guessable from the signature and was read off that project's own call site, then
+checked against `rwkv7_recurrent` before being relied on: `w` is the LoRA output
+*before* the decay transform (the kernel applies that itself), the rank-one pair is
+`(-kk, kk * a)`, activations are fp16 while the state is fp32, and `head_dim` must be
+64. Single-token decode is a different entry point, `wkv_one`, whose state is fp16.
+
+```python
+import torch
+from transformers.models.rwkv7.modeling_rwkv7 import RWKV7_WKV_FUNCTIONS
+
+torch.ops.load_library("<vllm-rwkv>/vllm/rwkv7_ops.abi3.so")
+_INV_SQRT_E = 0.6065306597126334
+
+
+def vllm_varlen_wkv(r, w_log, k, v, kk, a, state, cu_seq_lens=None, **kwargs):
+    batch, seq_len, heads, head_dim = r.shape
+    channels = heads * head_dim
+    # This model carries `w_log = -INV_SQRT_E * sigmoid(w_raw)`; the kernel wants
+    # `w_raw` and applies the transform itself, so invert it here.
+    sigmoid = (-w_log / _INV_SQRT_E).clamp(1e-6, 1 - 1e-6)
+    w_raw = torch.log(sigmoid / (1 - sigmoid))
+    flat = lambda t: t.reshape(batch * seq_len, channels).to(torch.float16).contiguous()
+
+    # Without `cu_seq_lens` every row of the batch is its own segment.
+    cu = cu_seq_lens if cu_seq_lens is not None else torch.arange(
+        0, batch * seq_len + 1, seq_len, device=r.device)
+    n_seq = cu.numel() - 1
+    lengths = (cu[1:] - cu[:-1]).tolist()
+    slot_state = torch.zeros(n_seq, heads, head_dim, head_dim, device=r.device, dtype=torch.float32)
+    y = torch.empty(batch * seq_len, channels, device=r.device, dtype=torch.float16)
+    torch.ops.rwkv7_wkv_fp32_v2.forward_varlen(
+        n_seq, batch * seq_len, max(lengths), channels, heads, cu.to(torch.int32),
+        torch.arange(n_seq, device=r.device, dtype=torch.int32), slot_state,
+        flat(r), flat(w_raw), flat(k), flat(v), flat(-kk), flat(kk * a), y)
+    # This model's contract returns the LAST segment's state.
+    return y.view(batch, seq_len, heads, head_dim).to(r.dtype), slot_state[-1:].to(state.dtype)
+
+
+RWKV7_WKV_FUNCTIONS["vllm_varlen"] = vllm_varlen_wkv
+```
+
+Checked against `rwkv7_recurrent` on three shapes — a packed row of uneven segments
+(5 + 7), an unpacked `batch=1`, and an unpacked `batch=3` — at relative errors of
+2.6e-04 to 5.2e-04, which is fp16 against an fp32 reference. On one RTX 5090 with the
+7.2B checkpoint it takes `1x256` prefill from 94% to 105% of `albatross faster3a`;
+single-token decode is unchanged, because that step is bound by streaming the weights
+rather than by the recurrence.
+
 ### Reaching the quoted decode throughput
 
 Single-stream decode on the 7.2B checkpoint, RTX 5090, fp16, measured five times
