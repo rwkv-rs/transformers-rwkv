@@ -138,8 +138,16 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
     # them at layer 0, and dropping them would mean this port can read that file but
     # not write it back. `test_layer_zero_value_residual_lora_is_unused` pins the
     # property this skip rests on, so it is checked somewhere rather than asserted
-    # here in prose. Gradient checkpointing itself is supported and exercised by
-    # `test_gradient_checkpointing_enable_disable` and by `test_training`.
+    # here in prose.
+    #
+    # This comment used to end by saying gradient checkpointing was "supported and
+    # exercised by `test_gradient_checkpointing_enable_disable` and by `test_training`".
+    # Neither runs a checkpointed backward -- the first only toggles flags and asserts
+    # the attributes moved, the second never enables checkpointing -- so skipping the
+    # three tests below left that path with no coverage at all, and it was in fact
+    # broken. It is covered now by `test_checkpointed_backward_matches_the_plain_one`,
+    # written here rather than inherited so it can sidestep the v-LoRA property these
+    # three trip over.
     _V_LORA_SKIP = (
         "layer 0's value-residual LoRA is structurally unreachable, so it has no "
         "gradient; see test_layer_zero_value_residual_lora_is_unused"
@@ -248,6 +256,84 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             incremental = torch.cat(steps, dim=1)
 
         torch.testing.assert_close(full, incremental, rtol=1e-4, atol=1e-4)
+
+    def test_checkpointed_backward_matches_the_plain_one(self):
+        """Gradient checkpointing must not change a gradient.
+
+        The three inherited tests for this are skipped over layer 0's unused v-LoRA,
+        and the two tests this file's skip comment pointed at instead turned out to
+        run no checkpointed backward at all -- one toggles flags, the other never
+        enables checkpointing. With nothing exercising it, the path was broken:
+        `GradientCheckpointingLayer` disarms a live cache only when it arrives as a
+        keyword it recognises, this model passes its state positionally, so the
+        backward replay re-read a state the forward had already advanced. Reentrant
+        checkpointing returned wrong gradients for 99 of 102 parameters with no error;
+        the non-reentrant default raised.
+
+        Comparing against the unpatched backward rather than checking for absence is
+        the point: the reentrant failure produced gradients, they were just wrong.
+        """
+        config = _tiny_config()
+        input_ids = torch.randint(0, config.vocab_size, (2, 8), device=torch_device)
+
+        def gradients(checkpointing, reentrant=True):
+            # Seeded per build: `_sharpened` draws fresh weights, so without this the
+            # comparison is between two different models and reports a difference
+            # whatever checkpointing does.
+            torch.manual_seed(0)
+            model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device).train()
+            if checkpointing:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": reentrant}
+                )
+            model(input_ids=input_ids, labels=input_ids).loss.backward()
+            return {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+
+        plain = gradients(checkpointing=False)
+        for reentrant in (True, False):
+            checkpointed = gradients(checkpointing=True, reentrant=reentrant)
+            self.assertEqual(set(plain), set(checkpointed), f"use_reentrant={reentrant}")
+            for name in plain:
+                torch.testing.assert_close(
+                    plain[name], checkpointed[name], rtol=1e-3, atol=1e-5,
+                    msg=f"{name} differs under checkpointing (use_reentrant={reentrant})",
+                )
+
+    def test_the_last_real_token_is_found_by_index_not_by_float_arithmetic(self):
+        """Finding the last unmasked position must not depend on the model's dtype.
+
+        The search was `(mask * arange).argmax()`, evaluated in the activation dtype
+        because the mask is cast to it. bfloat16 carries eight mantissa bits, so past
+        position 256 the products stop being distinct, `argmax` returns the first of a
+        tie, and the state handed back comes from several tokens short of the end --
+        1022 for 1023 at length 1024, 4088 for 4095 at 4096. An all-ones mask is
+        enough, which is what `generate` sends, so this was never confined to padded
+        batches.
+
+        Asserted against the mask-free path rather than against a hardcoded index: a
+        full-length mask asks for exactly what no mask asks for, so the two must agree
+        whatever the dtype.
+        """
+        config = _tiny_config()
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device).eval()
+        seq_len = 1024
+        input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=torch_device)
+        ones = torch.ones(1, seq_len, dtype=torch.long, device=torch_device)
+
+        for dtype in (torch.float32, torch.bfloat16):
+            typed = model.to(dtype)
+            with torch.no_grad():
+                masked = typed(input_ids=input_ids, attention_mask=ones, use_cache=True).state
+                unmasked = typed(input_ids=input_ids, use_cache=True).state
+
+            for layer in range(config.num_hidden_layers):
+                for slot in (Rwkv7Cache.WKV, Rwkv7Cache.ATT_SHIFT, Rwkv7Cache.FFN_SHIFT):
+                    torch.testing.assert_close(
+                        masked.layers[layer].recurrent_states[slot].float(),
+                        unmasked.layers[layer].recurrent_states[slot].float(),
+                        rtol=0, atol=0,
+                        msg=f"{dtype} layer {layer} slot {slot}: an all-ones mask moved the state",
+                    )
 
     def test_compiled_prefill_matches_eager_at_batch_and_length(self):
         """`torch.compile` must survive a shape with both a batch and a length.

@@ -1034,6 +1034,18 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        # Gradient checkpointing replays the forward during backward. If the cache is
+        # live, the replay re-reads a state the first pass already advanced, and the
+        # gradients that come back are wrong rather than absent. `GradientCheckpointingLayer`
+        # neutralises this itself, but only for a cache arriving as a keyword named
+        # `use_cache` / `past_key_values` / `layer_past`; this model hands its state to
+        # the block positionally, so none of those guards see it and the whole thing
+        # has to be caught here.
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
 
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
