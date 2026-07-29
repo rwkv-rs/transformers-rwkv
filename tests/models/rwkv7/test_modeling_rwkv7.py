@@ -283,9 +283,7 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             torch.manual_seed(0)
             model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device).train()
             if checkpointing:
-                model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": reentrant}
-                )
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": reentrant})
             model(input_ids=input_ids, labels=input_ids).loss.backward()
             return {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
 
@@ -295,7 +293,10 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             self.assertEqual(set(plain), set(checkpointed), f"use_reentrant={reentrant}")
             for name in plain:
                 torch.testing.assert_close(
-                    plain[name], checkpointed[name], rtol=1e-3, atol=1e-5,
+                    plain[name],
+                    checkpointed[name],
+                    rtol=1e-3,
+                    atol=1e-5,
                     msg=f"{name} differs under checkpointing (use_reentrant={reentrant})",
                 )
 
@@ -331,7 +332,8 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
                     torch.testing.assert_close(
                         masked.layers[layer].recurrent_states[slot].float(),
                         unmasked.layers[layer].recurrent_states[slot].float(),
-                        rtol=0, atol=0,
+                        rtol=0,
+                        atol=0,
                         msg=f"{dtype} layer {layer} slot {slot}: an all-ones mask moved the state",
                     )
 
@@ -516,11 +518,25 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         config = _tiny_config(sparse_channel_mix=True)
         model = Rwkv7ForCausalLM(config)
         ffn = model.rwkv7.blocks[0].ffn
-        ffn._value_fingerprint = ("pretend a cache was built",)
 
-        ffn.invalidate_sparse_cache()
+        with torch.no_grad():
+            ffn.build_sparse_cache()
+            # `.data.copy_` is the mutation the fingerprint is documented as unable to
+            # see: it does not step the version counter and it reuses the storage, so
+            # the cached transpose stays stale and nothing detects it.
+            ffn.value.weight.data.copy_(torch.randn_like(ffn.value.weight))
+            ffn.build_sparse_cache()
+            stale = ffn._value_t.clone()
+            self.assertFalse(
+                torch.allclose(stale, ffn.value.weight.t()),
+                "the edit was already visible without invalidate, so this proves nothing",
+            )
 
-        self.assertIsNone(ffn._value_fingerprint)
+            ffn.invalidate_sparse_cache()
+            self.assertIsNone(ffn._value_fingerprint)
+            ffn.build_sparse_cache()
+
+        torch.testing.assert_close(ffn._value_t, ffn.value.weight.t().contiguous())
 
     def test_wkv_implementation_is_selectable(self):
         """The recurrence is looked up by name, so a kernel can be dropped in.
@@ -554,7 +570,6 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertEqual(len(calls), config.num_hidden_layers)
         self.assertTrue(torch.equal(expected, got))
 
-    @require_torch_gpu
     def test_heavily_padded_fp16_batch_is_finite(self):
         """Padding in fp16, at a realistic pad fraction, must not produce NaN.
 
@@ -565,6 +580,12 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         whole row comes out NaN. Caught on real prompts, not here — hence the pad
         fraction below is 90%, like a short prompt batched with a long one, rather
         than the three pad tokens the other test uses.
+
+        Not gated on a GPU. It used to be, and the guard it protects is a dtype
+        question rather than a device one: fp16 runs on CPU perfectly well, the epsilon
+        is unrepresentable there too, and removing the guard makes these logits
+        non-finite on this machine. Behind `@require_torch_gpu` the only test for a
+        real user-facing bug never ran on the CI that gates the PR.
         """
         config = _tiny_config(sparse_channel_mix=False)
         model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device).half()
@@ -642,17 +663,34 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertGreater((plain - silenced).abs().max().item(), 0.0)
 
     def test_deep_embed_four_x_variant(self):
-        """A table as wide as the channel-mix inner width modulates its input instead."""
+        """A table as wide as the channel-mix inner width modulates its input instead.
+
+        Two assertions, and the second is the one that matters. A table of ones being
+        a no-op is equally true when the modulation has been deleted, and this test
+        used to stop there: removing `inner = inner * deep_embed` from the 4x branch
+        left the whole suite green. The sibling 1x test happens to cover its own
+        branch that way, and the GPU-gated sparse test is skipped on CPU CI, so
+        nothing anywhere reached this multiply.
+        """
         config = _tiny_config(use_deep_embed=True, deep_embed_size=64)
-        model = _randomised(Rwkv7ForCausalLM(config)).to(torch_device)
+        # `_sharpened`, not `_randomised`: at the 0.05 scale the channel-mix
+        # contribution to the logits is itself below a 1e-3 tolerance, so silencing it
+        # entirely is indistinguishable from silencing nothing and the second
+        # assertion would be as toothless as the one it replaces.
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
         input_ids = torch.randint(0, config.vocab_size, (1, 4), device=torch_device)
+        table = (config.num_hidden_layers, 1, 4, config.intermediate_size)
 
         with torch.no_grad():
             plain = model(input_ids=input_ids).logits
-            ones = torch.ones(config.num_hidden_layers, 1, 4, config.intermediate_size, device=torch_device)
-            neutral = model(input_ids=input_ids, deep_embeds=ones).logits
+            neutral = model(input_ids=input_ids, deep_embeds=torch.ones(*table, device=torch_device)).logits
+            damped = model(input_ids=input_ids, deep_embeds=torch.zeros(*table, device=torch_device)).logits
 
         torch.testing.assert_close(plain, neutral, rtol=1e-5, atol=1e-5)
+        self.assertFalse(
+            torch.allclose(plain, damped, rtol=1e-3, atol=1e-3),
+            "a table of zeros left the logits unchanged, so the 4x modulation is not wired up",
+        )
 
     def test_generate_is_deterministic_under_greedy(self):
         config = _tiny_config()

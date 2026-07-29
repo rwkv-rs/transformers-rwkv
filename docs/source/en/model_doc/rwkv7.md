@@ -164,8 +164,13 @@ def vllm_varlen_wkv(r, w_log, k, v, kk, a, state, cu_seq_lens=None, **kwargs):
         n_seq, batch * seq_len, max(lengths), channels, heads, cu.to(torch.int32),
         torch.arange(n_seq, device=r.device, dtype=torch.int32), slot_state,
         flat(r), flat(w_raw), flat(k), flat(v), flat(-kk), flat(kk * a), y)
-    # This model's contract returns the LAST segment's state.
-    return y.view(batch, seq_len, heads, head_dim).to(r.dtype), slot_state[-1:].to(state.dtype)
+    # Packed, the contract is the last segment's state, one row. Unpacked, every row
+    # of the batch is its own sequence and every row's state has to come back: this
+    # returned `slot_state[-1:]` in both cases, and since the caller copies into a
+    # `[batch, ...]` cache slot, one row broadcast silently over all of them and rows
+    # 0 and 1 continued from row 2's history with no error.
+    new_state = slot_state[-1:] if cu_seq_lens is not None else slot_state
+    return y.view(batch, seq_len, heads, head_dim).to(r.dtype), new_state.to(state.dtype)
 
 
 RWKV7_WKV_FUNCTIONS["vllm_varlen"] = vllm_varlen_wkv
@@ -173,7 +178,11 @@ RWKV7_WKV_FUNCTIONS["vllm_varlen"] = vllm_varlen_wkv
 
 Checked against `rwkv7_recurrent` on three shapes — a packed row of uneven segments
 (5 + 7), an unpacked `batch=1`, and an unpacked `batch=3` — at relative errors of
-2.6e-04 to 5.2e-04, which is fp16 against an fp32 reference. On one RTX 5090 with the
+2.6e-04 to 5.2e-04, which is fp16 against an fp32 reference. That check compared the
+returned activations on all three, and the returned *state* on none of them, which is
+how the `batch>1` state truncation above survived it: an adapter can be right about
+every value it emits and wrong about what it carries forward. A replacement kernel
+should be checked on both. On one RTX 5090 with the
 7.2B checkpoint it takes `1x256` prefill from 94% to 105% of `albatross faster3a`;
 single-token decode is unchanged, because that step is bound by streaming the weights
 rather than by the recurrence.
@@ -196,7 +205,7 @@ things have to line up — none of them is the default:
 ```python
 model = Rwkv7ForCausalLM.from_pretrained(checkpoint, dtype=torch.float16, sparse_channel_mix=True)
 model = model.eval().cuda()
-state = model.rwkv7.allocate_state(batch_size=1)      # BEFORE compiling, not state=None
+state = model.rwkv7.allocate_state(1)                 # BEFORE compiling, not state=None
 compiled = torch.compile(model, mode="max-autotune", dynamic=False)
 ```
 

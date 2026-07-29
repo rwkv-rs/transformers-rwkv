@@ -73,7 +73,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="converted RWKV-7 checkpoint directory")
     parser.add_argument("--dtype", default="float16")
-    parser.add_argument("--wkv-implementation", default="chunked", help="RWKV7_WKV_FUNCTIONS key")
+    parser.add_argument("--wkv-implementation", default="eager", help="RWKV7_WKV_FUNCTIONS key")
     parser.add_argument("--wkv-state-dtype", default="float32")
     parser.add_argument("--sparse-channel-mix", action="store_true")
     parser.add_argument("--compile-mode", default=None, help='e.g. "max-autotune"; omit to run eager')
@@ -119,7 +119,12 @@ def main() -> None:
         batch, seq_len = parse_shape(shape)
         try:
             throughput = measure(model, batch, seq_len, args.compile_mode, args.warmup, args.seed)
-        except Exception as error:  # a shape that will not run is a result, not a crash
+        except (torch.OutOfMemoryError, RuntimeError) as error:
+            # A shape that will not fit is a result; anything else is a bug in the run
+            # and must not be recorded as "this shape did not work". The default used
+            # to be a `wkv_implementation` that is not a registry key, so every row
+            # came back None and the table read as nine failed shapes rather than one
+            # wrong flag.
             print(f"  {shape:8s} FAILED {type(error).__name__}: {error}")
             rows[shape] = None
         else:

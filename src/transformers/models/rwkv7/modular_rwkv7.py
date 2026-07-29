@@ -552,7 +552,19 @@ class Rwkv7Attention(nn.Module):
         def _heads(t):
             return t.view(batch, seq_len, H, N)
 
-        wkv = RWKV7_WKV_FUNCTIONS[self.config.wkv_implementation]
+        # Named rather than indexed: a key that is not registered used to surface as a
+        # bare `KeyError: 'chunked'` from inside the forward, several frames from the
+        # config field that caused it, and a caller looping over shapes would record it
+        # as "this shape did not run" instead of "this model was never built". The
+        # registry is open by design, so this cannot be validated in the config.
+        try:
+            wkv = RWKV7_WKV_FUNCTIONS[self.config.wkv_implementation]
+        except KeyError:
+            raise ValueError(
+                f"wkv_implementation={self.config.wkv_implementation!r} is not registered. "
+                f"Known: {sorted(RWKV7_WKV_FUNCTIONS)}. Register your own with "
+                "`RWKV7_WKV_FUNCTIONS['name'] = fn` before building the model."
+            ) from None
         y, wkv_state = wkv(
             _heads(r),
             _heads(w_log),
@@ -1082,7 +1094,9 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         # the block positionally, so none of those guards see it and the whole thing
         # has to be caught here.
         if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
             use_cache = False
 
         if (input_ids is None) == (inputs_embeds is None):
