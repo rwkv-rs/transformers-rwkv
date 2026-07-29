@@ -155,45 +155,64 @@ def rwkv7_chunked(
     dtype = r.dtype
     r, w_log, k, v, kk, a = (t.to(compute_dtype) for t in (r, w_log, k, v, kk, a))
     state = state.to(compute_dtype)
+    # Everything that does not touch the carried state is computed for ALL chunks at
+    # once. Only the state recurrence is serial, and it was pulling the rest of the
+    # arithmetic into the Python loop with it: at T=256 and chunk 64 that was four
+    # iterations of ten-odd launches each, plus three constant matrices rebuilt every
+    # iteration. The loop below now does the state-dependent terms and nothing else.
+    # Never pad past the sequence: a 16-token prefill grouped into 64-wide chunks does
+    # four times the arithmetic for the same answer, which cost 1x16 nine points before
+    # this line existed. The old loop avoided it by shortening its last chunk.
+    chunk_size = min(chunk_size, seq_len)
+    chunks = (seq_len + chunk_size - 1) // chunk_size
+    padded = chunks * chunk_size
+    if padded != seq_len:
+        pad = (0, 0, 0, 0, 0, padded - seq_len)
+        r, k, v, kk, a = (torch.nn.functional.pad(t, pad) for t in (r, k, v, kk, a))
+        # A pad step must be the identity for the recurrence: decay 1, nothing added.
+        w_log = torch.nn.functional.pad(w_log, pad)
+    grouped = lambda t: t.reshape(batch, chunks, chunk_size, num_heads, head_dim)  # noqa: E731
+    rg, kg, vg, kkg, ag, wg = (grouped(t) for t in (r, k, v, kk, a, w_log))
+
+    w_c = torch.exp(wg)
+    c = torch.cumprod(w_c, dim=2)
+    c_prev = c / w_c
+    bg = kkg * ag
+    b_t, k_t = bg / c, kg / c
+    q_t, r_t = kkg * c_prev, rg * c
+
+    span = chunk_size
+    tri = torch.ones(span, span, device=r.device, dtype=r.dtype).tril(-1)
+    causal = torch.ones(span, span, device=r.device, dtype=r.dtype).tril(0)
+    eye = torch.eye(span, device=r.device, dtype=r.dtype)
+
+    # [batch, chunks, heads, span, span] -- one launch each instead of one per chunk.
+    qb = torch.einsum("bcthn,bcshn->bchts", q_t, b_t) * tri
+    qk = torch.einsum("bcthn,bcshn->bchts", q_t, k_t) * tri
+    rk = torch.einsum("bcthn,bcshn->bchts", r_t, k_t) * causal
+    rb = torch.einsum("bcthn,bcshn->bchts", r_t, b_t) * causal
+    lhs = eye + qb
+    qkv = torch.einsum("bchts,bcshv->bchtv", qk, vg)
+    rkv = torch.einsum("bchts,bcshv->bchtv", rk, vg)
+    c_last = c[:, :, -1].unsqueeze(-1)
+
     outputs = []
-
-    for start in range(0, seq_len, chunk_size):
-        stop = min(start + chunk_size, seq_len)
-        span = stop - start
-        w_c = torch.exp(w_log[:, start:stop])
-        c = torch.cumprod(w_c, dim=1)
-        c_prev = c / w_c
-        b = kk[:, start:stop] * a[:, start:stop]
-
-        b_t = b / c
-        k_t = k[:, start:stop] / c
-        q_t = kk[:, start:stop] * c_prev
-        r_t = r[:, start:stop] * c
-        v_c = v[:, start:stop]
-
-        strict = torch.ones(span, span, device=r.device, dtype=r.dtype).tril(-1)
-        causal = torch.ones(span, span, device=r.device, dtype=r.dtype).tril(0)
-
-        qb = torch.einsum("bthn,bshn->bhts", q_t, b_t) * strict
-        qk = torch.einsum("bthn,bshn->bhts", q_t, k_t) * strict
-        eye = torch.eye(span, device=r.device, dtype=r.dtype)
-        rhs = torch.einsum("bthn,bhnv->bhtv", q_t, state) + torch.einsum("bhts,bshv->bhtv", qk, v_c)
-        u = torch.linalg.solve_triangular(eye + qb, rhs, upper=False, unitriangular=True)
-
-        rk = torch.einsum("bthn,bshn->bhts", r_t, k_t) * causal
-        rb = torch.einsum("bthn,bshn->bhts", r_t, b_t) * causal
+    for i in range(chunks):
+        rhs = torch.einsum("bthn,bhnv->bhtv", q_t[:, i], state) + qkv[:, i]
+        u = torch.linalg.solve_triangular(lhs[:, i], rhs, upper=False, unitriangular=True)
         out_c = (
-            torch.einsum("bthn,bhnv->bhtv", r_t, state)
-            + torch.einsum("bhts,bshv->bhtv", rk, v_c)
-            - torch.einsum("bhts,bhsv->bhtv", rb, u)
+            torch.einsum("bthn,bhnv->bhtv", r_t[:, i], state)
+            + rkv[:, i]
+            - torch.einsum("bhts,bhsv->bhtv", rb[:, i], u)
         )
         outputs.append(out_c.permute(0, 2, 1, 3))
-
-        state = c[:, -1].unsqueeze(-1) * (
-            state + torch.einsum("bthn,bthv->bhnv", k_t, v_c) - torch.einsum("bthn,bhtv->bhnv", b_t, u)
+        state = c_last[:, i] * (
+            state
+            + torch.einsum("bthn,bthv->bhnv", k_t[:, i], vg[:, i])
+            - torch.einsum("bthn,bhtv->bhnv", b_t[:, i], u)
         )
 
-    return torch.cat(outputs, dim=1).to(dtype), state
+    return torch.cat(outputs, dim=1)[:, :seq_len].to(dtype), state
 
 
 def rwkv7_eager(
