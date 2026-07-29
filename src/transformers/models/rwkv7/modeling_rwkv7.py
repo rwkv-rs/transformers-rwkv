@@ -724,9 +724,26 @@ class Rwkv7Cache(Cache):
         return states[self.ATT_SHIFT], states[self.FFN_SHIFT], states[self.WKV]
 
     def write(self, layer_idx: int, att_shift: torch.Tensor, ffn_shift: torch.Tensor, wkv: torch.Tensor) -> None:
-        self.update_recurrent_state(att_shift, layer_idx, self.ATT_SHIFT)
-        self.update_recurrent_state(ffn_shift, layer_idx, self.FFN_SHIFT)
-        self.update_recurrent_state(wkv, layer_idx, self.WKV)
+        states = (
+            (self.ATT_SHIFT, att_shift),
+            (self.FFN_SHIFT, ffn_shift),
+            (self.WKV, wkv),
+        )
+        # Copying into the pre-allocated slot is what keeps its address fixed, which
+        # is what lets a captured CUDA graph replay the decode loop. It is also an
+        # in-place write on a tensor autograd may be holding, and backward through a
+        # cached forward then dies on "a variable needed for gradient computation has
+        # been modified by an inplace operation". Rebinding instead costs nothing
+        # here, because a training step is not the workload that wants graphs.
+        if torch.is_grad_enabled() and any(state.requires_grad for _, state in states):
+            layer = self.layers[layer_idx]
+            for slot, state in states:
+                layer.recurrent_states[slot] = state
+                layer.is_recurrent_states_initialized[slot] = True
+                layer.has_previous_state[slot] = True
+            return
+        for slot, state in states:
+            self.update_recurrent_state(state, layer_idx, slot)
 
 
 class Rwkv7Block(GradientCheckpointingLayer):
@@ -787,11 +804,17 @@ class Rwkv7Output(ModelOutput):
     state (`Rwkv7Cache`, *optional*):
         The recurrent state of every block. Feed it back to continue a sequence; it
         replaces the KV cache and is a constant size, whatever the context length.
+    attentions (always `None`):
+        Present so that code written against the common output shape does not have to
+        special-case this model. There is no attention here to report -- the mixing is
+        a recurrence, not a score matrix -- so it is `None` whatever `output_attentions`
+        is set to, rather than an empty tuple pretending to be a per-layer list.
     """
 
     last_hidden_state: torch.FloatTensor | None = None
     state: Rwkv7Cache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: None = None
 
 
 @dataclass
@@ -805,6 +828,7 @@ class Rwkv7CausalLMOutput(ModelOutput):
     logits: torch.FloatTensor | None = None
     state: Rwkv7Cache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: None = None
 
 
 @auto_docstring
@@ -871,6 +895,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         deep_embeds: torch.FloatTensor | None = None,
         cu_seq_lens: torch.LongTensor | None = None,
         use_cache: bool | None = None,
+        output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         **kwargs,
@@ -1013,7 +1038,16 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
             else {"inputs_embeds": inputs_embeds}
         )
         model_inputs["state"] = state
-        model_inputs.update({k: v for k, v in kwargs.items() if k in ("use_cache", "deep_embeds", "attention_mask")})
+        # Everything else the caller passed goes through, minus what this model does
+        # not take. It used to be an allowlist of three names, which meant
+        # `generate(output_hidden_states=True)` returned a tuple of `None` -- the flag
+        # was dropped here, the forward never saw it, and generate collected the
+        # nothing it got back. Any user kwarg met the same fate, silently. The two
+        # excluded here are `labels`, which would make generate compute a loss it
+        # never reads, and the KV-cache bookkeeping that belongs to models with a KV
+        # cache; this one carries its history in `state`.
+        skip = ("labels", "next_sequence_length", "past_key_values", "cache_position")
+        model_inputs.update({k: v for k, v in kwargs.items() if k not in skip and k not in model_inputs})
         return model_inputs
 
     @auto_docstring
@@ -1026,6 +1060,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         deep_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
+        output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         **kwargs,

@@ -23,6 +23,11 @@ import unittest
 from transformers import Rwkv7Config, is_torch_available
 from transformers.testing_utils import require_torch, require_torch_gpu, torch_device
 
+from ...generation.test_utils import GenerationTesterMixin
+from ...test_configuration_common import ConfigTester
+from ...test_modeling_common import ModelTesterMixin, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
+
 
 if is_torch_available():
     import torch
@@ -72,8 +77,92 @@ def _sharpened(model):
     return model.eval()
 
 
+class Rwkv7ModelTester:
+    """The inputs the shared model/generation tests build everything else from.
+
+    Deliberately lean. The RWKV v4 tester in this repo still carries `token_type_ids`,
+    `mc_token_ids` and `num_choices` from the GPT-2 tester it was copied from, none of
+    which this architecture has ever taken.
+    """
+
+    def __init__(self, parent, batch_size=3, seq_length=7, is_training=True):
+        self.parent = parent
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.is_training = is_training
+        self.hidden_size = 32
+        self.num_hidden_layers = 2  # the common suite caps this; 2 still exercises the layer-0 v_first hand-off
+        self.vocab_size = 99
+        self.pad_token_id = 0
+        self.bos_token_id = 0
+        self.eos_token_id = 0
+
+    def get_config(self):
+        return _tiny_config(
+            vocab_size=self.vocab_size, hidden_size=self.hidden_size, num_hidden_layers=self.num_hidden_layers
+        )
+
+    def prepare_config_and_inputs(self):
+        # ids start at 1: 0 is this tokenizer's pad/eos, and a prompt that opens with
+        # it makes several generation tests ambiguous about where the output begins.
+        input_ids = ids_tensor([self.batch_size, self.seq_length], self.vocab_size - 1) + 1
+        attention_mask = random_attention_mask([self.batch_size, self.seq_length])
+        return self.get_config(), input_ids, attention_mask
+
+    def prepare_config_and_inputs_for_common(self):
+        config, input_ids, attention_mask = self.prepare_config_and_inputs()
+        return config, {"input_ids": input_ids, "attention_mask": attention_mask}
+
+
 @require_torch
-class Rwkv7ModelTest(unittest.TestCase):
+class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
+    all_model_classes = (Rwkv7Model, Rwkv7ForCausalLM) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {"feature-extraction": Rwkv7Model, "text-generation": Rwkv7ForCausalLM} if is_torch_available() else {}
+    )
+    test_pruning = False
+    test_head_masking = False
+    test_missing_keys = False
+    # There is no attention here to report: the mixing is a recurrence, not a score
+    # matrix, so there is no [batch, heads, q, k] tensor for the shared suite to
+    # inspect. This is the flag those tests read, rather than a row of skips.
+    has_attentions = False
+
+    # Layer 0 *produces* `v_first` rather than mixing towards it, so its
+    # value-residual LoRA (`att.v0/v1/v2`) is never read and never receives a
+    # gradient. The shared check requires every `requires_grad` parameter to come back
+    # with one, and it re-enables `requires_grad` on everything first, so freezing
+    # those three does not satisfy it either.
+    #
+    # They are kept rather than not created, deliberately: a native `.pth` carries
+    # them at layer 0, and dropping them would mean this port can read that file but
+    # not write it back. `test_layer_zero_value_residual_lora_is_unused` pins the
+    # property this skip rests on, so it is checked somewhere rather than asserted
+    # here in prose. Gradient checkpointing itself is supported and exercised by
+    # `test_gradient_checkpointing_enable_disable` and by `test_training`.
+    _V_LORA_SKIP = (
+        "layer 0's value-residual LoRA is structurally unreachable, so it has no "
+        "gradient; see test_layer_zero_value_residual_lora_is_unused"
+    )
+
+    @unittest.skip(_V_LORA_SKIP)
+    def test_training_gradient_checkpointing(self):
+        pass
+
+    @unittest.skip(_V_LORA_SKIP)
+    def test_training_gradient_checkpointing_use_reentrant_true(self):
+        pass
+
+    @unittest.skip(_V_LORA_SKIP)
+    def test_training_gradient_checkpointing_use_reentrant_false(self):
+        pass
+
+    def setUp(self):
+        self.model_tester = Rwkv7ModelTester(self)
+        self.config_tester = ConfigTester(
+            self, config_class=Rwkv7Config, common_properties=["hidden_size", "num_hidden_layers"]
+        )
+
     def test_config_rejects_inconsistent_heads(self):
         with self.assertRaises(ValueError):
             _tiny_config(num_heads=3)

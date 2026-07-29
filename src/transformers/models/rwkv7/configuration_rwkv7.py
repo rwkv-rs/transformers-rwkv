@@ -140,6 +140,7 @@ class Rwkv7Config(PreTrainedConfig):
         sparse_channel_mix=False,
         bos_token_id=0,
         eos_token_id=0,
+        pad_token_id=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -176,6 +177,7 @@ class Rwkv7Config(PreTrainedConfig):
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
