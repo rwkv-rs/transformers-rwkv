@@ -412,8 +412,15 @@ class Rwkv7TokenShift(nn.Module):
         # They coincide under left padding, which is why this went unnoticed; under
         # right padding `x[:, -1]` is a blanked pad, so a continuation resumes from
         # zero instead of from where the sequence actually got to.
-        flags = keep.squeeze(-1)
-        last_real = (flags * torch.arange(x.shape[1], device=x.device)).argmax(dim=-1)
+        # Integer arithmetic, not the activation dtype. `keep` arrives cast to the
+        # model's dtype, and bf16 carries eight mantissa bits: past position 256 the
+        # products are no longer distinct, `argmax` returns the first of a tie, and
+        # the state comes back from a token several places short of the last real one
+        # -- 1022 for 1023 at length 1024, 4088 for 4095 at 4096. An all-ones mask is
+        # enough to trigger it, which is what `generate` sends, so this was not
+        # confined to padded batches.
+        positions = torch.arange(x.shape[1], device=x.device)
+        last_real = ((keep.squeeze(-1) > 0) * positions).argmax(dim=-1)
         return shifted, x[torch.arange(x.shape[0], device=x.device), last_real]
 
 
