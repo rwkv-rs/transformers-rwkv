@@ -32,6 +32,18 @@ from ...utils.import_utils import is_triton_available
 from .configuration_rwkv7 import Rwkv7Config
 
 
+# Imported at module scope, NOT lazily from the forward. A function containing an
+# `import` is on dynamo's skip list whether or not the import actually runs, so
+# calling one per layer breaks the graph at every layer -- which cost 138.9 tok/s at
+# batch 1 down to 47.4, eager speed, while the kernel itself was fine. `sparse_channel_mix`
+# avoids this by importing from `allocate_state`, outside anything traced; there is no
+# equivalent hook here, so it happens once at import.
+if is_triton_available():
+    from .fused_wkv import fused_wkv_one
+else:  # pragma: no cover - exercised only where triton is absent
+    fused_wkv_one = None
+
+
 class Rwkv7TokenShift(nn.Module):
     """`prev_token(x)`: the previous token's hidden state, zero at sequence start.
 
@@ -255,6 +267,41 @@ def rwkv7_eager(
 
 
 RWKV7_WKV_FUNCTIONS = {"eager": rwkv7_eager}
+
+
+def rwkv7_fused(
+    r: torch.Tensor,
+    w_log: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kk: torch.Tensor,
+    a: torch.Tensor,
+    state: torch.Tensor,
+    cu_seq_lens: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`"eager"`, with the single-token step replaced by a fused Triton kernel.
+
+    Only the decode step changes; prefill and packed batches fall through to the
+    portable path, which is also where this lands when Triton is missing, the tensors
+    are on CPU, or the state dtype is not the fp32 the kernel accumulates in. The
+    state is mutated in place and handed back, matching the portable contract.
+
+    Worth it only with batch: the kernel's whole point is that the state is read once
+    instead of three times, and at batch 1 the state is not what the step is spending
+    its time on. Measured at 7.2B on one RTX 5090, against albatross faster3a: batched
+    decode 55% -> 85% at 256x1, 91% -> 100% at 32x1, and 1x1 unchanged.
+    """
+    single_token = r.shape[1] == 1 and cu_seq_lens is None
+    if not (single_token and r.is_cuda and state.dtype == torch.float32 and fused_wkv_one is not None):
+        return rwkv7_eager(r, w_log, k, v, kk, a, state, cu_seq_lens=cu_seq_lens, **kwargs)
+    return fused_wkv_one(r, w_log, k, v, kk, a, state), state
+
+
+# Added after the definition rather than in the literal above: the modular converter
+# is free to move the dict, and it emits it next to `rwkv7_eager` -- ahead of this
+# function, which made the generated file raise NameError on import.
+RWKV7_WKV_FUNCTIONS["fused"] = rwkv7_fused
 
 
 class Rwkv7Attention(nn.Module):

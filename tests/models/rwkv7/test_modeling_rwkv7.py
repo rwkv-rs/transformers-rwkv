@@ -815,6 +815,39 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             "does, the ceiling moved and the default can be revisited",
         )
 
+    def test_fused_decode_falls_back_rather_than_failing(self):
+        """`"fused"` must be selectable anywhere, not only where its kernel runs.
+
+        It is a decode-step kernel: prefill, packed rows, CPU tensors, a state that is
+        not the fp32 it accumulates in, and a machine without Triton all have to reach
+        the portable path instead of raising. A registry entry that only works on one
+        configuration is worse than no entry, because the failure surfaces at the
+        first shape the caller did not think about.
+        """
+        from transformers.models.rwkv7.modeling_rwkv7 import RWKV7_WKV_FUNCTIONS
+
+        self.assertIn("fused", RWKV7_WKV_FUNCTIONS)
+        config = _tiny_config(wkv_implementation="fused")
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
+        reference = _sharpened(Rwkv7ForCausalLM(_tiny_config())).to(torch_device)
+        reference.load_state_dict(model.state_dict())
+
+        ids = torch.randint(1, config.vocab_size, (2, 9), device=torch_device)
+        with torch.no_grad():
+            got = model(input_ids=ids).logits  # prefill: falls through
+            want = reference(input_ids=ids).logits
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+        with torch.no_grad():  # decode, one token at a time
+            fused_state, plain_state, fused, plain = None, None, [], []
+            for position in range(ids.shape[1]):
+                a = model(input_ids=ids[:, position : position + 1], state=fused_state, use_cache=True)
+                b = reference(input_ids=ids[:, position : position + 1], state=plain_state, use_cache=True)
+                fused_state, plain_state = a.state, b.state
+                fused.append(a.logits)
+                plain.append(b.logits)
+        torch.testing.assert_close(torch.cat(fused, 1), torch.cat(plain, 1), rtol=1e-4, atol=1e-4)
+
     def test_wkv_state_dtype_is_configurable(self):
         """The state precision is independent of the activation dtype.
 
