@@ -32,13 +32,42 @@ This implementation keeps the reference parameter names (`blocks.N.att.receptanc
 the LoRA factors as raw `w1`/`w2` tensors, `emb`, `head`, …) rather than renaming
 them, so converting a native `.pth` checkpoint needs no per-tensor mapping table.
 
+## Checkpoints
+
+No checkpoint on the Hub loads into this implementation as-is, and it is worth being
+explicit about why rather than letting a `from_pretrained` line imply otherwise. The
+RWKV-7 weights published today come in two layouts, neither of which is this one:
+
+- **native** — the reference `.pth` from [`BlinkDL/rwkv-7-world`](https://huggingface.co/BlinkDL/rwkv-7-world)
+  and [`BlinkDL/rwkv7-g1`](https://huggingface.co/BlinkDL/rwkv7-g1). Same parameter
+  names as here, but a bare `torch.save` of a flat dict, not a `transformers` directory.
+- **fla** — [`RWKV/RWKV7-Goose-World2.8-0.1B-HF`](https://huggingface.co/RWKV/RWKV7-Goose-World2.8-0.1B-HF),
+  [`fla-hub/rwkv7-0.1B-g1`](https://huggingface.co/fla-hub/rwkv7-0.1B-g1) and friends.
+  These are `transformers` directories, but they are `trust_remote_code=True` repos
+  whose modelling code and tensor names come from `flash-linear-attention`, so they
+  load their own implementation rather than this one.
+
+Convert once, then use the output like any other checkpoint:
+
+```bash
+huggingface-cli download BlinkDL/rwkv-7-world RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth --local-dir .
+python src/transformers/models/rwkv7/convert_rwkv7_checkpoint_to_hf.py \
+    --checkpoint RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth \
+    --flavour native --output_dir ./rwkv7-0.1b-hf
+```
+
+`--flavour fla` takes the safetensors layout instead, so a checkpoint that only exists
+in fla form does not have to be re-trained to be used here. The tokenizer is the RWKV
+world tokenizer either way; the fla repos carry it, and `--flavour native` leaves it to
+you to point at one.
+
 ## Usage
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-tokenizer = AutoTokenizer.from_pretrained("RWKV/rwkv7-0.1b", trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained("RWKV/rwkv7-0.1b")
+tokenizer = AutoTokenizer.from_pretrained("RWKV/RWKV7-Goose-World2.8-0.1B-HF", trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained("./rwkv7-0.1b-hf")
 
 inputs = tokenizer("The Eiffel Tower is located in the city of", return_tensors="pt")
 print(tokenizer.decode(model.generate(**inputs, max_new_tokens=16)[0]))
