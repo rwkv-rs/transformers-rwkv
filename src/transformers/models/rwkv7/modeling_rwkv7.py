@@ -27,7 +27,7 @@ from ...cache_utils import Cache, LinearAttentionLayer
 from ...generation import GenerationMixin
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel
-from ...utils import ModelOutput, auto_docstring
+from ...utils import ModelOutput, auto_docstring, can_return_tuple
 from ...utils.import_utils import is_triton_available
 from .configuration_rwkv7 import Rwkv7Config
 
@@ -973,6 +973,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
     def _empty_state(self, batch: int, device, dtype) -> Rwkv7Cache:
         return Rwkv7Cache(self.config, batch_size=batch, device=device, dtype=dtype)
 
+    @can_return_tuple
     @auto_docstring
     def forward(
         self,
@@ -985,9 +986,8 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
         **kwargs,
-    ) -> tuple | Rwkv7Output:
+    ) -> Rwkv7Output:
         r"""
         attention_mask (`torch.LongTensor`, *optional*):
             1 on real tokens, 0 on padding. Read as the **tail** of whatever is
@@ -1024,7 +1024,6 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -1095,8 +1094,6 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if not return_dict:
-            return tuple(x for x in (hidden_states, state, all_hidden_states) if x is not None)
         return Rwkv7Output(last_hidden_state=hidden_states, state=state, hidden_states=all_hidden_states)
 
 
@@ -1138,6 +1135,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         model_inputs.update({k: v for k, v in kwargs.items() if k not in skip and k not in model_inputs})
         return model_inputs
 
+    @can_return_tuple
     @auto_docstring
     def forward(
         self,
@@ -1150,16 +1148,14 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
         **kwargs,
-    ) -> tuple | Rwkv7CausalLMOutput:
+    ) -> Rwkv7CausalLMOutput:
         r"""
         state (`Rwkv7Cache`, *optional*):
             Recurrent state returned by a previous call.
         deep_embeds (`torch.FloatTensor`, *optional*):
             RWKV-8 DeepEmbed vectors; see [`Rwkv7Model.forward`].
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         outputs = self.rwkv7(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1168,7 +1164,6 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
             deep_embeds=deep_embeds,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
             **kwargs,
         )
         logits = self.head(outputs.last_hidden_state)
@@ -1177,8 +1172,6 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits, labels, self.config.vocab_size, **kwargs)
 
-        if not return_dict:
-            return (loss, logits, outputs.state) if loss is not None else (logits, outputs.state)
         return Rwkv7CausalLMOutput(loss=loss, logits=logits, state=outputs.state, hidden_states=outputs.hidden_states)
 
 

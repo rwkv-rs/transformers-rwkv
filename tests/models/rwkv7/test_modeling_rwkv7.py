@@ -249,6 +249,29 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
 
         torch.testing.assert_close(full, incremental, rtol=1e-4, atol=1e-4)
 
+    def test_compiled_prefill_matches_eager_at_batch_and_length(self):
+        """`torch.compile` must survive a shape with both a batch and a length.
+
+        This exists because the one compile failure this port has actually had was
+        found by a benchmark, not by a test: at 16x16 the WKV output came back with a
+        layout `view` could not reinterpret, and every single-token and every
+        `batch=1` shape had missed it. `fullgraph=True` is the point of the test as
+        much as the numerics are -- the performance story here rests on CUDA graphs,
+        and a graph break loses them while still returning correct logits, so a test
+        that only compared outputs would stay green through exactly the regression
+        worth catching.
+        """
+        config = _tiny_config()
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device).eval()
+        input_ids = torch.randint(0, config.vocab_size, (2, 16), device=torch_device)
+
+        torch._dynamo.reset()
+        with torch.no_grad():
+            eager = model(input_ids=input_ids).logits
+            compiled = torch.compile(model, fullgraph=True)(input_ids=input_ids).logits
+
+        torch.testing.assert_close(eager, compiled, rtol=1e-4, atol=1e-4)
+
     def test_batch_rows_are_independent(self):
         """A row's output must not depend on what shares its batch.
 
