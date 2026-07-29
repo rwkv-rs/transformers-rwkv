@@ -89,8 +89,10 @@ the identity for those positions, so a padded row decodes exactly as if it had b
 on its own. Without the mask the padding is fed through the recurrence like any other
 token and moves the state before the real tokens arrive, which silently corrupts every
 row shorter than the longest one. `generate` passes the mask through for you; an
-all-ones mask costs nothing and changes nothing, and a single decoded token skips the
-handling entirely.
+all-ones mask costs nothing and changes nothing. A single decoded token is *not*
+exempt: that shortcut was removed after a fully-masked one-token row was found moving
+the state, so the mask is honoured at every length, and this paragraph said otherwise
+for several commits after the code stopped doing it.
 
 ### Packed (varlen) batches
 
@@ -190,7 +192,17 @@ rather than by the recurrence.
 ### Reaching the quoted decode throughput
 
 Single-stream decode on the 7.2B checkpoint, RTX 5090, fp16, measured five times
-per row (spread ≤ 0.1%):
+per row (spread ≤ 0.1%). Read the rows as a ladder rather than as an ablation: only
+one thing varies between the first two, but the third changes the compile mode *and*
+turns the flag on, so 91.9 -> 110.4 cannot be attributed to either alone and an
+earlier version of the notes below claimed it twice, once for each. Nothing here
+isolates `sparse_channel_mix`, and the source says why it would be misleading to try
+at one point on the ladder: the flag pays only once kernel launches are captured, so
+its value depends on the compile mode it is measured under. These numbers also predate
+the in-tree Triton WKV; the committed benchmark artifact reads 138.3 tok/s at `1x1`
+under `fused` with the same flags, and the ablation table in `sparse_channel_mix.py`
+was taken at a third point in this branch's history. Each is labelled with what it
+ran; none of them is a restatement of another.
 
 | how it is run | tok/s |
 |---|---:|
@@ -210,7 +222,7 @@ compiled = torch.compile(model, mode="max-autotune", dynamic=False)
 ```
 
 1. **`sparse_channel_mix=True`.** No checkpoint config carries this flag, so it
-   defaults to off and the dense path runs. It is worth +20%, and it is exact —
+   defaults to off and the dense path runs. It is exact —
    the activation is a squared ReLU, so the rows it skips contribute nothing.
 2. **`mode="max-autotune"`.** Plain `torch.compile()` gives 91.9 and
    `"reduce-overhead"` 110.4; the decode is a long chain of small kernels, which is

@@ -915,8 +915,9 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         """The chunk size is bounded by overflow, and only the worst decay finds it.
 
         The chunked form divides by the running decay `c`, so `1/c` grows like
-        `e^(0.5 * chunk_size)` when every channel sits at the floor the decay LoRA
-        can produce. `test_chunked_matches_sequential_recurrence` draws `w_log` from
+        `e^(e^-0.5 * chunk_size)` when every channel sits at the floor the decay LoRA
+        can produce -- the floor is `exp(-e^-0.5)` = 0.5452, and this docstring used to
+        say `e^-0.5`, which puts the fp32 ceiling at 177 rather than the true 146. `test_chunked_matches_sequential_recurrence` draws `w_log` from
         a sigmoid, which lands nowhere near that floor, so it would pass a chunk size
         that overflows in production on a checkpoint with strongly-decaying channels.
 
@@ -954,13 +955,16 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertTrue(torch.isfinite(default_out).all(), "the DEFAULT chunk size overflows at the decay floor")
         torch.testing.assert_close(default_out, reference, rtol=2e-4, atol=2e-4)
 
-        # And where it does run out: 1/c reaches e^128 at the floor, past fp32's 3.4e38.
-        blown, _ = rwkv7_chunked(r, w_log, k, v, kk, a, state.clone(), chunk_size=256)
-        self.assertFalse(
-            torch.isfinite(blown).all(),
-            "chunk 256 at the decay floor is expected to overflow fp32; if it no longer "
-            "does, the ceiling moved and the default can be revisited",
-        )
+        # And where it runs out. This used to assert that chunk 256 comes back
+        # non-finite, which documented the overflow by demonstrating it silently. The
+        # function now refuses instead, and the boundary is asserted on both sides so
+        # the derived limit cannot drift without a test noticing: 146 is the widest that
+        # works, 147 is the narrowest that raises.
+        widest, _ = rwkv7_chunked(r, w_log, k, v, kk, a, state.clone(), chunk_size=146)
+        self.assertTrue(torch.isfinite(widest).all(), "146 is supposed to be the widest chunk fp32 can carry")
+
+        with self.assertRaisesRegex(ValueError, "widest chunk that stays finite is 146"):
+            rwkv7_chunked(r, w_log, k, v, kk, a, state.clone(), chunk_size=147)
 
     def test_fused_decode_falls_back_rather_than_failing(self):
         """`"fused"` must be selectable anywhere, not only where its kernel runs.

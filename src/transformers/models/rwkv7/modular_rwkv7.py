@@ -40,6 +40,7 @@ Channel-mix (ffn):
     out = value(relu(key(xk))**2)
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -57,8 +58,10 @@ from .configuration_rwkv7 import Rwkv7Config
 
 logger = logging.get_logger(__name__)
 
-# e^-0.5. The decay LoRA emits w_log = -INV_SQRT_E * sigmoid(...), so the
-# per-step decay exp(w_log) lies in (e^-0.5, 1) — see RWKV-7 reference.
+# e^-0.5. The decay LoRA emits w_log = -INV_SQRT_E * sigmoid(...), so w_log lies in
+# (-e^-0.5, 0) and the per-step decay exp(w_log) lies in (exp(-e^-0.5), 1), i.e.
+# (0.5452, 1) — see RWKV-7 reference. Note the floor is exp(-e^-0.5), not e^-0.5: this
+# comment said the latter, and `rwkv7_chunked` built its chunk_size bound on it.
 _INV_SQRT_E = 0.6065306597126334
 
 
@@ -140,9 +143,19 @@ def rwkv7_chunked(
 
     `chunk_size` is bounded by that division by `c`, but by OVERFLOW rather than by
     precision, and the difference is worth a factor of four. The per-step decay is at
-    least `e^-0.5`, so at the worst case — every channel pinned at that floor —
-    `1/c` grows like `e^(0.5 * chunk_size)`. That reaches 7.2e16 at 64 and fp32 tops
-    out near 3.4e38, so there are twenty-odd decades of headroom left.
+    least `exp(-e^-0.5)` = 0.5452, so at the worst case — every channel pinned at that
+    floor — `1/c` grows like `e^(e^-0.5 * chunk_size)`. That reaches 7.2e16 at 64 and
+    fp32 tops out near 3.4e38, so there are twenty-odd decades of headroom left at the
+    default, and the ceiling is `ln(finfo.max) / e^-0.5` = 146 in fp32.
+
+    That derivation is worth stating carefully because the first version of it was
+    wrong in a way the numbers hid. It said the decay floor was `e^-0.5` rather than
+    `exp(-e^-0.5)`, hence growth like `e^(0.5 * chunk_size)` — which puts the ceiling at
+    177, and measured at the decay floor this function returns all-NaN from 147 up. The
+    quoted 7.2e16 came from the correct law all along (`e^(0.5*64)` is 7.9e13), so the
+    arithmetic had been done right and written up wrong, and following the prose rather
+    than the number led into the overflow band. `chunk_size` is checked below rather
+    than left to that reasoning.
 
     Precision does not degrade with it, because the substitution is a similarity
     transform: whatever `1/c` inflates, `c` deflates again on the way out, and a
@@ -164,6 +177,18 @@ def rwkv7_chunked(
     # four times the arithmetic for the same answer, which cost 1x16 nine points before
     # this line existed. The old loop avoided it by shortening its last chunk.
     chunk_size = min(chunk_size, seq_len)
+    # Refuse rather than return NaN. `1/c` reaches `e^(e^-0.5 * chunk_size)` at the
+    # decay floor, so the widest chunk this dtype can carry is derived from the dtype
+    # rather than written down: 146 in fp32, 12 in fp16. A caller who raises
+    # `chunk_size` for a longer prefill gets an error naming the limit instead of
+    # all-NaN logits several layers later, which is what the previous version did.
+    widest = int(math.log(torch.finfo(compute_dtype).max) / _INV_SQRT_E)
+    if chunk_size > widest:
+        raise ValueError(
+            f"chunk_size={chunk_size} overflows {compute_dtype}: the running decay's "
+            f"reciprocal grows like e^(e^-0.5 * chunk_size), so the widest chunk that "
+            f"stays finite is {widest}. Lower chunk_size, or raise compute_dtype."
+        )
     chunks = (seq_len + chunk_size - 1) // chunk_size
     padded = chunks * chunk_size
     if padded != seq_len:
@@ -326,9 +351,13 @@ def rwkv7_fused(
     """`"eager"`, with the single-token step replaced by a fused Triton kernel.
 
     Only the decode step changes; prefill and packed batches fall through to the
-    portable path, which is also where this lands when Triton is missing, the tensors
-    are on CPU, or the state dtype is not the fp32 the kernel accumulates in. The
-    state is mutated in place and handed back, matching the portable contract.
+    portable path, which is also where this lands when Triton is missing or the tensors
+    are on CPU. A narrower state is NOT a fallback case -- the kernel stores back
+    through the state's own dtype, which is the point of letting `wkv_state_dtype`
+    select it, and this docstring claimed the opposite for several commits after that
+    fallback was deliberately removed. The state is handed back rather than mutated in
+    place; the portable path does not mutate either, and saying it did was the same
+    stale prose.
 
     Worth it only with batch: the kernel's whole point is that the state is read once
     instead of three times, and at batch 1 the state is not what the step is spending
