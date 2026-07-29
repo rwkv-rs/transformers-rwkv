@@ -222,21 +222,23 @@ def rwkv7_chunked(
     rkv = torch.einsum("bchts,bcshv->bchtv", rk, vg)
     c_last = c[:, :, -1].unsqueeze(-1)
 
+    # `k~^T v` carries no state either, so it joins the batched half above; only the
+    # two products that read the carried state and the solve that depends on them are
+    # genuinely serial.
+    kv = torch.einsum("bcthn,bcthv->bchnv", k_t, vg)
+    # Both state products read the SAME state, so they are one matmul over a stacked
+    # token axis rather than two -- the loop is short and launch-bound, and this is one
+    # launch per chunk instead of two.
+    qr = torch.cat([q_t, r_t], dim=2)
+
     outputs = []
     for i in range(chunks):
-        rhs = torch.einsum("bthn,bhnv->bhtv", q_t[:, i], state) + qkv[:, i]
+        qr_s = torch.einsum("bthn,bhnv->bhtv", qr[:, i], state)
+        rhs = qr_s[:, :, :chunk_size] + qkv[:, i]
         u = torch.linalg.solve_triangular(lhs[:, i], rhs, upper=False, unitriangular=True)
-        out_c = (
-            torch.einsum("bthn,bhnv->bhtv", r_t[:, i], state)
-            + rkv[:, i]
-            - torch.einsum("bhts,bhsv->bhtv", rb[:, i], u)
-        )
+        out_c = qr_s[:, :, chunk_size:] + rkv[:, i] - torch.einsum("bhts,bhsv->bhtv", rb[:, i], u)
         outputs.append(out_c.permute(0, 2, 1, 3))
-        state = c_last[:, i] * (
-            state
-            + torch.einsum("bthn,bthv->bhnv", k_t[:, i], vg[:, i])
-            - torch.einsum("bthn,bhtv->bhnv", b_t[:, i], u)
-        )
+        state = c_last[:, i] * (state + kv[:, i] - torch.einsum("bthn,bhtv->bhnv", b_t[:, i], u))
 
     return torch.cat(outputs, dim=1)[:, :seq_len].to(dtype), state
 
