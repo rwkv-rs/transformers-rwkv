@@ -388,9 +388,16 @@ class Rwkv7Attention(nn.Module):
             cu_seq_lens=cu_seq_lens,
         )
 
-        y = self.ln_x(y.view(batch * seq_len, C)).view(batch, seq_len, C)
+        # `reshape`, not `view`: what comes back from the WKV is whatever layout that
+        # implementation produced, and a registered kernel -- or inductor, which is
+        # free to pick its own -- can hand back a `[batch, seq_len, heads, head_dim]`
+        # that is strided as if it were `[batch, heads, seq_len, head_dim]`. `view`
+        # then raises, and it raises only when batch and seq_len are BOTH greater
+        # than one, which is why a compiled 16x16 forward failed while 1xT and Bx1
+        # both passed.
+        y = self.ln_x(y.reshape(batch * seq_len, C)).view(batch, seq_len, C)
         # r·k·r_k summed per head, broadcast back over the head's value channels
-        bonus = ((_heads(r) * _heads(k) * self.r_k).sum(dim=-1, keepdim=True) * _heads(v)).view(batch, seq_len, C)
+        bonus = ((_heads(r) * _heads(k) * self.r_k).sum(dim=-1, keepdim=True) * _heads(v)).reshape(batch, seq_len, C)
         y = self.output((y + bonus) * g)
         return y, v_first, new_shift_state, wkv_state
 
