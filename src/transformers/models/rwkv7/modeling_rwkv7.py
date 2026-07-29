@@ -312,7 +312,11 @@ def rwkv7_fused(
     decode 55% -> 85% at 256x1, 91% -> 100% at 32x1, and 1x1 unchanged.
     """
     single_token = r.shape[1] == 1 and cu_seq_lens is None
-    if not (single_token and r.is_cuda and state.dtype == torch.float32 and fused_wkv_one is not None):
+    # The kernel loads to fp32 and stores back in whatever the state's dtype is, so a
+    # narrower state is not a different code path -- and it is the only lever left at
+    # batch. The kernel already runs at ~86% of this card's bandwidth moving a 268 MB
+    # fp32 state per layer, so halving the state is worth more than any tuning of it.
+    if not (single_token and r.is_cuda and fused_wkv_one is not None):
         return rwkv7_eager(r, w_log, k, v, kk, a, state, cu_seq_lens=cu_seq_lens, **kwargs)
     return fused_wkv_one(r, w_log, k, v, kk, a, state), state
 
