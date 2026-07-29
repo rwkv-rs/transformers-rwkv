@@ -147,9 +147,7 @@ class NumpyRwkv7:
         for h in range(heads):
             # `sa` reads the state before this token updates it; `out` reads it after.
             sa = (-kk_h[h]) @ state[h]
-            state[h] = (
-                decay[h][:, None] * state[h] + b_h[h][:, None] * sa[None, :] + k_h[h][:, None] * v_h[h][None, :]
-            )
+            state[h] = decay[h][:, None] * state[h] + b_h[h][:, None] * sa[None, :] + k_h[h][:, None] * v_h[h][None, :]
             out[h] = r_h[h] @ state[h]
 
         y = _group_norm(out.reshape(-1), *layer["ln_x"], heads, width, self.norm_eps * width)

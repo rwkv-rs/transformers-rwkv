@@ -115,5 +115,3 @@ def fused_wkv_one(
         N=head_dim,
     )
     return out.view(batch, 1, heads, head_dim)
-
-
