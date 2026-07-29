@@ -764,6 +764,57 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
                 out_state, reference_state, rtol=2e-4, atol=2e-4, msg=f"state chunk={chunk_size}"
             )
 
+    def test_chunked_survives_the_slowest_decay_it_can_be_given(self):
+        """The chunk size is bounded by overflow, and only the worst decay finds it.
+
+        The chunked form divides by the running decay `c`, so `1/c` grows like
+        `e^(0.5 * chunk_size)` when every channel sits at the floor the decay LoRA
+        can produce. `test_chunked_matches_sequential_recurrence` draws `w_log` from
+        a sigmoid, which lands nowhere near that floor, so it would pass a chunk size
+        that overflows in production on a checkpoint with strongly-decaying channels.
+
+        Precision is not what limits it: the substitution is a similarity transform,
+        so `c` deflates on the way out whatever `1/c` inflated, and a common scale
+        factor does not move a relative error. What limits it is fp32's exponent
+        range, and the second half of this test is where that runs out -- kept as an
+        assertion rather than a comment so the default has a measured ceiling above
+        it rather than an assumed one.
+        """
+        from transformers.models.rwkv7.modeling_rwkv7 import rwkv7_chunked, rwkv7_recurrent
+
+        torch.manual_seed(0)
+        shape = (1, 256, 2, 8)
+        floor = -0.6065306597126334
+        w_log = torch.full(shape, floor, device=torch_device)  # every channel at the floor
+        r = torch.randn(shape, device=torch_device) * 0.2
+        k = torch.randn(shape, device=torch_device) * 0.2
+        v = torch.randn(shape, device=torch_device) * 0.2
+        kk = torch.nn.functional.normalize(torch.randn(shape, device=torch_device), dim=-1)
+        a = torch.sigmoid(torch.randn(shape, device=torch_device))
+        state = torch.zeros(1, 2, 8, 8, device=torch_device)
+
+        reference, _ = rwkv7_recurrent(r, w_log, k, v, kk, a, state.clone())
+        for chunk_size in (16, 64):  # 64 is the default
+            out, _ = rwkv7_chunked(r, w_log, k, v, kk, a, state.clone(), chunk_size=chunk_size)
+            self.assertTrue(torch.isfinite(out).all(), f"chunk={chunk_size} overflowed")
+            torch.testing.assert_close(out, reference, rtol=2e-4, atol=2e-4, msg=f"chunk={chunk_size}")
+
+        # The default itself, not just the sizes named above: every call here passes
+        # `chunk_size=` explicitly, so raising the default to something that overflows
+        # would leave all of them green. This is the one that exercises what the model
+        # actually uses.
+        default_out, _ = rwkv7_chunked(r, w_log, k, v, kk, a, state.clone())
+        self.assertTrue(torch.isfinite(default_out).all(), "the DEFAULT chunk size overflows at the decay floor")
+        torch.testing.assert_close(default_out, reference, rtol=2e-4, atol=2e-4)
+
+        # And where it does run out: 1/c reaches e^128 at the floor, past fp32's 3.4e38.
+        blown, _ = rwkv7_chunked(r, w_log, k, v, kk, a, state.clone(), chunk_size=256)
+        self.assertFalse(
+            torch.isfinite(blown).all(),
+            "chunk 256 at the decay floor is expected to overflow fp32; if it no longer "
+            "does, the ceiling moved and the default can be revisited",
+        )
+
     def test_wkv_state_dtype_is_configurable(self):
         """The state precision is independent of the activation dtype.
 
