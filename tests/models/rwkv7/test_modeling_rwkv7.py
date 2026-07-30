@@ -23,7 +23,7 @@ import tempfile
 import unittest
 
 from transformers import Rwkv7Config, is_torch_available
-from transformers.testing_utils import require_torch, require_torch_gpu, slow, torch_device
+from transformers.testing_utils import require_peft, require_torch, require_torch_gpu, slow, torch_device
 
 from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
@@ -367,6 +367,65 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
         self.assertEqual(lost, [], f"{len(lost)} parameters came back zeroed, e.g. {lost[:5]}")
         for name in before:
             torch.testing.assert_close(after[name], before[name], rtol=0, atol=0, msg=name)
+
+    @require_peft
+    def test_peft_lora_attaches_and_actually_learns(self):
+        """A LoRA-wrapped model has to train, and no module may bypass its adapter.
+
+        The bounty's criterion 3 asks for the common transformers-based PEFT flow to
+        work. Two properties, each of which has a silent failure mode this test exists
+        to catch. The loss on an overfit batch must actually fall, because a wiring
+        break under wrapping tends to produce a model that runs and returns a loss
+        while learning nothing. And every attached adapter must receive a gradient,
+        because a forward that reads `module.weight` directly instead of calling the
+        module silently routes around its LoRA -- the channel-mix projection here is
+        exactly the kind of place that could regress to that, and did during the
+        sparse-path work.
+        """
+        from peft import LoraConfig, get_peft_model
+
+        torch.manual_seed(0)
+        config = _tiny_config()
+        model = _sharpened(Rwkv7ForCausalLM(config))
+        wrapped = get_peft_model(
+            model, LoraConfig(r=8, lora_alpha=16, target_modules=["receptance", "key", "value", "output"])
+        )
+        trainable = {name for name, p in wrapped.named_parameters() if p.requires_grad}
+        self.assertTrue(trainable, "no trainable parameters after wrapping")
+        self.assertTrue(all("lora" in name for name in trainable), "base weights not frozen")
+
+        wrapped.train()
+        input_ids = torch.randint(1, config.vocab_size, (2, 12))
+        optimizer = torch.optim.AdamW((p for p in wrapped.parameters() if p.requires_grad), lr=1e-2)
+
+        losses = []
+        for step in range(24):
+            loss = wrapped(input_ids=input_ids, labels=input_ids).loss
+            loss.backward()
+            if step == 0:
+                # Every adapter, not just some: an unfired adapter means its module
+                # was bypassed, and the loss can still fall through the others. The
+                # check is on lora_B, and that is not arbitrary: LoRA initialises B to
+                # zero, so dL/dA passes through B and is identically zero on the first
+                # step -- the first version of this test asserted lora_A here and
+                # failed on all 18 adapters of a perfectly healthy model. B's gradient
+                # is nonzero from step 0 exactly when the module's output reaches the
+                # loss, which is the property under test.
+                dead = [
+                    name
+                    for name, p in wrapped.named_parameters()
+                    if p.requires_grad and "lora_B" in name and (p.grad is None or p.grad.abs().max() == 0)
+                ]
+                self.assertEqual(dead, [], f"{len(dead)} adapters received no gradient")
+            optimizer.step()
+            optimizer.zero_grad()
+            losses.append(loss.item())
+
+        self.assertLess(
+            losses[-1],
+            0.6 * losses[0],
+            f"overfitting one batch for 24 steps only moved the loss {losses[0]:.3f} -> {losses[-1]:.3f}",
+        )
 
     def test_checkpointed_backward_matches_the_plain_one(self):
         """Gradient checkpointing must not change a gradient.
