@@ -981,6 +981,30 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
     # `_reorder_cache` here instead would take precedence over it in `generate` and
     # bypass the cache's own bookkeeping, so it is deliberately absent.
 
+    def _init_weights(self, module):
+        """Also initialise the parameters that are not inside a standard submodule.
+
+        The time-mix and channel-mix hold twenty-one raw `nn.Parameter`s -- the six
+        token-shift mixes, the four LoRA factor pairs and their biases, `k_k`, `k_a`,
+        `r_k`. The inherited `_init_weights` knows about `nn.Linear`, `nn.Embedding`
+        and `nn.LayerNorm` and nothing else, so none of those were reachable: a model
+        built on a meta device and then materialised came back with them uninitialised,
+        which `test_can_init_all_missing_weights` says plainly and which nothing here
+        was running until this suite was first executed on a GPU.
+
+        Zeros, because that is exactly what `__init__` does -- this makes materialising
+        from meta agree with ordinary construction rather than inventing a second
+        answer. It is deliberately NOT the reference training initialisation, which
+        gives the shift mixes a per-layer ramp and the LoRA factors particular scales.
+        Reproducing that belongs with training support, which this port does not claim;
+        every real use loads a converted checkpoint over these values.
+        """
+        super()._init_weights(module)
+        if isinstance(module, (Rwkv7Attention, Rwkv7FeedForward)):
+            for parameter in module._parameters.values():
+                if parameter is not None:
+                    parameter.data.zero_()
+
 
 @auto_docstring
 class Rwkv7Model(Rwkv7PreTrainedModel):
