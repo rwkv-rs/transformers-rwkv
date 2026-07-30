@@ -18,10 +18,12 @@ state errors: a carried state that is stale, mixed between batch rows, or simply
 not equivalent to having read the whole prefix. Those are what these tests pin.
 """
 
+import shutil
+import tempfile
 import unittest
 
 from transformers import Rwkv7Config, is_torch_available
-from transformers.testing_utils import require_torch, require_torch_gpu, torch_device
+from transformers.testing_utils import require_torch, require_torch_gpu, slow, torch_device
 
 from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
@@ -1378,3 +1380,121 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
             dense = model(input_ids=input_ids).logits
 
         torch.testing.assert_close(after_update, dense, rtol=1e-3, atol=1e-3)
+
+
+@require_torch
+@slow
+class Rwkv7IntegrationTests(unittest.TestCase):
+    """A real checkpoint, against numbers produced by an implementation that is not this one.
+
+    Everything else in this file builds a model out of random weights, which pins
+    internal consistency and cannot see a whole class of defect: an `_init_weights` that
+    zeroed 249 of a converted checkpoint's 402 tensors passed the entire suite and was
+    caught only by loading real weights and reading the output.
+
+    The expected values below come from BlinkDL's own runtime -- the `rwkv` package at
+    `cpu fp32` with `RWKV_V7_ON=1` -- and not from this implementation, which would make
+    them self-certifying. They are deliberately not taken from `fla`, whose RWKV layer
+    prints a warning on import saying it is potentially buggy and that results should be
+    cross-checked against the official repo.
+
+    0.1B is chosen for more than its size: 768 wide at head_dim 64 is twelve heads of
+    width 64, so head *count* and head *width* differ. At the 7.2B they are both 64 and a
+    quantity indexed by the wrong one of them agrees by coincidence.
+    """
+
+    CHECKPOINT_REPO = "BlinkDL/rwkv-7-world"
+    CHECKPOINT_FILE = "RWKV-x070-World-0.1B-v2.8-20241210-ctx4096.pth"
+
+    # "The Eiffel Tower is located in the city of", RWKV world tokenizer.
+    PROMPT_IDS = [6699, 304, 25740, 109, 37480, 4600, 52151, 4596, 22590, 30449, 4706]
+    # " Paris, France. It is the tallest building in the world and is the world's tallest"
+    EXPECTED_IDS = [
+        37138,
+        45,
+        44312,
+        47,
+        3918,
+        4600,
+        22590,
+        32190,
+        7513,
+        55666,
+        4596,
+        22590,
+        40213,
+        21265,
+        4600,
+        22590,
+        40213,
+        460,
+        32190,
+        7513,
+    ]
+    EXPECTED_TOP5 = [37138, 29319, 20312, 3632, 29417]
+    EXPECTED_TOP5_LOGITS = [5.1235, 1.0825, 0.9404, 0.8200, 0.2382]
+
+    @classmethod
+    def setUpClass(cls):
+        from huggingface_hub import hf_hub_download
+
+        from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import convert
+
+        cls._work = tempfile.mkdtemp()
+        native = hf_hub_download(cls.CHECKPOINT_REPO, cls.CHECKPOINT_FILE)
+        # Through the converter in this PR, so the test covers that too: a model PR whose
+        # checkpoints all arrive by a path the tests never take is testing half of itself.
+        convert(native, "native", None, f"{cls._work}/hf", dtype="float32")
+        cls.model = Rwkv7ForCausalLM.from_pretrained(f"{cls._work}/hf", dtype=torch.float32).eval()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._work, ignore_errors=True)
+
+    def test_config_is_inferred_at_a_non_square_width(self):
+        config = self.model.config
+        self.assertEqual((config.hidden_size, config.num_heads, config.head_dim), (768, 12, 64))
+        self.assertNotEqual(config.num_heads, config.head_dim)
+
+    def test_next_token_logits_match_the_reference_runtime(self):
+        """The distribution, not just its argmax: a wrong scale agrees on the winner."""
+        with torch.no_grad():
+            logits = self.model(input_ids=torch.tensor([self.PROMPT_IDS])).logits[0, -1].float()
+
+        values, indices = torch.topk(logits, 5)
+        self.assertEqual(indices.tolist(), self.EXPECTED_TOP5)
+        torch.testing.assert_close(values, torch.tensor(self.EXPECTED_TOP5_LOGITS), rtol=1e-4, atol=1e-3)
+
+    def test_greedy_continuation_matches_the_reference_runtime(self):
+        with torch.no_grad():
+            generated = self.model.generate(
+                input_ids=torch.tensor([self.PROMPT_IDS]), max_new_tokens=20, do_sample=False
+            )
+        self.assertEqual(generated[0, len(self.PROMPT_IDS) :].tolist(), self.EXPECTED_IDS)
+
+    def test_the_cache_carries_what_a_full_forward_computes(self):
+        """Twenty steps of one-token decode against twenty full re-reads of the prefix.
+
+        The shared suite checks this on random weights, where the state is small enough
+        that a broken carry can hide under the tolerance. Here a divergence shows up as a
+        different token.
+        """
+        ids = list(self.PROMPT_IDS)
+        cached, recomputed = [], []
+        with torch.no_grad():
+            out = self.model(input_ids=torch.tensor([ids]), use_cache=True)
+            state = out.state
+            cached.append(int(out.logits[0, -1].argmax()))
+            for _ in range(19):
+                out = self.model(input_ids=torch.tensor([[cached[-1]]]), state=state, use_cache=True)
+                state = out.state
+                cached.append(int(out.logits[0, -1].argmax()))
+
+            walk = list(self.PROMPT_IDS)
+            for _ in range(20):
+                logits = self.model(input_ids=torch.tensor([walk]), use_cache=False).logits[0, -1]
+                recomputed.append(int(logits.argmax()))
+                walk.append(recomputed[-1])
+
+        self.assertEqual(cached, recomputed)
+        self.assertEqual(cached, self.EXPECTED_IDS)
