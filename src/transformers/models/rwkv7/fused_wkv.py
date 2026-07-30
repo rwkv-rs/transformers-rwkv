@@ -55,6 +55,7 @@ def _wkv_one_kernel(
     stride_sb,
     stride_sh,
     stride_si,
+    stride_sj,
     stride_vb,
     stride_vh,
     N: tl.constexpr,
@@ -78,7 +79,11 @@ def _wkv_one_kernel(
     kk = tl.load(kk_ptr + vec + i).to(tl.float32)
     a = tl.load(a_ptr + vec + i).to(tl.float32)
 
-    off = batch * stride_sb + head * stride_sh + i[:, None] * stride_si + j[None, :]
+    # Every axis of the state is strided, the last one included. Hardcoding unit
+    # stride there reads the tile transposed when the caller hands over anything
+    # that is not contiguous, and the result is wrong by 80-98% with nothing
+    # raised: the shape is right, so neither the kernel nor Triton notices.
+    off = batch * stride_sb + head * stride_sh + i[:, None] * stride_si + j[None, :] * stride_sj
     state = tl.load(state_ptr + off).to(tl.float32)
 
     # Same three lines as the reference, in the same order and in fp32: `sa` uses the
@@ -101,6 +106,13 @@ def fused_wkv_one(
     state: torch.Tensor,
 ) -> torch.Tensor:
     batch, _, heads, head_dim = r.shape
+    # The grid comes from `r`, so a state that disagrees with it is read at offsets
+    # belonging to another row and returns a plausible answer for the wrong sequence.
+    # Checked rather than assumed: the kernel cannot tell, and neither can the caller.
+    if tuple(state.shape) != (batch, heads, head_dim, head_dim):
+        raise ValueError(
+            f"state has shape {tuple(state.shape)}, but the vectors imply {(batch, heads, head_dim, head_dim)}"
+        )
     out = torch.empty(batch, heads, head_dim, device=r.device, dtype=r.dtype)
     flat = [t.reshape(batch, heads, head_dim).contiguous() for t in (r, w_log, k, v, kk, a)]
     _wkv_one_kernel[(batch, heads)](
@@ -110,6 +122,7 @@ def fused_wkv_one(
         state.stride(0),
         state.stride(1),
         state.stride(2),
+        state.stride(3),
         out.stride(0),
         out.stride(1),
         N=head_dim,

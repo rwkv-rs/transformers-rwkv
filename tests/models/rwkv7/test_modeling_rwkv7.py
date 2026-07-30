@@ -415,6 +415,47 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
                         msg=f"{dtype} layer {layer} slot {slot}: an all-ones mask moved the state",
                     )
 
+    @require_torch_gpu
+    def test_fused_kernel_reads_a_strided_state_correctly(self):
+        """The fused step must index the state by its strides, not by assumption.
+
+        Its offset arithmetic hardcoded unit stride on the state's last axis and passed
+        only three of the four strides, so a caller handing over anything that is not
+        contiguous had the tile read transposed. Nothing raised: the shape is right, so
+        neither Triton nor the caller could tell, and the answer came back 82% wrong on
+        the output and 98% wrong on the carried state.
+
+        The batch check is here for the same reason. The launch grid comes from `r`, so
+        a state that disagrees with it is read at offsets belonging to a different
+        sequence and returns a plausible answer for the wrong one.
+        """
+        from transformers.models.rwkv7.fused_wkv import fused_wkv_one
+        from transformers.models.rwkv7.modeling_rwkv7 import rwkv7_eager
+
+        torch.manual_seed(0)
+        batch, heads, width = 2, 4, 64
+        shape = (batch, 1, heads, width)
+        vector = lambda: torch.randn(*shape, device=torch_device) * 0.2  # noqa: E731
+        r, k, v = vector(), vector(), vector()
+        kk = torch.nn.functional.normalize(torch.randn(*shape, device=torch_device), dim=-1)
+        a = torch.sigmoid(torch.randn(*shape, device=torch_device))
+        w_log = -0.6065306597126334 * torch.sigmoid(torch.randn(*shape, device=torch_device))
+        base = torch.randn(batch, heads, width, width, device=torch_device) * 0.1
+
+        # A transpose of the two square axes: same shape, same elements, stride(3) != 1.
+        strided = base.clone().transpose(2, 3)
+        self.assertFalse(strided.is_contiguous(), "the fixture stopped being strided")
+
+        for name, state in (("contiguous", base.clone()), ("strided", strided)):
+            expected_out, expected_state = rwkv7_eager(r, w_log, k, v, kk, a, state.clone())
+            got_state = state.clone()
+            got_out = fused_wkv_one(r, w_log, k, v, kk, a, got_state)
+            torch.testing.assert_close(got_out, expected_out, rtol=1e-4, atol=1e-4, msg=name)
+            torch.testing.assert_close(got_state, expected_state, rtol=1e-4, atol=1e-4, msg=name)
+
+        with self.assertRaisesRegex(ValueError, "but the vectors imply"):
+            fused_wkv_one(r, w_log, k, v, kk, a, torch.zeros(batch + 1, heads, width, width, device=torch_device))
+
     def test_compiled_prefill_matches_eager_at_batch_and_length(self):
         """`torch.compile` must survive a shape with both a batch and a length.
 
