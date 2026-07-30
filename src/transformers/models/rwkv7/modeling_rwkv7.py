@@ -358,7 +358,13 @@ def rwkv7_fused(
     # narrower state is not a different code path -- and it is the only lever left at
     # batch. The kernel already runs at ~86% of this card's bandwidth moving a 268 MB
     # fp32 state per layer, so halving the state is worth more than any tuning of it.
-    if not (single_token and r.is_cuda and fused_wkv_one is not None):
+    # `head_dim` a power of two is part of the kernel's applicability domain, not a
+    # detail: `tl.arange` requires it, and without this term a width like 192 reached
+    # Triton and came back as a CompilationError raised from inside the kernel rather
+    # than as a fallback. The portable path has no such constraint, so falling through
+    # is both correct and what the docstring already promises for the other cases.
+    width = r.shape[-1]
+    if not (single_token and r.is_cuda and fused_wkv_one is not None and width & (width - 1) == 0):
         return rwkv7_eager(r, w_log, k, v, kk, a, state, cu_seq_lens=cu_seq_lens, **kwargs)
     return fused_wkv_one(r, w_log, k, v, kk, a, state), state
 
