@@ -49,6 +49,7 @@ from torch import nn
 
 from ...cache_utils import Cache, LinearAttentionLayer
 from ...generation import GenerationMixin
+from ...initialization import zeros_
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel
 from ...utils import ModelOutput, auto_docstring, can_return_tuple, logging
@@ -1038,12 +1039,20 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
         gives the shift mixes a per-layer ramp and the LoRA factors particular scales.
         Reproducing that belongs with training support, which this port does not claim;
         every real use loads a converted checkpoint over these values.
+
+        Through `initialization.zeros_` rather than `parameter.data.zero_()`, and the
+        difference is not cosmetic. The framework skips re-initialising anything already
+        loaded by checking an `_is_hf_initialized` flag that those helpers set and a raw
+        in-place write does not. The first version of this method wrote in place, so the
+        flag was never set, `_init_weights` ran anyway, and 249 of a converted 0.1B
+        checkpoint's parameters were zeroed after being loaded -- the model produced
+        "civil civil civil" where the reference runtime produced "Paris, France".
         """
         super()._init_weights(module)
         if isinstance(module, (Rwkv7Attention, Rwkv7FeedForward)):
             for parameter in module._parameters.values():
                 if parameter is not None:
-                    parameter.data.zero_()
+                    zeros_(parameter)
 
 
 @auto_docstring

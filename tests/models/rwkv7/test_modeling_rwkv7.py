@@ -335,6 +335,37 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
                 json.dump(config.to_dict(), handle)
             convert(checkpoint, "native", right_path, f"{work}/out-right")
 
+    def test_a_reloaded_checkpoint_keeps_every_weight(self):
+        """Saving and reloading must not lose a parameter to re-initialisation.
+
+        `_init_weights` has to reach this model's twenty-one raw `nn.Parameter`s, which
+        the inherited one does not. Written the obvious way -- `parameter.data.zero_()`
+        -- it also destroys them on load: the framework skips re-initialising anything
+        already there by checking an `_is_hf_initialized` flag that `initialization`'s
+        helpers set and a raw in-place write does not, so `_init_weights` runs after the
+        checkpoint is in and zeroes what it just loaded.
+
+        That shipped for exactly as long as it took to run a real checkpoint through it.
+        A converted 0.1B came back with 249 of its 402 tensors zeroed and generated
+        "civil civil civil" where the reference runtime generated "Paris, France". None
+        of the tests here noticed, because they all build models rather than load them.
+        """
+        import tempfile
+
+        config = _tiny_config()
+        original = _sharpened(Rwkv7ForCausalLM(config))
+        with tempfile.TemporaryDirectory() as work:
+            original.save_pretrained(work)
+            reloaded = Rwkv7ForCausalLM.from_pretrained(work)
+
+        before = dict(original.named_parameters())
+        after = dict(reloaded.named_parameters())
+        self.assertEqual(set(before), set(after))
+        lost = [name for name, p in after.items() if p.abs().max() == 0 and before[name].abs().max() != 0]
+        self.assertEqual(lost, [], f"{len(lost)} parameters came back zeroed, e.g. {lost[:5]}")
+        for name in before:
+            torch.testing.assert_close(after[name], before[name], rtol=0, atol=0, msg=name)
+
     def test_checkpointed_backward_matches_the_plain_one(self):
         """Gradient checkpointing must not change a gradient.
 
