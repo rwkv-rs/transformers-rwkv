@@ -28,11 +28,16 @@ from ...test_pipeline_mixin import PipelineTesterMixin
 
 if is_torch_available():
     import torch
+    from safetensors.torch import load_file
     from torch.nn import functional as F
 
     from transformers import Rwkv7ForCausalLM, Rwkv7Model
-    from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import convert_state_dict
-    from transformers.models.rwkv7.kernel_backends import register_rwkv7_wkv_backend
+    from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import (
+        convert_rwkv7_checkpoint_to_hf_format,
+        convert_state_dict,
+        infer_rwkv7_config,
+    )
+    from transformers.models.rwkv7.modeling_rwkv7 import register_rwkv7_wkv_backend
 
     def rwkv7_reference_backend(
         receptance,
@@ -382,6 +387,58 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
 
         converted = convert_state_dict(raw_state_dict, config, fuse_embedding_layer_norm=False)
         self.assertFalse(any(f"rwkv7.blocks.0.att.{name}" in converted for name in ("v0", "v1", "v2")))
+
+    def test_conversion_rejects_incompatible_low_rank_shapes(self):
+        config = get_config()
+        model = Rwkv7ForCausalLM(config)
+        raw_state_dict = {}
+        for name, tensor in model.state_dict().items():
+            if name == "head.weight":
+                raw_name = name
+            elif name == "rwkv7.embeddings.weight":
+                raw_name = "emb.weight"
+            else:
+                raw_name = name.removeprefix("rwkv7.")
+            raw_state_dict[raw_name] = tensor
+        raw_state_dict["blocks.0.att.w1"] = torch.empty(config.hidden_size, 31)
+
+        with self.assertRaisesRegex(ValueError, "low-rank tensors"):
+            infer_rwkv7_config(raw_state_dict)
+
+    def test_conversion_saves_requested_dtype_and_metadata(self):
+        config = get_config()
+        model = Rwkv7ForCausalLM(config)
+        raw_state_dict = {}
+        for name, tensor in model.state_dict().items():
+            if name == "head.weight":
+                raw_name = name
+            elif name == "rwkv7.embeddings.weight":
+                raw_name = "emb.weight"
+            else:
+                raw_name = name.removeprefix("rwkv7.")
+            raw_state_dict[raw_name] = tensor
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            checkpoint_path = f"{temporary_directory}/rwkv7-ctx32.pth"
+            output_directory = f"{temporary_directory}/converted"
+            torch.save(raw_state_dict, checkpoint_path)
+            convert_rwkv7_checkpoint_to_hf_format(
+                output_dir=output_directory,
+                checkpoint_path=checkpoint_path,
+                fuse_embedding_layer_norm=False,
+                dtype="float16",
+            )
+
+            converted_config = Rwkv7Config.from_pretrained(output_directory)
+            converted_state_dict = load_file(f"{output_directory}/model.safetensors")
+            converted_model = Rwkv7ForCausalLM.from_pretrained(output_directory)
+
+        self.assertEqual(converted_config.architectures, ["Rwkv7ForCausalLM"])
+        self.assertEqual(converted_config.dtype, torch.float16)
+        self.assertEqual({tensor.dtype for tensor in converted_state_dict.values()}, {torch.float16})
+        for name, parameter in converted_model.named_parameters():
+            expected_dtype = torch.float32 if name.endswith("att.w0") else torch.float16
+            self.assertEqual(parameter.dtype, expected_dtype)
 
     def test_backward(self):
         config = get_config()

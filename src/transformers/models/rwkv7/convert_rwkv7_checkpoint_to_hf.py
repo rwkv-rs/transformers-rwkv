@@ -27,6 +27,12 @@ from .configuration_rwkv7 import Rwkv7Config
 
 logger = logging.get_logger(__name__)
 
+_SUPPORTED_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
 
 def _projection_ranks(hidden_size: int) -> tuple[int, int, int, int]:
     decay_rank = max(32, int(round(2.5 * hidden_size**0.5 / 32) * 32))
@@ -72,6 +78,27 @@ def infer_rwkv7_config(
     if ffn_weight.ndim != 2 or ffn_weight.shape[1] != hidden_size:
         raise ValueError(f"Invalid block-0 FFN key shape: {tuple(ffn_weight.shape)}.")
     intermediate_size = ffn_weight.shape[0]
+
+    expected_ranks = _projection_ranks(hidden_size)
+    rank_tensors = (
+        ("blocks.0.att.w1", "blocks.0.att.w2"),
+        ("blocks.0.att.a1", "blocks.0.att.a2"),
+        ("blocks.1.att.v1", "blocks.1.att.v2"),
+        ("blocks.0.att.g1", "blocks.0.att.g2"),
+    )
+    if num_hidden_layers < 2:
+        raise ValueError("RWKV-7 checkpoints must contain at least two layers to infer the value-residual rank.")
+    for expected_rank, (first_name, second_name) in zip(expected_ranks, rank_tensors):
+        if first_name not in state_dict or second_name not in state_dict:
+            raise ValueError(f"Checkpoint is missing low-rank tensors `{first_name}` or `{second_name}`.")
+        first_shape = tuple(state_dict[first_name].shape)
+        second_shape = tuple(state_dict[second_name].shape)
+        if first_shape != (hidden_size, expected_rank) or second_shape != (expected_rank, hidden_size):
+            raise ValueError(
+                f"Checkpoint low-rank tensors `{first_name}` and `{second_name}` have shapes "
+                f"{first_shape} and {second_shape}; this implementation expects "
+                f"{(hidden_size, expected_rank)} and {(expected_rank, hidden_size)}."
+            )
 
     context_match = re.search(r"ctx(\d+)", os.path.basename(checkpoint_name), flags=re.IGNORECASE)
     context_length = int(context_match.group(1)) if context_match else 4096
@@ -201,6 +228,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
     push_to_hub: bool = False,
     model_name: str | None = None,
     fuse_embedding_layer_norm: bool = True,
+    dtype: str = "float16",
     max_shard_size: str = "5GB",
     safe_serialization: bool = True,
 ):
@@ -222,6 +250,15 @@ def convert_rwkv7_checkpoint_to_hf_format(
         raise ValueError("RWKV-7 checkpoint must contain a tensor state dictionary.")
     config = infer_rwkv7_config(raw_state_dict, model_file, embedding_layer_norm_fused=fuse_embedding_layer_norm)
     converted_state_dict = convert_state_dict(raw_state_dict, config, fuse_embedding_layer_norm)
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype `{dtype}`. Choose from {sorted(_SUPPORTED_DTYPES)}.")
+    target_dtype = _SUPPORTED_DTYPES[dtype]
+    converted_state_dict = {
+        name: tensor.to(dtype=target_dtype, memory_format=torch.contiguous_format)
+        for name, tensor in converted_state_dict.items()
+    }
+    config.architectures = ["Rwkv7ForCausalLM"]
+    config.dtype = target_dtype
 
     os.makedirs(output_dir, exist_ok=True)
     config.save_pretrained(output_dir)
@@ -267,6 +304,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--tokenizer_name_or_path", type=str)
     parser.add_argument("--max_shard_size", type=str, default="5GB")
+    parser.add_argument("--dtype", choices=sorted(_SUPPORTED_DTYPES), default="float16")
     parser.add_argument("--no_safe_serialization", action="store_true")
     parser.add_argument("--no_embedding_layer_norm_fusion", action="store_true")
     parser.add_argument("--push_to_hub", action="store_true")
@@ -284,6 +322,7 @@ if __name__ == "__main__":
         push_to_hub=args.push_to_hub,
         model_name=args.model_name,
         fuse_embedding_layer_norm=not args.no_embedding_layer_norm_fusion,
+        dtype=args.dtype,
         max_shard_size=args.max_shard_size,
         safe_serialization=not args.no_safe_serialization,
     )
