@@ -38,8 +38,16 @@ opaque; one traced kernel is better off without the wrapper.
 """
 
 import torch
-import triton
-import triton.language as tl
+from ...utils.import_utils import is_triton_available
+
+# Guarded rather than bare, although the module itself is only ever imported
+# under the same `is_triton_available()` condition: import scanners that parse
+# this file in isolation (transformers' remote-code `check_imports` is one)
+# exempt imports inside an availability-guarded block, and demand triton on
+# every machine otherwise.
+if is_triton_available():
+    import triton
+    import triton.language as tl
 
 
 @triton.jit
