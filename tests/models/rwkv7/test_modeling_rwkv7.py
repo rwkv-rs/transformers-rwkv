@@ -257,6 +257,84 @@ class Rwkv7ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
 
         torch.testing.assert_close(full, incremental, rtol=1e-4, atol=1e-4)
 
+    def test_logits_to_keep_shortens_the_head(self):
+        """A prefill needs one row of logits, not `seq_len` of them.
+
+        The head is the widest matrix in the model, so running it over the whole prompt
+        is the largest avoidable cost in a prefill. This argument used to be swallowed
+        by `**kwargs`: passing it changed nothing, silently, and `generate` declined to
+        pass it at all because `_supports_logits_to_keep()` reads the signature.
+        """
+        config = _tiny_config()
+        model = _sharpened(Rwkv7ForCausalLM(config)).to(torch_device)
+        input_ids = torch.randint(0, config.vocab_size, (2, 12), device=torch_device)
+
+        self.assertTrue(model._supports_logits_to_keep())
+        with torch.no_grad():
+            everything = model(input_ids=input_ids).logits
+            for keep in (1, 4):
+                shortened = model(input_ids=input_ids, logits_to_keep=keep).logits
+                self.assertEqual(shortened.shape, (2, keep, config.vocab_size))
+                # The kept rows must be the LAST ones, and identical to computing them
+                # all: a slice taken from the wrong end would have the right shape.
+                torch.testing.assert_close(shortened, everything[:, -keep:, :])
+
+    def test_intermediate_size_follows_hidden_size_when_it_is_not_given(self):
+        """`hidden_ratio` has to actually derive something.
+
+        `intermediate_size` used to default to 3072, which is exactly `768 * 4.0` --
+        right for the default `hidden_size` and silently wrong for every other one. A
+        config written as `Rwkv7Config(hidden_size=4096, num_heads=64)` came back with a
+        channel-mix four times narrower than the architecture it names, and the model
+        built from it loads no real checkpoint. The default config is unchanged, which
+        is why this needs a second width to see at all.
+        """
+        self.assertEqual(Rwkv7Config().intermediate_size, 3072)
+        self.assertEqual(Rwkv7Config(hidden_size=4096, num_heads=64).intermediate_size, 16384)
+        self.assertEqual(Rwkv7Config(hidden_size=2048, num_heads=32).intermediate_size, 8192)
+        # An explicit value still wins, and still round-trips through config.json.
+        explicit = Rwkv7Config(hidden_size=4096, num_heads=64, intermediate_size=4096)
+        self.assertEqual(explicit.intermediate_size, 4096)
+        self.assertEqual(Rwkv7Config.from_dict(explicit.to_dict()).intermediate_size, 4096)
+
+    def test_conversion_rejects_a_config_whose_shapes_disagree(self):
+        """Matching key names is not the same as matching the model.
+
+        The converter compared key sets only. A hand-written `config.json` that gets a
+        width wrong has all the right names, so it converted with zero reported
+        mismatches and produced a model that loads and generates noise. The skeleton it
+        checks names against carries the shapes too.
+        """
+        import json
+        import tempfile
+
+        from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import convert
+
+        config = _tiny_config()
+        source = Rwkv7ForCausalLM(config)
+        # `_convert_native` is a prefix rename, so stripping it produces exactly the
+        # native `.pth` layout that conversion expects.
+        native = {key.removeprefix("rwkv7."): value for key, value in source.state_dict().items()}
+
+        with tempfile.TemporaryDirectory() as work:
+            checkpoint = f"{work}/model.pth"
+            torch.save(native, checkpoint)
+
+            wrong = config.to_dict()
+            wrong["intermediate_size"] = config.intermediate_size * 2  # same names, different widths
+            wrong_path = f"{work}/wrong.json"
+            with open(wrong_path, "w") as handle:
+                json.dump(wrong, handle)
+
+            with self.assertRaisesRegex(RuntimeError, "do not match the shapes this config implies"):
+                convert(checkpoint, "native", wrong_path, f"{work}/out-wrong")
+
+            # Control: the same checkpoint with a config that agrees must convert.
+            right_path = f"{work}/right.json"
+            with open(right_path, "w") as handle:
+                json.dump(config.to_dict(), handle)
+            convert(checkpoint, "native", right_path, f"{work}/out-right")
+
     def test_checkpointed_backward_matches_the_plain_one(self):
         """Gradient checkpointing must not change a gradient.
 

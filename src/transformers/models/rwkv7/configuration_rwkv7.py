@@ -45,7 +45,7 @@ class Rwkv7Config(PreTrainedConfig):
             *produces* `v_first` instead of mixing towards it.
         gate_low_rank_dim (`int`, *optional*, defaults to 128):
             Rank of the output-gate (`g`) LoRA.
-        intermediate_size (`int`, *optional*, defaults to 3072):
+        intermediate_size (`int`, *optional*):
             Channel-mix inner width (`hidden_ratio * hidden_size` by convention).
         hidden_ratio (`float`, *optional*, defaults to 4.0):
             Used to derive `intermediate_size` when it is not given explicitly.
@@ -137,7 +137,7 @@ class Rwkv7Config(PreTrainedConfig):
         a_low_rank_dim=64,
         v_low_rank_dim=32,
         gate_low_rank_dim=128,
-        intermediate_size=3072,
+        intermediate_size=None,
         hidden_ratio=4.0,
         hidden_act="sqrelu",
         norm_eps=1e-5,
@@ -165,6 +165,14 @@ class Rwkv7Config(PreTrainedConfig):
         self.v_low_rank_dim = v_low_rank_dim
         self.gate_low_rank_dim = gate_low_rank_dim
         self.hidden_ratio = hidden_ratio
+        # `None` rather than a number, so `hidden_ratio` is what actually decides. It
+        # used to default to 3072, which is exactly `768 * 4.0` -- correct for the
+        # default `hidden_size` and silently wrong for every other one. A config built
+        # as `Rwkv7Config(hidden_size=4096, num_heads=64)` came back with a channel-mix
+        # four times narrower than the architecture it names, and `hidden_ratio` was
+        # dead code that nothing could reach without passing `intermediate_size=None`
+        # explicitly. Serialisation is unaffected: the resolved value is written to
+        # `config.json` either way.
         self.intermediate_size = (
             intermediate_size if intermediate_size is not None else int(hidden_size * hidden_ratio)
         )

@@ -1251,6 +1251,7 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs,
     ) -> Rwkv7CausalLMOutput:
         r"""
@@ -1258,6 +1259,15 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
             Recurrent state returned by a previous call.
         deep_embeds (`torch.FloatTensor`, *optional*):
             RWKV-8 DeepEmbed vectors; see [`Rwkv7Model.forward`].
+        logits_to_keep (`int` or `torch.Tensor`, *optional*, defaults to 0):
+            Compute the head over only the last `logits_to_keep` positions, or over the
+            positions this tensor indexes; 0 means all of them. Worth having on a
+            recurrent model for the same reason as on any other: a prefill needs one
+            row of logits and the vocabulary is the widest matrix in the model, so
+            running the head over the whole prompt is the single largest avoidable cost
+            in a prefill. Until this argument existed it was swallowed by `**kwargs`,
+            so `generate` declined to pass it and a caller who passed it was quietly
+            ignored.
         """
         outputs = self.rwkv7(
             input_ids=input_ids,
@@ -1269,7 +1279,8 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             **kwargs,
         )
-        logits = self.head(outputs.last_hidden_state)
+        keep = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.head(outputs.last_hidden_state[:, keep, :])
 
         loss = None
         if labels is not None:
