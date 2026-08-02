@@ -76,6 +76,28 @@ def test_rwkv7_skips_packed_linear_without_weight() -> None:
     torch.testing.assert_close(linear.weight_scale, expected_scale)
 
 
+def test_rwkv7_low_rank_projections_are_standard_linear_modules_and_can_be_frozen() -> None:
+    model = Rwkv7ForCausalLM(_tiny_config()).train()
+    time_mix = model.model.blocks[1].att
+    projection_names = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
+
+    for name in projection_names:
+        projection = getattr(time_mix, name)
+        assert isinstance(projection, torch.nn.Linear)
+        assert projection.bias is None
+        assert f"model.blocks.1.att.{name}.weight" in dict(model.named_parameters())
+        projection.requires_grad_(False)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    loss = model(input_ids=input_ids, labels=input_ids).loss
+    assert loss is not None
+    loss.backward()
+
+    for name in projection_names:
+        assert getattr(time_mix, name).weight.grad is None
+    assert time_mix.receptance.weight.grad is not None
+
+
 def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
     torch.manual_seed(0)
     model = Rwkv7ForCausalLM(_tiny_config())
@@ -386,9 +408,9 @@ def test_rwkv7_flash_trainer_checkpoint_resume_matches_uninterrupted_training(tm
     assert {block.att.last_wkv_backend for block in gradient_model.model.blocks} == {"flash_rwkv"}
     for name in (
         "model.embeddings.weight",
-        "model.blocks.0.att.g2",
+        "model.blocks.0.att.g2.weight",
         "model.blocks.0.ffn.key.weight",
-        "model.blocks.1.att.g2",
+        "model.blocks.1.att.g2.weight",
         "head.weight",
     ):
         gradient = gradient_model.get_parameter(name).grad
