@@ -1,16 +1,20 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import json
+
 import pytest
 import torch
 
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM, Trainer, TrainingArguments
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7ForCausalLM,
     Rwkv7Model,
     rwkv7_reference,
 )
+from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
+from transformers.utils import SAFE_WEIGHTS_NAME
 
 
 def _tiny_config() -> Rwkv7Config:
@@ -144,3 +148,128 @@ def test_rwkv7_save_reload_and_auto_classes(tmp_path) -> None:
     assert isinstance(auto_model, Rwkv7Model)
     assert isinstance(auto_causal_lm, Rwkv7ForCausalLM)
     torch.testing.assert_close(auto_causal_lm(input_ids).logits, expected)
+
+
+class _TinyCausalLMDataset(torch.utils.data.Dataset):
+    def __init__(self):
+        self.examples = [
+            torch.tensor(tokens, dtype=torch.long)
+            for tokens in (
+                [1, 2, 3, 4, 5],
+                [5, 4, 3, 2, 1],
+                [2, 4, 6, 8, 10],
+                [10, 8, 6, 4, 2],
+                [3, 6, 9, 12, 15],
+                [15, 12, 9, 6, 3],
+                [7, 11, 13, 17, 19],
+                [19, 17, 13, 11, 7],
+            )
+        ]
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, index):
+        input_ids = self.examples[index]
+        return {"input_ids": input_ids, "labels": input_ids.clone()}
+
+
+def _training_arguments(output_dir, *, max_steps: int) -> TrainingArguments:
+    return TrainingArguments(
+        output_dir=output_dir,
+        max_steps=max_steps,
+        per_device_train_batch_size=1,
+        learning_rate=1e-3,
+        lr_scheduler_type="linear",
+        warmup_steps=0,
+        optim="adamw_torch",
+        logging_strategy="steps",
+        logging_steps=1,
+        save_strategy="steps",
+        save_steps=2,
+        report_to="none",
+        disable_tqdm=True,
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
+        seed=17,
+        data_seed=23,
+        use_cpu=True,
+    )
+
+
+def test_rwkv7_trainer_checkpoint_resume_matches_uninterrupted_training(tmp_path) -> None:
+    dataset = _TinyCausalLMDataset()
+
+    torch.manual_seed(11)
+    gradient_model = Rwkv7ForCausalLM(_tiny_config()).train()
+    gradient_batch = {name: tensor.unsqueeze(0) for name, tensor in dataset[0].items()}
+    gradient_output = gradient_model(**gradient_batch)
+    assert gradient_output.state is None
+    assert gradient_output.loss is not None and torch.isfinite(gradient_output.loss)
+    gradient_output.loss.backward()
+    for name, parameter in gradient_model.named_parameters():
+        assert parameter.grad is not None, f"missing gradient for {name}"
+        assert torch.isfinite(parameter.grad).all(), f"non-finite gradient for {name}"
+    for name in (
+        "model.embeddings.weight",
+        "model.blocks.0.ffn.key.weight",
+        "model.blocks.0.ffn.value.weight",
+        "model.blocks.1.ffn.key.weight",
+        "model.blocks.1.ffn.value.weight",
+        "head.weight",
+    ):
+        assert gradient_model.get_parameter(name).grad.abs().sum() > 0
+
+    torch.manual_seed(29)
+    reference_model = Rwkv7ForCausalLM(_tiny_config())
+    initial_parameters = {name: parameter.detach().clone() for name, parameter in reference_model.named_parameters()}
+    reference_trainer = Trainer(
+        model=reference_model,
+        args=_training_arguments(tmp_path / "reference", max_steps=4),
+        train_dataset=dataset,
+    )
+    reference_result = reference_trainer.train()
+
+    assert torch.isfinite(torch.tensor(reference_result.training_loss))
+    logged_losses = [entry["loss"] for entry in reference_trainer.state.log_history if "loss" in entry]
+    assert len(logged_losses) == 4
+    assert torch.isfinite(torch.tensor(logged_losses)).all()
+    for name in (
+        "model.blocks.0.ffn.key.weight",
+        "model.blocks.1.ffn.value.weight",
+        "head.weight",
+    ):
+        assert not torch.equal(reference_model.get_parameter(name), initial_parameters[name])
+
+    checkpoint = tmp_path / "reference" / "checkpoint-2"
+    for filename in (
+        SAFE_WEIGHTS_NAME,
+        "config.json",
+        OPTIMIZER_NAME,
+        SCHEDULER_NAME,
+        "rng_state.pth",
+        TRAINER_STATE_NAME,
+    ):
+        assert (checkpoint / filename).is_file(), f"missing checkpoint state: {filename}"
+    checkpoint_state = json.loads((checkpoint / TRAINER_STATE_NAME).read_text(encoding="utf-8"))
+    assert checkpoint_state["global_step"] == 2
+
+    torch.manual_seed(999)
+    resumed_model = Rwkv7ForCausalLM(_tiny_config())
+    resumed_trainer = Trainer(
+        model=resumed_model,
+        args=_training_arguments(tmp_path / "resumed", max_steps=4),
+        train_dataset=dataset,
+    )
+    resumed_trainer.train(resume_from_checkpoint=checkpoint)
+
+    assert resumed_trainer.state.global_step == reference_trainer.state.global_step == 4
+    assert resumed_trainer.lr_scheduler.state_dict() == reference_trainer.lr_scheduler.state_dict()
+    for name, reference_parameter in reference_model.named_parameters():
+        torch.testing.assert_close(
+            resumed_model.get_parameter(name),
+            reference_parameter,
+            rtol=0,
+            atol=0,
+            msg=lambda message, name=name: f"resume diverged for {name}: {message}",
+        )
