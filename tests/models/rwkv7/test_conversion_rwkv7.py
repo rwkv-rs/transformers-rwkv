@@ -66,6 +66,8 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
         torch.testing.assert_close(converted.state_dict()[name], tensor)
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
     assert result["validation"]["architecture"] == "Rwkv7ForCausalLM"
+    assert result["validation"]["device"] == "cpu"
+    assert result["validation"]["requested_wkv_backend"] == "auto"
     assert result["validation"]["strict_load"]
     assert result["validation"]["generated_ids"] == [[1, 2, 3, 2, 2]]
     assert "rwkv7_validation.json" in result["validation"]["artifact_files"]
@@ -94,12 +96,13 @@ def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
         str(checkpoint),
         str(output_dir),
         fuse_embedding_layer_norm=True,
+        wkv_backend="reference",
         validation_max_new_tokens=2,
     )
     converted = Rwkv7ForCausalLM.from_pretrained(output_dir).eval()
-    converted.config.wkv_backend = "reference"
 
     assert converted.config.embedding_layer_norm_fused
+    assert converted.config.wkv_backend == "reference"
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
 
 

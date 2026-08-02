@@ -36,8 +36,13 @@ import torch
 from transformers import AutoModelForCausalLM
 
 
-artifact_dir, encoded_input_ids, encoded_max_new_tokens = sys.argv[1:]
-model, loading_info = AutoModelForCausalLM.from_pretrained(artifact_dir, output_loading_info=True)
+artifact_dir, encoded_input_ids, encoded_max_new_tokens, encoded_device, encoded_dtype, expected_backend = sys.argv[1:]
+dtype = None if encoded_dtype == "auto" else getattr(torch, encoded_dtype)
+model, loading_info = AutoModelForCausalLM.from_pretrained(
+    artifact_dir,
+    dtype=dtype,
+    output_loading_info=True,
+)
 load_errors = {{
     name: loading_info.get(name, [])
     for name in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
@@ -45,8 +50,9 @@ load_errors = {{
 }}
 if load_errors:
     raise RuntimeError(f"RWKV-7 artifact did not strict-load: {{load_errors}}")
-model.eval()
-input_ids = torch.tensor([json.loads(encoded_input_ids)], dtype=torch.long)
+device = torch.device(encoded_device)
+model.to(device).eval()
+input_ids = torch.tensor([json.loads(encoded_input_ids)], dtype=torch.long, device=device)
 generation_kwargs = {{
     "max_new_tokens": int(encoded_max_new_tokens),
     "do_sample": False,
@@ -57,12 +63,19 @@ second = model.generate(input_ids, **generation_kwargs)
 if not torch.equal(first, second):
     raise RuntimeError("RWKV-7 artifact generation is not deterministic.")
 observed_backends = sorted({{block.att.last_wkv_backend for block in model.model.blocks}})
+if expected_backend and observed_backends != [expected_backend]:
+    raise RuntimeError(
+        f"RWKV-7 artifact requested backend {{expected_backend!r}} but observed {{observed_backends!r}}."
+    )
 result = {{
     "architecture": type(model).__name__,
-    "generated_ids": first.tolist(),
-    "input_ids": input_ids.tolist(),
+    "device": str(device),
+    "dtype": encoded_dtype,
+    "generated_ids": first.cpu().tolist(),
+    "input_ids": input_ids.cpu().tolist(),
     "max_new_tokens": generation_kwargs["max_new_tokens"],
     "observed_wkv_backends": observed_backends,
+    "requested_wkv_backend": model.config.wkv_backend,
     "strict_load": True,
 }}
 print("{_VALIDATION_MARKER}" + json.dumps(result, sort_keys=True))
@@ -82,12 +95,21 @@ def validate_rwkv7_artifact_in_subprocess(
     *,
     input_ids: list[int] | tuple[int, ...] = (1, 2, 3),
     max_new_tokens: int = 4,
+    device: str = "cpu",
+    dtype: str = "auto",
+    expected_wkv_backend: str | None = None,
 ) -> dict:
-    """Strict-load and deterministically generate from an artifact in a fresh Python process."""
+    """Strict-load and deterministically generate on the selected device in a fresh Python process."""
     if not input_ids:
         raise ValueError("Artifact validation requires at least one input token id.")
     if max_new_tokens < 1:
         raise ValueError("Artifact validation requires `max_new_tokens` to be positive.")
+    if not device:
+        raise ValueError("Artifact validation requires a non-empty `device`.")
+    if dtype != "auto" and dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported validation dtype `{dtype}`. Choose from auto or {sorted(_SUPPORTED_DTYPES)}.")
+    if expected_wkv_backend not in {None, "reference", "flash_rwkv"}:
+        raise ValueError("Expected WKV backend must be `reference`, `flash_rwkv`, or omitted.")
     command = [
         sys.executable,
         "-c",
@@ -95,6 +117,9 @@ def validate_rwkv7_artifact_in_subprocess(
         os.fspath(artifact_dir),
         json.dumps(list(input_ids)),
         str(max_new_tokens),
+        device,
+        dtype,
+        expected_wkv_backend or "",
     ]
     try:
         completed = subprocess.run(command, check=True, capture_output=True, text=True)
@@ -266,6 +291,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
     max_shard_size: str = "5GB",
     tokenizer_name_or_path: str | None = None,
     source_revision: str | None = None,
+    wkv_backend: str = "auto",
     validation_input_ids: list[int] | tuple[int, ...] = (1, 2, 3),
     validation_max_new_tokens: int = 4,
 ) -> dict:
@@ -274,6 +300,8 @@ def convert_rwkv7_checkpoint_to_hf_format(
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
     if dtype is not None and dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"Unsupported dtype `{dtype}`. Choose from {sorted(_SUPPORTED_DTYPES)} or preserve it.")
+    if wkv_backend not in {"auto", "reference", "flash_rwkv"}:
+        raise ValueError("`wkv_backend` must be `auto`, `reference`, or `flash_rwkv`.")
 
     raw_state_dict = _validate_tensor_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
     config = infer_rwkv7_config(
@@ -281,6 +309,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
         checkpoint_path,
         embedding_layer_norm_fused=fuse_embedding_layer_norm,
     )
+    config.wkv_backend = wkv_backend
     converted = convert_state_dict(raw_state_dict, config, fuse_embedding_layer_norm)
     model = Rwkv7ForCausalLM(config)
     try:
@@ -314,6 +343,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
         "safe_serialization": safe_serialization,
         "source_revision": source_revision,
         "tokenizer_source": tokenizer_name_or_path,
+        "wkv_backend": wkv_backend,
     }
     (output_path / "rwkv7_conversion.json").write_text(
         json.dumps(conversion, indent=2, sort_keys=True) + "\n",
@@ -323,6 +353,9 @@ def convert_rwkv7_checkpoint_to_hf_format(
         output_path,
         input_ids=validation_input_ids,
         max_new_tokens=validation_max_new_tokens,
+        device="cuda" if wkv_backend == "flash_rwkv" else "cpu",
+        dtype=dtype or "auto",
+        expected_wkv_backend=None if wkv_backend == "auto" else wkv_backend,
     )
     validation["artifact_files"] = sorted(
         [path.name for path in output_path.iterdir() if path.is_file()] + ["rwkv7_validation.json"]
@@ -346,6 +379,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max_shard_size", default="5GB")
     parser.add_argument("--tokenizer_name_or_path")
     parser.add_argument("--source_revision")
+    parser.add_argument("--wkv_backend", choices=("auto", "reference", "flash_rwkv"), default="auto")
     parser.add_argument("--validation_input_ids", default="1,2,3")
     parser.add_argument("--validation_max_new_tokens", type=int, default=4)
     args = parser.parse_args(argv)
@@ -359,6 +393,7 @@ def main(argv: list[str] | None = None) -> None:
         max_shard_size=args.max_shard_size,
         tokenizer_name_or_path=args.tokenizer_name_or_path,
         source_revision=args.source_revision,
+        wkv_backend=args.wkv_backend,
         validation_input_ids=validation_input_ids,
         validation_max_new_tokens=args.validation_max_new_tokens,
     )
