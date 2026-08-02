@@ -5,7 +5,6 @@ import importlib
 import inspect
 import json
 import math
-import os
 import subprocess
 from dataclasses import dataclass
 from functools import cache
@@ -30,13 +29,13 @@ _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
 RWKV7_FLA_DISTRIBUTION = "flash-linear-attention"
 RWKV7_FLA_EXTRA = "flash-rwkv"
 RWKV7_FLA_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
-RWKV7_FLA_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+RWKV7_FLA_REVISION = "88e8ff9d29dcebadb89ebad62ee76951729ea0df"
 RWKV7_FLA_REQUIREMENT = (
     f"{RWKV7_FLA_DISTRIBUTION}[{RWKV7_FLA_EXTRA}] @ git+{RWKV7_FLA_REPOSITORY}@{RWKV7_FLA_REVISION}"
 )
 RWKV7_FLASH_RWKV_DISTRIBUTION = "flash-rwkv"
 RWKV7_FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
-RWKV7_FLASH_RWKV_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
+RWKV7_FLASH_RWKV_REVISION = "c637985558c398de1db6a3c0523b1eec206a88d4"
 
 
 class Rwkv7DynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
@@ -239,20 +238,20 @@ def validate_rwkv7_runtime_provenance() -> dict[str, str]:
 def _load_fla_rwkv7_contract():
     validate_rwkv7_runtime_provenance()
     rwkv7 = importlib.import_module("fla.ops.rwkv7")
-    chunk_rwkv7 = getattr(rwkv7, "chunk_rwkv7", None)
+    recurrent_rwkv7 = getattr(rwkv7, "recurrent_rwkv7", None)
     get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
-    if not callable(chunk_rwkv7) or not callable(get_last_provider):
+    if not callable(recurrent_rwkv7) or not callable(get_last_provider):
         raise RuntimeError(
-            "The installed FLA RWKV-7 API must publicly expose chunk_rwkv7 and get_last_rwkv7_provider."
+            "The installed FLA RWKV-7 API must publicly expose recurrent_rwkv7 and get_last_rwkv7_provider."
         )
     try:
-        parameters = inspect.signature(chunk_rwkv7).parameters
+        parameters = inspect.signature(recurrent_rwkv7).parameters
     except (TypeError, ValueError) as error:
-        raise RuntimeError("The installed FLA chunk_rwkv7 API is not inspectable.") from error
+        raise RuntimeError("The installed FLA recurrent_rwkv7 API is not inspectable.") from error
     missing = sorted(_FLA_RWKV7_REQUIRED_PARAMETERS - parameters.keys())
     if missing:
-        raise RuntimeError(f"The installed FLA chunk_rwkv7 API lacks required stateful parameters: {missing}.")
-    return chunk_rwkv7, get_last_provider
+        raise RuntimeError(f"The installed FLA recurrent_rwkv7 API lacks required stateful parameters: {missing}.")
+    return recurrent_rwkv7, get_last_provider
 
 
 def _rwkv7_flash(
@@ -264,10 +263,13 @@ def _rwkv7_flash(
     b,
     state,
     head_size,
+    *,
+    cu_seqlens=None,
+    state_indices=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run FlashRWKV exclusively through FLA's public stateful dispatch contract."""
+    """Run FlashRWKV exclusively through FLA's public recurrent contract."""
     try:
-        chunk_rwkv7, get_last_provider = _load_fla_rwkv7_contract()
+        recurrent_rwkv7, get_last_provider = _load_fla_rwkv7_contract()
     except (ImportError, RuntimeError) as error:
         raise RuntimeError(f"RWKV-7 requires the pinned public FLA FlashRWKV contract: {error}") from error
 
@@ -278,53 +280,29 @@ def _rwkv7_flash(
         for tensor in (receptance, raw_decay, key, value, a, b)
     ]
     tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
-    requires_grad = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (*tensors, state))
-    if requires_grad:
-        if os.environ.get("FLA_FLASH_RWKV") != "1":
-            raise RuntimeError(
-                "FLA_FLASH_RWKV=1 is required for differentiable fixed-batch FlashRWKV execution; fallback is disabled."
-            )
-        call_tensors = tensors
-        state_pool = state
-        cu_seqlens = None
-        state_indices = None
-    else:
-        call_tensors = [
-            tensor.reshape(1, batch_size * sequence_length, num_heads, tensor.shape[-1]).contiguous()
-            for tensor in tensors
-        ]
-        state_pool = state.clone()
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * sequence_length,
-            sequence_length,
-            dtype=torch.int32,
-            device=receptance.device,
-        )
-        state_indices = torch.arange(batch_size, dtype=torch.int32, device=receptance.device)
 
     try:
-        result = chunk_rwkv7(
-            *call_tensors,
-            initial_state=state_pool,
+        result = recurrent_rwkv7(
+            *tensors,
+            initial_state=state,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             mode="fp32io16",
         )
     except (RuntimeError, TypeError, ValueError) as error:
-        raise RuntimeError(f"FLA public chunk_rwkv7 execution failed: {error}") from error
+        raise RuntimeError(f"FLA public recurrent_rwkv7 execution failed: {error}") from error
     if get_last_provider() != "flash_rwkv":
-        raise RuntimeError("FLA public chunk_rwkv7 did not select FlashRWKV; fallback is disabled.")
+        raise RuntimeError("FLA public recurrent_rwkv7 did not select FlashRWKV; fallback is disabled.")
     if not isinstance(result, tuple) or len(result) != 2:
-        raise RuntimeError("FLA public chunk_rwkv7 must return (output, final_state).")
+        raise RuntimeError("FLA public recurrent_rwkv7 must return (output, final_state).")
     output, final_state = result
-    if not isinstance(output, torch.Tensor) or output.shape != call_tensors[3].shape:
-        raise RuntimeError("FLA public chunk_rwkv7 returned an output with an incompatible shape.")
+    if not isinstance(output, torch.Tensor) or output.shape != tensors[3].shape:
+        raise RuntimeError("FLA public recurrent_rwkv7 returned an output with an incompatible shape.")
     if not isinstance(final_state, torch.Tensor) or final_state.shape != state.shape:
-        raise RuntimeError("FLA public chunk_rwkv7 returned an incompatible final state.")
-    if state_indices is not None and final_state is not state_pool:
-        raise RuntimeError("FLA packed FlashRWKV must update the supplied state pool in place.")
+        raise RuntimeError("FLA public recurrent_rwkv7 returned an incompatible final state.")
+    if state_indices is not None and final_state is not state:
+        raise RuntimeError("FLA packed recurrent RWKV-7 must update the supplied state pool in place.")
     return output.reshape(batch_size, sequence_length, hidden_size), final_state
 
 

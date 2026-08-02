@@ -67,9 +67,8 @@ def synthetic_fla_public_contract(tmp_path, monkeypatch):
     existing_pythonpath = os.environ.get("PYTHONPATH")
     pythonpath = str(site_packages) if not existing_pythonpath else f"{site_packages}:{existing_pythonpath}"
     monkeypatch.setenv("PYTHONPATH", pythonpath)
-    monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     monkeypatch.setattr(
         modeling_rwkv7,
         "_load_fla_rwkv7_contract",
-        lambda: (testing_utils.chunk_rwkv7, testing_utils.get_last_rwkv7_provider),
+        lambda: (testing_utils.recurrent_rwkv7, testing_utils.get_last_rwkv7_provider),
     )

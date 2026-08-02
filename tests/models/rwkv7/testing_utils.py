@@ -20,7 +20,7 @@ def _run_sequence(tensors, state):
     return torch.stack(outputs, dim=1).to(v.dtype), current_state
 
 
-def chunk_rwkv7(
+def recurrent_rwkv7(
     r,
     w,
     k,
@@ -34,7 +34,7 @@ def chunk_rwkv7(
     state_indices,
     mode,
 ):
-    """CPU oracle for the public FLA call shape; this is not a FlashRWKV operator E2E helper."""
+    """CPU oracle for the public recurrent FLA call shape; this is not a FlashRWKV operator E2E helper."""
     assert output_final_state is True
     assert mode == "fp32io16"
     tensors = (r, w, k, v, a, b)
@@ -53,6 +53,10 @@ def chunk_rwkv7(
         initial_state[state_index].copy_(final_state[0])
         outputs.append(output)
     return torch.cat(outputs, dim=1), initial_state
+
+
+# Explicit chunk/reference comparisons may keep using this test-only oracle name.
+chunk_rwkv7 = recurrent_rwkv7
 
 
 def get_last_rwkv7_provider():
