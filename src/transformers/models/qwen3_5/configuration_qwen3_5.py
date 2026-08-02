@@ -40,8 +40,13 @@ class Qwen3_5TextConfig(PreTrainedConfig):
         Number of value heads used in linear attention layers.
     rwkv7_head_size (`int`, *optional*, defaults to 64):
         Width of each RWKV-7 recurrent head in `"rwkv7"` layers.
+    rwkv7_head_sizes (`list[int]`, *optional*):
+        Per-layer RWKV-7 head sizes. When set, this list must contain one entry per decoder layer and overrides
+        `rwkv7_head_size` for `"rwkv7"` layers.
     rwkv7_backend (`str`, *optional*, defaults to `"auto"`):
         RWKV-7 recurrent backend used by `"rwkv7"` layers.
+    use_rwkv7_layer_norm (`bool`, *optional*, defaults to `False`):
+        Whether to use RWKV-style LayerNorm instead of Qwen3.5 RMSNorm throughout the text decoder.
 
     ```python
     >>> from transformers import Qwen3_5TextModel, Qwen3_5TextConfig
@@ -111,7 +116,9 @@ class Qwen3_5TextConfig(PreTrainedConfig):
     base_config_key = "text_config"
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
     rwkv7_head_size: int = 64
+    rwkv7_head_sizes: list[int] | None = None
     rwkv7_backend: str = "auto"
+    use_rwkv7_layer_norm: bool = False
 
     def __post_init__(self, **kwargs):
         kwargs.setdefault("partial_rotary_factor", 0.25)  # assign default for BC
@@ -130,9 +137,19 @@ class Qwen3_5TextConfig(PreTrainedConfig):
         invalid_layer_types = set(self.layer_types) - {"full_attention", "linear_attention", "rwkv7"}
         if invalid_layer_types:
             raise ValueError(f"Unsupported Qwen3.5 layer types: {sorted(invalid_layer_types)}.")
+        if self.rwkv7_head_sizes is not None and len(self.rwkv7_head_sizes) != self.num_hidden_layers:
+            raise ValueError("`rwkv7_head_sizes` must contain exactly `num_hidden_layers` entries.")
         if "rwkv7" in self.layer_types:
-            if self.rwkv7_head_size <= 0 or self.hidden_size % self.rwkv7_head_size:
-                raise ValueError("`hidden_size` must be divisible by a positive `rwkv7_head_size`.")
+            for layer_idx, layer_type in enumerate(self.layer_types):
+                if layer_type != "rwkv7":
+                    continue
+                head_size = (
+                    self.rwkv7_head_sizes[layer_idx] if self.rwkv7_head_sizes is not None else self.rwkv7_head_size
+                )
+                if head_size <= 0 or self.hidden_size % head_size:
+                    raise ValueError(
+                        f"`hidden_size` must be divisible by the positive RWKV-7 head size at layer {layer_idx}."
+                    )
             if self.rwkv7_backend not in {"auto", "reference", "flash_rwkv"}:
                 raise ValueError("`rwkv7_backend` must be 'auto', 'reference', or 'flash_rwkv'.")
 

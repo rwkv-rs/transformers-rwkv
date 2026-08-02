@@ -8,10 +8,53 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ...cache_utils import CacheLayerMixin, LinearAttentionLayer
 from ...generation import GenerationMixin
 from ...modeling_utils import PreTrainedModel
 from ...utils import ModelOutput, auto_docstring
 from .configuration_rwkv7 import Rwkv7Config
+
+
+class Rwkv7DynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
+    """Recurrent state cache that also tracks the token offset required by generation."""
+
+    _layer_type = "rwkv7"
+    is_sliding = False
+
+    def __init__(self, number_of_states: int = 1, **kwargs):
+        CacheLayerMixin.__init__(self)
+        LinearAttentionLayer.__init__(self, number_of_states=number_of_states, **kwargs)
+        self.cumulative_length = 0
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
+        raise RuntimeError("RWKV-7 caches recurrent state through `update_conv_state` and `update_recurrent_state`.")
+
+    def update_conv_state(
+        self,
+        conv_states: torch.Tensor,
+        state_idx: int = 0,
+        conv_kernel_size: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        updated_states = super().update_conv_state(
+            conv_states,
+            state_idx=state_idx,
+            conv_kernel_size=conv_kernel_size,
+            **kwargs,
+        )
+        if state_idx == 0:
+            self.cumulative_length += conv_states.shape[-1]
+        return updated_states
+
+    def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        return query_length, 0
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def reset(self) -> None:
+        super().reset()
+        self.cumulative_length = 0
 
 
 def _token_shift(
