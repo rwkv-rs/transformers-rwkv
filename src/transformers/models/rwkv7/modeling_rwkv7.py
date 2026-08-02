@@ -63,8 +63,8 @@ def _rwkv7_flash(
     """Run the optional FlashRWKV provider when its published capability contract accepts the call."""
     try:
         from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
-    except ImportError:
-        return None, "reference"
+    except ImportError as error:
+        return None, f"FlashRWKV provider import failed: {error}"
 
     batch_size, sequence_length, hidden_size = receptance.shape
     num_heads = hidden_size // head_size
@@ -74,9 +74,11 @@ def _rwkv7_flash(
     ]
     tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
     backend = FlashRWKVBackend()
-    accepted, _ = backend.chunk_rwkv7_verifier(*tensors, initial_state=state, output_final_state=True)
-    if not FlashRWKVBackend.is_available() or not accepted:
-        return None, "reference"
+    accepted, reason = backend.chunk_rwkv7_verifier(*tensors, initial_state=state, output_final_state=True)
+    if not FlashRWKVBackend.is_available():
+        return None, "FlashRWKV provider is unavailable"
+    if not accepted:
+        return None, reason or "FlashRWKV provider rejected the call"
     output, final_state = backend.chunk_rwkv7(*tensors, initial_state=state, output_final_state=True)
     return (output.reshape(batch_size, sequence_length, hidden_size), final_state), "flash_rwkv"
 
@@ -159,6 +161,8 @@ class Rwkv7TimeMix(nn.Module):
         if self.config.wkv_backend != "reference":
             accelerated, self.last_wkv_backend = _rwkv7_flash(*wkv_inputs)
         if accelerated is None:
+            if self.config.wkv_backend == "flash_rwkv":
+                raise RuntimeError(f"Explicit FlashRWKV request failed closed: {self.last_wkv_backend}")
             output, wkv_state = rwkv7_reference(*wkv_inputs)
             self.last_wkv_backend = "reference"
         else:

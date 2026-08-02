@@ -350,15 +350,11 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
         self.assertSetEqual(set(mixed_model.state_dict()), set(restored.state_dict()))
         torch.testing.assert_close(actual, expected)
 
-    def test_head_size_128_flash_request_falls_back_to_reference(self):
+    def test_head_size_128_explicit_flash_request_fails_closed(self):
         config = self.get_config(rwkv7_backend="flash_rwkv")
         model = Qwen3_5TextModel(config).eval()
-        with torch.no_grad():
-            output = model(torch.randint(0, config.vocab_size, (1, 3)), use_cache=False).last_hidden_state
-
-        self.assertTrue(torch.isfinite(output).all())
-        for layer_idx in (1, 2):
-            self.assertEqual(model.layers[layer_idx].rwkv_attn.time_mix.last_wkv_backend, "reference")
+        with self.assertRaisesRegex(RuntimeError, "Explicit FlashRWKV request failed closed"):
+            model(torch.randint(0, config.vocab_size, (1, 3)), use_cache=False)
 
     def test_invalid_rwkv7_geometry_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "divisible"):

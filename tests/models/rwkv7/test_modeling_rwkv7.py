@@ -30,6 +30,18 @@ def _tiny_config() -> Rwkv7Config:
     )
 
 
+def _tiny_flash_config() -> Rwkv7Config:
+    return Rwkv7Config(
+        vocab_size=31,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        head_size=64,
+        context_length=16,
+        wkv_backend="flash_rwkv",
+    )
+
+
 def test_rwkv7_initializes_regular_linear_weights() -> None:
     model = Rwkv7PreTrainedModel(_tiny_config())
     linear = torch.nn.Linear(4, 4, bias=False)
@@ -158,15 +170,23 @@ def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
-@pytest.mark.parametrize("backend", ["auto", "flash_rwkv"])
-def test_rwkv7_accelerated_backend_falls_back_on_cpu(backend) -> None:
+def test_rwkv7_auto_backend_falls_back_on_cpu() -> None:
     config = _tiny_config()
-    config.wkv_backend = backend
+    config.wkv_backend = "auto"
     model = Rwkv7ForCausalLM(config).eval()
 
     model(torch.tensor([[1, 2, 3]]))
 
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"reference"}
+
+
+def test_rwkv7_explicit_accelerated_backend_fails_closed_on_cpu() -> None:
+    config = _tiny_config()
+    config.wkv_backend = "flash_rwkv"
+    model = Rwkv7ForCausalLM(config).eval()
+
+    with pytest.raises(RuntimeError, match="Explicit FlashRWKV request failed closed"):
+        model(torch.tensor([[1, 2, 3]]))
 
 
 def test_rwkv7_accelerated_backend_selection_is_observable(monkeypatch) -> None:
@@ -232,7 +252,7 @@ class _TinyCausalLMDataset(torch.utils.data.Dataset):
         return {"input_ids": input_ids, "labels": input_ids.clone()}
 
 
-def _training_arguments(output_dir, *, max_steps: int) -> TrainingArguments:
+def _training_arguments(output_dir, *, max_steps: int, use_cpu: bool = True) -> TrainingArguments:
     return TrainingArguments(
         output_dir=output_dir,
         max_steps=max_steps,
@@ -251,7 +271,7 @@ def _training_arguments(output_dir, *, max_steps: int) -> TrainingArguments:
         dataloader_pin_memory=False,
         seed=17,
         data_seed=23,
-        use_cpu=True,
+        use_cpu=use_cpu,
     )
 
 
@@ -331,3 +351,80 @@ def test_rwkv7_trainer_checkpoint_resume_matches_uninterrupted_training(tmp_path
             atol=0,
             msg=lambda message, name=name: f"resume diverged for {name}: {message}",
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA FlashRWKV training")
+def test_rwkv7_flash_trainer_checkpoint_resume_matches_uninterrupted_training(tmp_path) -> None:
+    pytest.importorskip("flash_rwkv")
+    dataset = _TinyCausalLMDataset()
+
+    torch.manual_seed(11)
+    gradient_model = Rwkv7ForCausalLM(_tiny_flash_config()).to(device="cuda", dtype=torch.bfloat16).train()
+    gradient_batch = {name: tensor.unsqueeze(0).cuda() for name, tensor in dataset[0].items()}
+    gradient_loss = gradient_model(**gradient_batch).loss
+    assert gradient_loss is not None and torch.isfinite(gradient_loss) and gradient_loss > 0
+    gradient_loss.backward()
+    assert {block.att.last_wkv_backend for block in gradient_model.model.blocks} == {"flash_rwkv"}
+    for name in (
+        "model.embeddings.weight",
+        "model.blocks.0.att.g2",
+        "model.blocks.0.ffn.key.weight",
+        "model.blocks.1.att.g2",
+        "head.weight",
+    ):
+        gradient = gradient_model.get_parameter(name).grad
+        assert gradient is not None and torch.isfinite(gradient).all()
+        assert gradient.abs().sum() > 0, f"zero gradient for {name}"
+
+    torch.manual_seed(29)
+    reference_model = Rwkv7ForCausalLM(_tiny_flash_config()).to(device="cuda", dtype=torch.bfloat16)
+    reference_trainer = Trainer(
+        model=reference_model,
+        args=_training_arguments(tmp_path / "flash-reference", max_steps=4, use_cpu=False),
+        train_dataset=dataset,
+    )
+    reference_result = reference_trainer.train()
+    reference_losses = [entry["loss"] for entry in reference_trainer.state.log_history if "loss" in entry]
+    assert torch.isfinite(torch.tensor(reference_result.training_loss))
+    assert len(reference_losses) == 4 and all(loss > 0 for loss in reference_losses)
+    assert torch.isfinite(torch.tensor(reference_losses)).all()
+    assert {block.att.last_wkv_backend for block in reference_model.model.blocks} == {"flash_rwkv"}
+
+    checkpoint = tmp_path / "flash-reference" / "checkpoint-2"
+    for filename in (
+        SAFE_WEIGHTS_NAME,
+        "config.json",
+        OPTIMIZER_NAME,
+        SCHEDULER_NAME,
+        "rng_state.pth",
+        TRAINER_STATE_NAME,
+    ):
+        assert (checkpoint / filename).is_file(), f"missing checkpoint state: {filename}"
+    assert json.loads((checkpoint / TRAINER_STATE_NAME).read_text())["global_step"] == 2
+
+    torch.manual_seed(999)
+    resumed_model = Rwkv7ForCausalLM(_tiny_flash_config()).to(device="cuda", dtype=torch.bfloat16)
+    resumed_trainer = Trainer(
+        model=resumed_model,
+        args=_training_arguments(tmp_path / "flash-resumed", max_steps=4, use_cpu=False),
+        train_dataset=dataset,
+    )
+    resumed_trainer.train(resume_from_checkpoint=checkpoint)
+
+    assert resumed_trainer.state.global_step == reference_trainer.state.global_step == 4
+    assert resumed_trainer.lr_scheduler.state_dict() == reference_trainer.lr_scheduler.state_dict()
+    assert (
+        resumed_trainer.optimizer.state_dict()["param_groups"]
+        == reference_trainer.optimizer.state_dict()["param_groups"]
+    )
+    for resumed_state, reference_state in zip(
+        resumed_trainer.optimizer.state_dict()["state"].values(),
+        reference_trainer.optimizer.state_dict()["state"].values(),
+        strict=True,
+    ):
+        assert resumed_state.keys() == reference_state.keys()
+        for key in resumed_state:
+            torch.testing.assert_close(resumed_state[key], reference_state[key], rtol=0, atol=0)
+    for name, reference_parameter in reference_model.named_parameters():
+        torch.testing.assert_close(resumed_model.get_parameter(name), reference_parameter, rtol=0, atol=0)
+    assert {block.att.last_wkv_backend for block in resumed_model.model.blocks} == {"flash_rwkv"}
