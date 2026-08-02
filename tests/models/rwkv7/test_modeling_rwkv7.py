@@ -75,6 +75,21 @@ def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:
     torch.testing.assert_close(final_state, state)
 
 
+def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
+    torch.manual_seed(0)
+    inputs = [torch.randn(1, 2, 4, dtype=torch.float16, requires_grad=True) for _ in range(6)]
+    initial_state = torch.randn(1, 1, 4, 4, dtype=torch.float32, requires_grad=True)
+
+    output, final_state = rwkv7_reference(*inputs, initial_state, head_size=4)
+    output.float().square().mean().backward()
+
+    assert output.dtype == torch.float16
+    assert final_state.dtype == torch.float32
+    for tensor in [*inputs, initial_state]:
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
 def test_rwkv7_generate_updates_recurrent_state() -> None:
     torch.manual_seed(0)
     model = Rwkv7ForCausalLM(_tiny_config()).eval()

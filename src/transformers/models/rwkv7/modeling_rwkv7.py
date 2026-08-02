@@ -35,14 +35,15 @@ def rwkv7_reference(
     """Differentiable token-by-token RWKV-7 recurrence."""
     batch_size, sequence_length, hidden_size = receptance.shape
     num_heads = hidden_size // head_size
+    output_dtype = value.dtype
     tensors = [
-        tensor.view(batch_size, sequence_length, num_heads, head_size)
+        tensor.view(batch_size, sequence_length, num_heads, head_size).float()
         for tensor in (receptance, raw_decay, key, value, a, b)
     ]
     receptance, raw_decay, key, value, a, b = tensors
     log_decay = -F.softplus(-raw_decay) - 0.5
     outputs = []
-    current_state = state
+    current_state = state.float()
     for token_index in range(sequence_length):
         decay = log_decay[:, token_index].exp().unsqueeze(-1)
         state_projection = torch.einsum("bhk,bhkv->bhv", a[:, token_index], current_state)
@@ -52,7 +53,7 @@ def rwkv7_reference(
             + key[:, token_index].unsqueeze(-1) * value[:, token_index].unsqueeze(-2)
         )
         outputs.append(torch.einsum("bhk,bhkv->bhv", receptance[:, token_index], current_state))
-    output = torch.stack(outputs, dim=1).reshape(batch_size, sequence_length, hidden_size)
+    output = torch.stack(outputs, dim=1).reshape(batch_size, sequence_length, hidden_size).to(output_dtype)
     return output, current_state
 
 
