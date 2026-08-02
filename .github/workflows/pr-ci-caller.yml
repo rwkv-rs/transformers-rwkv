@@ -46,6 +46,9 @@ jobs:
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_skips_packed_linear_without_weight \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_quantized_low_rank_initialization_preserves_packed_weights_in_fresh_process \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_causal_lm_forward_backward_and_recurrent_state \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_github_repository_canonicalization_accepts_exact_repo \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_github_repository_canonicalization_rejects_hostile_source \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_editable_provenance_accepts_lowercase_repository_without_git_suffix \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_runtime_provenance_rejects_same_name_registry_package \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_runtime_provenance_rejects_wrong_fork_revision \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_runtime_provenance_rejects_unproven_flash_rwkv \
@@ -56,7 +59,8 @@ jobs:
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_fla_contract_rejects_provider_fallback \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_generate_updates_recurrent_state \
-            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_save_reload_and_auto_classes
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_save_reload_and_auto_classes \
+            tests/examples/test_any_to_rwkv_qwen3_5_conversion.py
 
   pr-ci:
     uses: ./.github/workflows/pr-ci_dynamic_caller_example.yml

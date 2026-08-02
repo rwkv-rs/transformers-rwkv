@@ -138,6 +138,41 @@ def _editable_git_value(source_dir: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def _canonical_github_repository(url: str) -> str | None:
+    """Return one strict ASCII identity for an HTTPS GitHub repository URL."""
+    candidate = url.removeprefix("git+")
+    try:
+        candidate.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    if "%" in candidate:
+        return None
+
+    parsed = urlparse(candidate)
+    if parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.params or parsed.query or parsed.fragment:
+        return None
+
+    repository_path = parsed.path.removesuffix("/")
+    if repository_path.endswith(".git"):
+        repository_path = repository_path[:-4]
+        if repository_path.endswith(".git"):
+            return None
+
+    path_parts = repository_path.split("/")
+    if len(path_parts) != 3 or path_parts[0]:
+        return None
+    owner, repository_name = path_parts[1:]
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._")
+    if (
+        owner in {"", ".", ".."}
+        or repository_name in {"", ".", ".."}
+        or any(character not in allowed for character in owner)
+        or any(character not in allowed for character in repository_name)
+    ):
+        return None
+    return f"https://github.com/{owner.lower()}/{repository_name.lower()}.git"
+
+
 def _validate_rwkv7_distribution_provenance(
     *,
     distribution_name: str,
@@ -168,7 +203,7 @@ def _validate_rwkv7_distribution_provenance(
     vcs_info = direct_url.get("vcs_info")
     source_kind = "vcs"
     if isinstance(vcs_info, dict):
-        observed_repository = str(direct_url.get("url", "")).removeprefix("git+").rstrip("/")
+        observed_repository = str(direct_url.get("url", ""))
         requested_revision = str(vcs_info.get("requested_revision", "")).lower()
         resolved_revision = str(vcs_info.get("commit_id", "")).lower()
         if vcs_info.get("vcs") != "git":
@@ -187,15 +222,18 @@ def _validate_rwkv7_distribution_provenance(
             module_origin.relative_to(source_dir)
         except ValueError as error:
             raise RuntimeError(f"Imported `{module_name}` is outside its editable provenance checkout.") from error
-        observed_repository = _editable_git_value(source_dir, "remote", "get-url", "origin").rstrip("/")
+        observed_repository = _editable_git_value(source_dir, "remote", "get-url", "origin")
         requested_revision = revision
         resolved_revision = _editable_git_value(source_dir, "rev-parse", "HEAD").lower()
         if _editable_git_value(source_dir, "status", "--porcelain"):
             raise RuntimeError(f"Editable `{distribution_name}` provenance checkout must be clean.")
         source_kind = "editable"
 
-    if observed_repository != repository:
-        raise RuntimeError(f"RWKV-7 `{distribution_name}` repository provenance mismatch: {observed_repository!r}.")
+    expected_repository = _canonical_github_repository(repository)
+    if expected_repository is None:
+        raise RuntimeError(f"RWKV-7 `{distribution_name}` pinned repository configuration is invalid.")
+    if _canonical_github_repository(observed_repository) != expected_repository:
+        raise RuntimeError(f"RWKV-7 `{distribution_name}` repository provenance mismatch.")
     if requested_revision != revision or resolved_revision != revision:
         raise RuntimeError(
             f"RWKV-7 `{distribution_name}` revision provenance mismatch: "
