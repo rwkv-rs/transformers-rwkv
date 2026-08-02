@@ -3,10 +3,15 @@
 
 import importlib
 import inspect
+import json
 import math
 import os
+import subprocess
 from dataclasses import dataclass
 from functools import cache
+from importlib import metadata as importlib_metadata
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import torch
 from torch import nn
@@ -22,6 +27,16 @@ from .configuration_rwkv7 import Rwkv7Config
 _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
     {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
 )
+RWKV7_FLA_DISTRIBUTION = "flash-linear-attention"
+RWKV7_FLA_EXTRA = "flash-rwkv"
+RWKV7_FLA_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
+RWKV7_FLA_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+RWKV7_FLA_REQUIREMENT = (
+    f"{RWKV7_FLA_DISTRIBUTION}[{RWKV7_FLA_EXTRA}] @ git+{RWKV7_FLA_REPOSITORY}@{RWKV7_FLA_REVISION}"
+)
+RWKV7_FLASH_RWKV_DISTRIBUTION = "flash-rwkv"
+RWKV7_FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
+RWKV7_FLASH_RWKV_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
 
 
 class Rwkv7DynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
@@ -109,8 +124,120 @@ def rwkv7_reference(
     return output, current_state
 
 
+def _editable_git_value(source_dir: Path, *arguments: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source_dir), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError("Editable RWKV7 runtime provenance requires a working Git executable.") from error
+    if completed.returncode != 0:
+        raise RuntimeError(f"Editable RWKV7 runtime provenance Git check failed: {completed.stderr.strip()}")
+    return completed.stdout.strip()
+
+
+def _validate_rwkv7_distribution_provenance(
+    *,
+    distribution_name: str,
+    module_name: str,
+    repository: str,
+    revision: str,
+) -> dict[str, str]:
+    try:
+        distribution = importlib_metadata.distribution(distribution_name)
+    except importlib_metadata.PackageNotFoundError as error:
+        raise RuntimeError(f"RWKV-7 requires the pinned `{RWKV7_FLA_REQUIREMENT}` runtime.") from error
+    if distribution.metadata.get("Name") != distribution_name:
+        raise RuntimeError(f"RWKV-7 distribution identity does not match the pinned `{distribution_name}` package.")
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise RuntimeError(
+            f"RWKV-7 `{distribution_name}` provenance requires PEP 610 direct_url.json; registry packages are rejected."
+        )
+    try:
+        direct_url = json.loads(direct_url_text)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"RWKV-7 `{distribution_name}` direct_url.json is invalid.") from error
+
+    module_spec = importlib.util.find_spec(module_name)
+    if module_spec is None or module_spec.origin is None:
+        raise RuntimeError(f"RWKV-7 `{distribution_name}` does not provide an importable `{module_name}` package.")
+    module_origin = Path(module_spec.origin).resolve()
+    vcs_info = direct_url.get("vcs_info")
+    source_kind = "vcs"
+    if isinstance(vcs_info, dict):
+        observed_repository = str(direct_url.get("url", "")).removeprefix("git+").rstrip("/")
+        requested_revision = str(vcs_info.get("requested_revision", "")).lower()
+        resolved_revision = str(vcs_info.get("commit_id", "")).lower()
+        if vcs_info.get("vcs") != "git":
+            raise RuntimeError(f"RWKV-7 `{distribution_name}` provenance must use Git.")
+        expected_module = Path(distribution.locate_file(f"{module_name}/__init__.py")).resolve()
+        if module_origin != expected_module:
+            raise RuntimeError(f"Imported `{module_name}` package does not belong to `{distribution_name}`.")
+    else:
+        parsed_url = urlparse(str(direct_url.get("url", "")))
+        if direct_url.get("dir_info", {}).get("editable") is not True or parsed_url.scheme != "file":
+            raise RuntimeError(
+                f"RWKV-7 `{distribution_name}` is neither a pinned Git install nor a verified editable checkout."
+            )
+        source_dir = Path(unquote(parsed_url.path)).resolve()
+        try:
+            module_origin.relative_to(source_dir)
+        except ValueError as error:
+            raise RuntimeError(f"Imported `{module_name}` is outside its editable provenance checkout.") from error
+        observed_repository = _editable_git_value(source_dir, "remote", "get-url", "origin").rstrip("/")
+        requested_revision = revision
+        resolved_revision = _editable_git_value(source_dir, "rev-parse", "HEAD").lower()
+        if _editable_git_value(source_dir, "status", "--porcelain"):
+            raise RuntimeError(f"Editable `{distribution_name}` provenance checkout must be clean.")
+        source_kind = "editable"
+
+    if observed_repository != repository:
+        raise RuntimeError(f"RWKV-7 `{distribution_name}` repository provenance mismatch: {observed_repository!r}.")
+    if requested_revision != revision or resolved_revision != revision:
+        raise RuntimeError(
+            f"RWKV-7 `{distribution_name}` revision provenance mismatch: "
+            f"requested={requested_revision!r}, resolved={resolved_revision!r}."
+        )
+    return {"source_kind": source_kind, "version": distribution.version}
+
+
+def validate_rwkv7_runtime_provenance() -> dict[str, str]:
+    """Fail closed unless FLA and FlashRWKV come from the pinned rwkv-rs revisions."""
+    fla = _validate_rwkv7_distribution_provenance(
+        distribution_name=RWKV7_FLA_DISTRIBUTION,
+        module_name="fla",
+        repository=RWKV7_FLA_REPOSITORY,
+        revision=RWKV7_FLA_REVISION,
+    )
+    flash_rwkv = _validate_rwkv7_distribution_provenance(
+        distribution_name=RWKV7_FLASH_RWKV_DISTRIBUTION,
+        module_name="flash_rwkv",
+        repository=RWKV7_FLASH_RWKV_REPOSITORY,
+        revision=RWKV7_FLASH_RWKV_REVISION,
+    )
+    return {
+        "distribution": RWKV7_FLA_DISTRIBUTION,
+        "distribution_version": fla["version"],
+        "extra": RWKV7_FLA_EXTRA,
+        "flash_rwkv_distribution": RWKV7_FLASH_RWKV_DISTRIBUTION,
+        "flash_rwkv_distribution_version": flash_rwkv["version"],
+        "flash_rwkv_repository": RWKV7_FLASH_RWKV_REPOSITORY,
+        "flash_rwkv_revision": RWKV7_FLASH_RWKV_REVISION,
+        "flash_rwkv_source_kind": flash_rwkv["source_kind"],
+        "repository": RWKV7_FLA_REPOSITORY,
+        "requirement": RWKV7_FLA_REQUIREMENT,
+        "revision": RWKV7_FLA_REVISION,
+        "source_kind": fla["source_kind"],
+    }
+
+
 @cache
 def _load_fla_rwkv7_contract():
+    validate_rwkv7_runtime_provenance()
     rwkv7 = importlib.import_module("fla.ops.rwkv7")
     chunk_rwkv7 = getattr(rwkv7, "chunk_rwkv7", None)
     get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
@@ -540,10 +667,19 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
 
 
 __all__ = [
+    "RWKV7_FLA_DISTRIBUTION",
+    "RWKV7_FLA_EXTRA",
+    "RWKV7_FLA_REPOSITORY",
+    "RWKV7_FLA_REQUIREMENT",
+    "RWKV7_FLA_REVISION",
+    "RWKV7_FLASH_RWKV_DISTRIBUTION",
+    "RWKV7_FLASH_RWKV_REPOSITORY",
+    "RWKV7_FLASH_RWKV_REVISION",
     "Rwkv7CausalLMOutput",
     "Rwkv7ForCausalLM",
     "Rwkv7Model",
     "Rwkv7Output",
     "Rwkv7PreTrainedModel",
     "rwkv7_reference",
+    "validate_rwkv7_runtime_provenance",
 ]
