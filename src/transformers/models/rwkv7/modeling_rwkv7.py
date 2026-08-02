@@ -514,14 +514,8 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
     _is_stateful = True
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            weight = getattr(module, "weight", None)
-            if weight is not None:
-                nn.init.normal_(weight, mean=0.0, std=0.02)
-        elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-        elif isinstance(module, Rwkv7TimeMix):
+        super()._init_weights(module)
+        if isinstance(module, Rwkv7TimeMix):
             for parameter in module.parameters(recurse=False):
                 nn.init.zeros_(parameter)
             module._reset_low_rank_parameters()
