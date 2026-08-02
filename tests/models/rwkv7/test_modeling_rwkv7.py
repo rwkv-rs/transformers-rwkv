@@ -12,6 +12,7 @@ from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7ForCausalLM,
     Rwkv7Model,
+    Rwkv7PreTrainedModel,
     rwkv7_reference,
 )
 from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
@@ -27,6 +28,37 @@ def _tiny_config() -> Rwkv7Config:
         head_size=4,
         context_length=16,
     )
+
+
+def test_rwkv7_initializes_regular_linear_weights() -> None:
+    model = Rwkv7PreTrainedModel(_tiny_config())
+    linear = torch.nn.Linear(4, 4, bias=False)
+    torch.nn.init.constant_(linear.weight, float("nan"))
+
+    model._init_weights(linear)
+
+    assert torch.isfinite(linear.weight).all()
+    assert linear.weight.std() > 0
+
+
+def test_rwkv7_skips_packed_linear_without_weight() -> None:
+    class PackedLinear(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(4, 4, bias=False)
+            del self.weight
+            self.register_buffer("weight_packed", torch.arange(8, dtype=torch.uint8))
+            self.register_buffer("weight_scale", torch.arange(4, dtype=torch.float32))
+
+    model = Rwkv7PreTrainedModel(_tiny_config())
+    linear = PackedLinear()
+    expected_packed = linear.weight_packed.clone()
+    expected_scale = linear.weight_scale.clone()
+
+    model._init_weights(linear)
+
+    assert not hasattr(linear, "weight")
+    torch.testing.assert_close(linear.weight_packed, expected_packed)
+    torch.testing.assert_close(linear.weight_scale, expected_scale)
 
 
 def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
