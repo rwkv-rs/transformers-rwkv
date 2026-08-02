@@ -57,8 +57,8 @@ class Rwkv7ConfigTest(unittest.TestCase):
             num_hidden_layers=3,
             head_size=8,
             decay_low_rank_dim=96,
-            aaa_low_rank_dim=80,
-            value_low_rank_dim=48,
+            a_low_rank_dim=80,
+            v_low_rank_dim=48,
             gate_low_rank_dim=112,
         )
 
@@ -77,8 +77,8 @@ class Rwkv7ConfigTest(unittest.TestCase):
             "num_attention_heads",
             "wkv_state_dtype",
             "decay_low_rank_dim",
-            "aaa_low_rank_dim",
-            "value_low_rank_dim",
+            "a_low_rank_dim",
+            "v_low_rank_dim",
             "gate_low_rank_dim",
         ):
             self.assertEqual(getattr(reloaded, field), getattr(config, field))
