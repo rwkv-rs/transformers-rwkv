@@ -16,7 +16,7 @@ from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7PreTrainedModel,
     rwkv7_reference,
 )
-from transformers.testing_utils import slow
+from transformers.testing_utils import run_test_using_subprocess, slow
 from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
 from transformers.utils import SAFE_WEIGHTS_NAME
 
@@ -85,6 +85,7 @@ def test_rwkv7_low_rank_projections_are_standard_linear_modules_and_can_be_froze
         projection = getattr(time_mix, name)
         assert isinstance(projection, torch.nn.Linear)
         assert projection.bias is None
+        assert torch.count_nonzero(projection.weight) == 0
         assert f"model.blocks.1.att.{name}.weight" in dict(model.named_parameters())
         projection.requires_grad_(False)
 
@@ -96,6 +97,40 @@ def test_rwkv7_low_rank_projections_are_standard_linear_modules_and_can_be_froze
     for name in projection_names:
         assert getattr(time_mix, name).weight.grad is None
     assert time_mix.receptance.weight.grad is not None
+
+
+@run_test_using_subprocess
+def test_rwkv7_quantized_low_rank_initialization_preserves_packed_weights_in_fresh_process() -> None:
+    initializer = Rwkv7PreTrainedModel(_tiny_config())
+    time_mix = modeling_rwkv7.Rwkv7TimeMix(_tiny_config(), layer_id=1)
+    packed_names = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
+    packed_state = {}
+    for index, name in enumerate(packed_names):
+        projection = getattr(time_mix, name)
+        del projection.weight
+        projection.register_buffer("weight_packed", torch.arange(8, dtype=torch.uint8) + index)
+        projection.register_buffer("weight_scale", torch.arange(4, dtype=torch.float32) + index)
+        packed_state[name] = (
+            projection.weight_packed,
+            projection.weight_packed.clone(),
+            projection.weight_scale,
+            projection.weight_scale.clone(),
+        )
+
+    # Match from_pretrained initialization order: quantized children first, then their TimeMix parent.
+    for child in time_mix.children():
+        initializer._init_weights(child)
+    initializer._init_weights(time_mix)
+
+    for name in packed_names:
+        projection = getattr(time_mix, name)
+        packed, expected_packed, scale, expected_scale = packed_state[name]
+        assert not hasattr(projection, "weight")
+        assert "weight" not in projection._parameters
+        assert projection.weight_packed is packed
+        assert projection.weight_scale is scale
+        torch.testing.assert_close(projection.weight_packed, expected_packed)
+        torch.testing.assert_close(projection.weight_scale, expected_scale)
 
 
 def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
