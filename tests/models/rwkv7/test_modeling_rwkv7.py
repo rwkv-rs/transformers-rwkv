@@ -277,6 +277,160 @@ def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
+@pytest.mark.parametrize(
+    ("repository", "repository_path"),
+    [
+        pytest.param(modeling_rwkv7.RWKV7_FLA_REPOSITORY, "rwkv-rs/fla-rwkv", id="fla"),
+        pytest.param(modeling_rwkv7.RWKV7_FLASH_RWKV_REPOSITORY, "rwkv-rs/FlashRWKV", id="flash-rwkv"),
+    ],
+)
+@pytest.mark.parametrize(
+    "url_template",
+    [
+        "https://github.com/{repository_path}",
+        "https://github.com/{repository_path}/",
+        "https://github.com/{uppercase_path}.git",
+        "git+https://github.com/{repository_path}.git/",
+    ],
+    ids=("plain", "trailing-slash", "ascii-case-git", "git-prefix-git-trailing-slash"),
+)
+def test_rwkv7_github_repository_canonicalization_accepts_exact_repo(
+    repository,
+    repository_path,
+    url_template,
+) -> None:
+    observed = url_template.format(
+        repository_path=repository_path,
+        uppercase_path=repository_path.upper(),
+    )
+
+    assert modeling_rwkv7._canonical_github_repository(observed) == modeling_rwkv7._canonical_github_repository(
+        repository
+    )
+
+
+@pytest.mark.parametrize(
+    ("repository", "repository_path"),
+    [
+        pytest.param(modeling_rwkv7.RWKV7_FLA_REPOSITORY, "rwkv-rs/fla-rwkv", id="fla"),
+        pytest.param(modeling_rwkv7.RWKV7_FLASH_RWKV_REPOSITORY, "rwkv-rs/FlashRWKV", id="flash-rwkv"),
+    ],
+)
+@pytest.mark.parametrize(
+    "url_template",
+    [
+        "http://github.com/{repository_path}.git",
+        "https://user@github.com/{repository_path}.git",
+        "https://github.com:443/{repository_path}.git",
+        "https://github.com/{repository_path}.git?ref=main",
+        "https://github.com/{repository_path}.git#fragment",
+        "https://github.com/{repository_path}.git;transport=ssh",
+        "https://github.com/{owner}%2F{repository_name}.git",
+        "https://github.com/rwkv-rſ/{repository_name}.git",
+        "https://github.com//{repository_path}.git",
+        "https://github.com/{repository_path}.git//",
+        "https://gitlab.com/{repository_path}.git",
+        "https://github.com/attacker/{repository_name}.git",
+        "https://github.com/{repository_path}/extra.git",
+        "https://github.com/{repository_path}.git.git",
+    ],
+    ids=(
+        "non-https",
+        "userinfo",
+        "port",
+        "query",
+        "fragment",
+        "path-params",
+        "percent-encoding",
+        "unicode-confusable",
+        "repeated-leading-slash",
+        "repeated-trailing-slash",
+        "foreign-host",
+        "fork",
+        "extra-path",
+        "repeated-git-suffix",
+    ),
+)
+def test_rwkv7_github_repository_canonicalization_rejects_hostile_source(
+    repository,
+    repository_path,
+    url_template,
+) -> None:
+    owner, repository_name = repository_path.split("/")
+    observed = url_template.format(
+        owner=owner,
+        repository_name=repository_name,
+        repository_path=repository_path,
+    )
+
+    assert modeling_rwkv7._canonical_github_repository(observed) != modeling_rwkv7._canonical_github_repository(
+        repository
+    )
+
+
+@pytest.mark.parametrize(
+    ("distribution_name", "module_name", "repository", "revision"),
+    [
+        pytest.param(
+            modeling_rwkv7.RWKV7_FLA_DISTRIBUTION,
+            "fla",
+            modeling_rwkv7.RWKV7_FLA_REPOSITORY,
+            modeling_rwkv7.RWKV7_FLA_REVISION,
+            id="fla",
+        ),
+        pytest.param(
+            modeling_rwkv7.RWKV7_FLASH_RWKV_DISTRIBUTION,
+            "flash_rwkv",
+            modeling_rwkv7.RWKV7_FLASH_RWKV_REPOSITORY,
+            modeling_rwkv7.RWKV7_FLASH_RWKV_REVISION,
+            id="flash-rwkv",
+        ),
+    ],
+)
+def test_rwkv7_editable_provenance_accepts_lowercase_repository_without_git_suffix(
+    monkeypatch,
+    tmp_path,
+    distribution_name,
+    module_name,
+    repository,
+    revision,
+) -> None:
+    source_dir = tmp_path / distribution_name
+    module_origin = source_dir / module_name / "__init__.py"
+
+    class EditableDistribution:
+        metadata = {"Name": distribution_name}
+        version = "0.0.0"
+
+        @staticmethod
+        def read_text(_filename):
+            return json.dumps({"url": source_dir.as_uri(), "dir_info": {"editable": True}})
+
+    def editable_git_value(observed_source_dir, *arguments):
+        assert observed_source_dir == source_dir
+        values = {
+            ("remote", "get-url", "origin"): repository.removesuffix(".git").lower(),
+            ("rev-parse", "HEAD"): revision,
+            ("status", "--porcelain"): "",
+        }
+        return values[arguments]
+
+    monkeypatch.setattr(modeling_rwkv7.importlib_metadata, "distribution", lambda _name: EditableDistribution())
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib.util,
+        "find_spec",
+        lambda name: importlib.machinery.ModuleSpec(name, loader=None, origin=str(module_origin)),
+    )
+    monkeypatch.setattr(modeling_rwkv7, "_editable_git_value", editable_git_value)
+
+    assert modeling_rwkv7._validate_rwkv7_distribution_provenance(
+        distribution_name=distribution_name,
+        module_name=module_name,
+        repository=repository,
+        revision=revision,
+    ) == {"source_kind": "editable", "version": "0.0.0"}
+
+
 @run_test_using_subprocess
 def test_rwkv7_runtime_provenance_is_fork_pinned_in_fresh_process() -> None:
     pytest.importorskip("fla")
@@ -307,14 +461,14 @@ def test_rwkv7_runtime_provenance_is_fork_pinned_in_fresh_process() -> None:
             "flash-linear-attention",
             "0.5.2",
             "fla",
-            "https://github.com/rwkv-rs/fla-rwkv.git",
+            "https://github.com/rwkv-rs/fla-rwkv",
             "88e8ff9d29dcebadb89ebad62ee76951729ea0df",
         ),
         "flash-rwkv": PinnedVcsDistribution(
             "flash-rwkv",
             "0.1.0",
             "flash_rwkv",
-            "https://github.com/rwkv-rs/FlashRWKV.git",
+            "https://github.com/rwkv-rs/flashrwkv",
             "c637985558c398de1db6a3c0523b1eec206a88d4",
         ),
     }

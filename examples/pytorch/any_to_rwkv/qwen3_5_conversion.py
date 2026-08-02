@@ -19,12 +19,14 @@ from torch.nn import functional as F
 
 from transformers import PretrainedConfig, PreTrainedModel, Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
 from transformers.modeling_outputs import CausalLMOutput
+from transformers.models.rwkv7 import validate_rwkv7_runtime_provenance
 
 
 RWKV7_HEAD_SIZE_BY_SOURCE_LAYER = {"linear_attention": 128, "full_attention": 256}
 
 
 def _load_public_recurrent_rwkv7():
+    validate_rwkv7_runtime_provenance()
     rwkv7 = importlib.import_module("fla.ops.rwkv7")
     recurrent_rwkv7 = getattr(rwkv7, "recurrent_rwkv7", None)
     get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
