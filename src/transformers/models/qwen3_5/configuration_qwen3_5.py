@@ -105,13 +105,13 @@ class Qwen3_5TextConfig(PreTrainedConfig):
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 32
     layer_types: list[str] | None = None
-    rwkv7_head_size: int = 64
-    rwkv7_backend: str = "auto"
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
     base_config_key = "text_config"
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
+    rwkv7_head_size: int = 64
+    rwkv7_backend: str = "auto"
 
     def __post_init__(self, **kwargs):
         kwargs.setdefault("partial_rotary_factor", 0.25)  # assign default for BC
@@ -124,6 +124,7 @@ class Qwen3_5TextConfig(PreTrainedConfig):
         else:
             self.layer_types = remap_legacy_layer_types(self.layer_types)
 
+        super().__post_init__(**kwargs)
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("`layer_types` must contain exactly `num_hidden_layers` entries.")
         invalid_layer_types = set(self.layer_types) - {"full_attention", "linear_attention", "rwkv7"}
@@ -134,8 +135,6 @@ class Qwen3_5TextConfig(PreTrainedConfig):
                 raise ValueError("`hidden_size` must be divisible by a positive `rwkv7_head_size`.")
             if self.rwkv7_backend not in {"auto", "reference", "flash_rwkv"}:
                 raise ValueError("`rwkv7_backend` must be 'auto', 'reference', or 'flash_rwkv'.")
-
-        super().__post_init__(**kwargs)
 
 
 @auto_docstring(checkpoint="Qwen/Qwen3.5-27B")
