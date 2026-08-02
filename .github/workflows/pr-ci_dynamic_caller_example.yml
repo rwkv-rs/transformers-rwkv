@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ubuntu-24.04
+      run_dynamic_test_matrix:
+        description: Run the upstream Transformers dynamic test matrix.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   # ===========================================================================
@@ -127,6 +132,17 @@ jobs:
       - name: Check which jobs have tests to run
         id: check
         run: |
+          if [ "${{ inputs.run_dynamic_test_matrix }}" != "true" ]; then
+            echo "Dynamic test matrix disabled; RWKV7 contracts run in the dedicated focused job."
+            for job in tests_torch tests_generate tests_tokenization tests_processors \
+                       pipelines_torch tests_custom_tokenizers examples_torch \
+                       tests_exotic_models tests_repo_utils tests_non_model \
+                       tests_training_ci tests_tensor_parallel_ci tests_fsdp_ci tests_peft_integration; do
+              echo "run_${job}=false" >> "$GITHUB_OUTPUT"
+            done
+            exit 0
+          fi
+
           for job in tests_torch tests_generate tests_tokenization tests_processors \
                      pipelines_torch tests_custom_tokenizers examples_torch \
                      tests_exotic_models tests_repo_utils tests_non_model \

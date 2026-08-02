@@ -52,3 +52,4 @@ jobs:
     uses: ./.github/workflows/pr-ci_dynamic_caller_example.yml
     with:
       cpu_runner: ubuntu-24.04
+      run_dynamic_test_matrix: false
