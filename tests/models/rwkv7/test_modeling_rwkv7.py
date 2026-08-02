@@ -6,6 +6,7 @@ import json
 import pytest
 import torch
 
+import transformers.models.rwkv7.modeling_rwkv7 as modeling_rwkv7
 from transformers import AutoModel, AutoModelForCausalLM, Trainer, TrainingArguments
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.modeling_rwkv7 import (
@@ -134,6 +135,20 @@ def test_rwkv7_accelerated_backend_falls_back_on_cpu(backend) -> None:
     model(torch.tensor([[1, 2, 3]]))
 
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"reference"}
+
+
+def test_rwkv7_accelerated_backend_selection_is_observable(monkeypatch) -> None:
+    def accelerated(*inputs):
+        return rwkv7_reference(*inputs), "flash_rwkv"
+
+    monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", accelerated)
+    config = _tiny_config()
+    config.wkv_backend = "flash_rwkv"
+    model = Rwkv7ForCausalLM(config).eval()
+
+    model(torch.tensor([[1, 2, 3]]))
+
+    assert {block.att.last_wkv_backend for block in model.model.blocks} == {"flash_rwkv"}
 
 
 def test_rwkv7_generate_updates_recurrent_state() -> None:
