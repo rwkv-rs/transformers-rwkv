@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 import torch
 
 from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.models.rwkv7 import validate_rwkv7_runtime_provenance
 
 
 _DTYPES = {
@@ -27,6 +29,27 @@ _DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+_CANONICAL_MANIFEST_NAME = "rwkv7_hf_upload_manifest.json"
+_TOKENIZER_FILES = frozenset(
+    {
+        "added_tokens.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "spiece.model",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "vocab.json",
+        "vocab.txt",
+    }
+)
+_OPTIONAL_ARTIFACT_METADATA = frozenset(
+    {
+        "generation_config.json",
+        "rwkv7_conversion.json",
+        "rwkv7_validation.json",
+    }
+)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -104,6 +127,38 @@ def _require_observed_backend(requested: str, observed: set[str]) -> None:
         raise RuntimeError(f"Explicit {requested!r} backend request failed closed; observed {sorted(observed)!r}")
 
 
+def _capture_observed_backend(model: torch.nn.Module, requested: str, stage: str) -> set[str]:
+    observed = _observed_backends(model)
+    try:
+        _require_observed_backend(requested, observed)
+    except RuntimeError as error:
+        raise RuntimeError(f"RWKV7 {stage} backend observation failed: {error}") from error
+    return observed
+
+
+def _require_consistent_backend_observations(observations: dict[str, set[str]]) -> set[str]:
+    signatures = {tuple(sorted(observed)) for observed in observations.values()}
+    if len(signatures) != 1:
+        rendered = {stage: sorted(observed) for stage, observed in observations.items()}
+        raise RuntimeError(f"RWKV7 benchmark stages selected inconsistent WKV backends: {rendered}")
+    return set(next(iter(signatures)))
+
+
+def _state_difference_summary(
+    actual: tuple[torch.Tensor, ...],
+    expected: tuple[torch.Tensor, ...],
+) -> tuple[float, float]:
+    differences = [
+        (actual_component.float() - expected_component.float()).abs()
+        for actual_component, expected_component in zip(actual, expected, strict=True)
+    ]
+    total_values = sum(difference.numel() for difference in differences)
+    return (
+        max(difference.max().item() for difference in differences),
+        sum(difference.sum().item() for difference in differences) / total_values,
+    )
+
+
 def _correctness_gate(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -112,17 +167,28 @@ def _correctness_gate(
     dtype: torch.dtype,
 ) -> tuple[dict[str, Any], tuple[torch.Tensor, ...]]:
     one_shot = model(input_ids=input_ids, use_cache=True)
+    one_shot_backend = _capture_observed_backend(model, requested_backend, "correctness one-shot")
+    if one_shot.state is None:
+        raise RuntimeError("RWKV7 one-shot correctness call did not return recurrent state with use_cache=True")
     prefix = model(input_ids=input_ids[:, :prompt_tokens], use_cache=True)
+    prefix_backend = _capture_observed_backend(model, requested_backend, "correctness prefix prefill")
     if prefix.state is None:
         raise RuntimeError("RWKV7 prefill did not return recurrent state with use_cache=True")
 
     state = prefix.state
+    prefix_state_snapshot = _clone_state(prefix.state)
     staged_logits = []
+    decode_backend_observations = {}
     for token_index in range(prompt_tokens, input_ids.shape[1]):
         step = model(
             input_ids=input_ids[:, token_index : token_index + 1],
             state=state,
             use_cache=True,
+        )
+        decode_backend_observations[f"staged_decode_token_{token_index - prompt_tokens}"] = _capture_observed_backend(
+            model,
+            requested_backend,
+            f"correctness staged decode token {token_index - prompt_tokens}",
         )
         if step.state is None:
             raise RuntimeError("RWKV7 decode did not return recurrent state with use_cache=True")
@@ -139,21 +205,42 @@ def _correctness_gate(
     else:
         rtol, atol = 5e-2, 5e-2
     torch.testing.assert_close(staged, expected, rtol=rtol, atol=atol)
+    if len(state) != len(one_shot.state):
+        raise RuntimeError("RWKV7 staged and one-shot calls returned different recurrent-state layouts")
+    for staged_component, expected_component in zip(state, one_shot.state, strict=True):
+        torch.testing.assert_close(staged_component, expected_component, rtol=rtol, atol=atol)
+    for preserved_component, snapshot_component in zip(prefix.state, prefix_state_snapshot, strict=True):
+        torch.testing.assert_close(preserved_component, snapshot_component, rtol=0, atol=0)
 
-    observed = _observed_backends(model)
-    _require_observed_backend(requested_backend, observed)
+    backend_observations = {
+        "one_shot": one_shot_backend,
+        "prefix_prefill": prefix_backend,
+        **decode_backend_observations,
+    }
+    observed = _require_consistent_backend_observations(backend_observations)
+    state_max_abs_error, state_mean_abs_error = _state_difference_summary(state, one_shot.state)
+
     return (
         {
             "passed": True,
-            "comparison": "staged recurrent decode logits vs matching one-shot logits",
+            "comparison": "staged recurrent decode logits and final state vs matching one-shot outputs",
             "compared_tokens": input_ids.shape[1] - prompt_tokens,
             "max_abs_error": difference.max().item(),
             "mean_abs_error": difference.mean().item(),
+            "state_components": len(state),
+            "state_max_abs_error": state_max_abs_error,
+            "state_mean_abs_error": state_mean_abs_error,
+            "input_state_preserved": True,
             "rtol": rtol,
             "atol": atol,
             "observed_backends": sorted(observed),
+            "backend_observations": {
+                "one_shot": sorted(one_shot_backend),
+                "prefix_prefill": sorted(prefix_backend),
+                "staged_decode": sorted(_require_consistent_backend_observations(decode_backend_observations)),
+            },
         },
-        prefix.state,
+        prefix_state_snapshot,
     )
 
 
@@ -161,41 +248,65 @@ def _measure_cuda(
     operation,
     setup,
     *,
+    model: torch.nn.Module,
+    requested_backend: str,
+    stage: str,
     warmup: int,
     iterations: int,
     tokens_per_iteration: int,
     device: torch.device,
 ) -> dict[str, Any]:
+    events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iterations)]
+    backend_observations = {}
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
     for _ in range(warmup):
         payload = setup()
         torch.cuda.synchronize(device)
         result = operation(payload)
+        backend_observations[f"warmup_{len(backend_observations)}"] = _capture_observed_backend(
+            model, requested_backend, f"{stage} warmup"
+        )
         torch.cuda.synchronize(device)
         del result, payload
 
-    events = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(iterations)]
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
-    resident_before_bytes = torch.cuda.memory_allocated(device)
     samples_ms = []
-    for start, end in events:
+    resident_before_samples = []
+    peak_allocated_samples = []
+    peak_increment_samples = []
+    for iteration, (start, end) in enumerate(events):
         payload = setup()
         torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        resident_before_bytes = torch.cuda.memory_allocated(device)
         start.record()
         result = operation(payload)
         end.record()
+        backend_observations[f"timed_{iteration}"] = _capture_observed_backend(
+            model, requested_backend, f"{stage} timed iteration {iteration}"
+        )
         torch.cuda.synchronize(device)
         samples_ms.append(start.elapsed_time(end))
+        peak_allocated_bytes = torch.cuda.max_memory_allocated(device)
+        resident_before_samples.append(resident_before_bytes)
+        peak_allocated_samples.append(peak_allocated_bytes)
+        peak_increment_samples.append(peak_allocated_bytes - resident_before_bytes)
         del result, payload
 
+    observed = _require_consistent_backend_observations(backend_observations)
     summary = _latency_summary(samples_ms, tokens_per_iteration)
     summary.update(
         {
             "warmup_iterations": warmup,
             "timed_iterations": iterations,
-            "resident_before_bytes": resident_before_bytes,
-            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
-            "peak_increment_bytes": torch.cuda.max_memory_allocated(device) - resident_before_bytes,
+            "observed_backends": sorted(observed),
+            "torch_allocator_memory": {
+                "scope": "PyTorch allocator only; excludes state setup and may not include native external allocations",
+                "resident_before_operation_bytes_samples": resident_before_samples,
+                "peak_allocated_bytes_samples": peak_allocated_samples,
+                "operation_peak_increment_bytes_samples": peak_increment_samples,
+                "max_operation_peak_increment_bytes": max(peak_increment_samples),
+            },
         }
     )
     return summary
@@ -209,27 +320,148 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Could not read RWKV7 artifact metadata {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"RWKV7 artifact metadata must be a JSON object: {path}")
+    return payload
+
+
+def _local_artifact_files(artifact_dir: Path) -> tuple[list[Path], list[Path]]:
+    config_path = artifact_dir / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"Local model artifact has no config.json: {artifact_dir}")
+
+    index_path = artifact_dir / "model.safetensors.index.json"
+    single_weight_path = artifact_dir / "model.safetensors"
+    if index_path.is_file() and single_weight_path.is_file():
+        raise ValueError("Local RWKV7 artifact ambiguously contains both sharded and single-file safetensors")
+    if index_path.is_file():
+        index = _read_json_object(index_path)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("model.safetensors.index.json requires a non-empty weight_map")
+        weight_names = sorted(set(weight_map.values()))
+        if not all(
+            isinstance(name, str) and Path(name).name == name and name.endswith(".safetensors")
+            for name in weight_names
+        ):
+            raise ValueError("model.safetensors.index.json must reference top-level .safetensors shards")
+        weight_paths = [artifact_dir / name for name in weight_names]
+        missing = [path.name for path in weight_paths if not path.is_file()]
+        if missing:
+            raise ValueError(f"model.safetensors.index.json references missing weight shards: {missing}")
+        index_files = [index_path]
+    elif single_weight_path.is_file():
+        weight_paths = [single_weight_path]
+        index_files = []
+    else:
+        raise ValueError("Local RWKV7 artifact requires model.safetensors or a complete safetensors shard index")
+
+    unreferenced_weights = sorted(set(artifact_dir.glob("*.safetensors")) - set(weight_paths))
+    if unreferenced_weights:
+        raise ValueError(
+            "Local RWKV7 artifact contains unreferenced safetensors files: "
+            f"{[path.name for path in unreferenced_weights]}"
+        )
+    tokenizer_paths = sorted(
+        path for path in artifact_dir.iterdir() if path.is_file() and path.name in _TOKENIZER_FILES
+    )
+    metadata_paths = sorted(
+        path for path in artifact_dir.iterdir() if path.is_file() and path.name in _OPTIONAL_ARTIFACT_METADATA
+    )
+    tracked_paths = [config_path, *index_files, *weight_paths, *tokenizer_paths, *metadata_paths]
+    return tracked_paths, weight_paths
+
+
+def _file_record(path: Path, artifact_dir: Path) -> dict[str, Any]:
+    return {
+        "name": path.relative_to(artifact_dir).as_posix(),
+        "sha256": _sha256(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _validated_manifest_records(
+    manifest_path: Path,
+    artifact_dir: Path,
+    required_names: set[str],
+) -> list[dict[str, Any]]:
+    manifest = _read_json_object(manifest_path)
+    if manifest.get("schema_version") != 1:
+        raise ValueError("RWKV7 canonical upload manifest must use schema_version=1")
+    artifact = manifest.get("artifact")
+    files = artifact.get("files") if isinstance(artifact, dict) else None
+    if not isinstance(files, list) or not files:
+        raise ValueError("RWKV7 canonical upload manifest requires a non-empty artifact.files list")
+
+    records = []
+    observed_names = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise ValueError("RWKV7 canonical upload manifest file entries must be JSON objects")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("RWKV7 canonical upload manifest file entries require a name")
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or name in observed_names:
+            raise ValueError(f"RWKV7 canonical upload manifest contains an unsafe or duplicate path: {name!r}")
+        path = (artifact_dir / relative).resolve()
+        try:
+            path.relative_to(artifact_dir)
+        except ValueError as error:
+            raise ValueError(f"RWKV7 canonical upload manifest path escapes the artifact: {name!r}") from error
+        if not path.is_file():
+            raise ValueError(f"RWKV7 canonical upload manifest references a missing file: {name!r}")
+        record = _file_record(path, artifact_dir)
+        if entry.get("sha256") != record["sha256"] or entry.get("size_bytes") != record["size_bytes"]:
+            raise ValueError(f"RWKV7 canonical upload manifest digest changed for {name!r}")
+        records.append(record)
+        observed_names.add(name)
+
+    missing = sorted(required_names - observed_names)
+    if missing:
+        raise ValueError(f"RWKV7 canonical upload manifest does not cover required benchmark files: {missing}")
+    return sorted(records, key=lambda record: record["name"])
+
+
 def _artifact_provenance(reference: str, config: Any) -> dict[str, Any]:
     local_path = Path(reference).expanduser()
     if local_path.exists():
         resolved = local_path.resolve()
-        config_path = resolved / "config.json"
-        if not config_path.is_file():
-            raise ValueError(f"Local model artifact has no config.json: {resolved}")
-        weight_files = sorted(resolved.glob("*.safetensors"))
+        tracked_paths, weight_paths = _local_artifact_files(resolved)
+        required_names = {path.relative_to(resolved).as_posix() for path in tracked_paths}
+        manifest_path = resolved / _CANONICAL_MANIFEST_NAME
+        if manifest_path.is_file():
+            files = _validated_manifest_records(manifest_path, resolved, required_names)
+            identity = {
+                "method": "rwkv7_hf_upload_manifest",
+                "manifest_name": manifest_path.name,
+                "manifest_sha256": _sha256(manifest_path),
+            }
+        else:
+            files = sorted((_file_record(path, resolved) for path in tracked_paths), key=lambda record: record["name"])
+            identity = {"method": "direct_sha256"}
         return {
             "kind": "local_path",
             "input_reference": reference,
             "resolved_reference": str(resolved),
-            "config_sha256": _sha256(config_path),
-            "weight_files": [{"name": path.name, "size_bytes": path.stat().st_size} for path in weight_files],
+            "identity": identity,
+            "files": files,
+            "weight_files": [path.name for path in weight_paths],
             "hub_commit": getattr(config, "_commit_hash", None),
         }
+    hub_commit = getattr(config, "_commit_hash", None)
+    if not isinstance(hub_commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}", hub_commit) is None:
+        raise ValueError("Hub RWKV7 artifact did not resolve to an immutable 40-character commit")
     return {
         "kind": "hub_repo_id",
         "input_reference": reference,
         "resolved_reference": reference,
-        "hub_commit": getattr(config, "_commit_hash", None),
+        "hub_commit": hub_commit.lower(),
     }
 
 
@@ -243,6 +475,12 @@ def _distribution_provenance(name: str) -> dict[str, Any] | None:
     if direct_url is not None:
         result["direct_url"] = json.loads(direct_url)
     return result
+
+
+def _validated_operator_provenance(observed: set[str]) -> dict[str, str] | None:
+    if observed != {"flash_rwkv"}:
+        return None
+    return dict(validate_rwkv7_runtime_provenance())
 
 
 def _source_provenance(repo_root: Path) -> dict[str, Any]:
@@ -287,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
             "The correctness workload exceeds config.context_length: "
             f"{args.prompt_tokens} + {args.decode_tokens} > {config.context_length}"
         )
+    artifact_provenance = _artifact_provenance(args.model, config)
     config.wkv_backend = args.backend
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -314,10 +553,15 @@ def main(argv: list[str] | None = None) -> int:
             args.backend,
             dtype,
         )
+        correctness_backends = set(correctness["observed_backends"])
+        operator_provenance = _validated_operator_provenance(correctness_backends)
         torch.cuda.synchronize(device)
         prefill = _measure_cuda(
             lambda _: model(input_ids=prompt_input_ids, use_cache=True),
             lambda: None,
+            model=model,
+            requested_backend=args.backend,
+            stage="prefill",
             warmup=args.warmup,
             iterations=args.iterations,
             tokens_per_iteration=args.batch_size * args.prompt_tokens,
@@ -326,25 +570,36 @@ def main(argv: list[str] | None = None) -> int:
         decode = _measure_cuda(
             lambda state: model(input_ids=decode_input_ids, state=state, use_cache=True),
             lambda: _clone_state(prefix_state),
+            model=model,
+            requested_backend=args.backend,
+            stage="decode",
             warmup=args.warmup,
             iterations=args.iterations,
             tokens_per_iteration=args.batch_size,
             device=device,
         )
-        observed = _observed_backends(model)
-        _require_observed_backend(args.backend, observed)
+        observed = _require_consistent_backend_observations(
+            {
+                "correctness": correctness_backends,
+                "prefill": set(prefill["observed_backends"]),
+                "decode": set(decode["observed_backends"]),
+            }
+        )
+        if observed == {"flash_rwkv"} and operator_provenance is None:
+            raise RuntimeError("FlashRWKV benchmark result lacks validated public runtime provenance")
 
     repo_root = Path(__file__).resolve().parents[2]
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "rwkv7_standalone_model_only",
         "scope": "standalone diagnostic; recorded hardware only, with no acceptance-hardware claim",
         "source": _source_provenance(repo_root),
-        "artifact": _artifact_provenance(args.model, config),
+        "artifact": artifact_provenance,
         "runtime": {
             "dtype": args.dtype,
             "requested_backend": args.backend,
             "observed_backends": sorted(observed),
+            "validated_operator_provenance": operator_provenance,
             "provider_packages": {
                 name: provenance
                 for name in ("flash-rwkv", "flash-linear-attention")
@@ -376,6 +631,10 @@ def main(argv: list[str] | None = None) -> int:
                 "JSON serialization and disk write",
             ],
             "decode_state": "each timed one-token decode starts from a clone of the same prefill state",
+            "memory": (
+                "per-iteration operation-only peak from the PyTorch allocator; setup state is in the baseline, "
+                "and native external allocations may be absent"
+            ),
         },
         "seed": args.seed,
         "local_files_only": args.local_files_only,
