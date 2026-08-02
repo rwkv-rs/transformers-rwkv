@@ -31,6 +31,21 @@ def _config() -> Rwkv7Config:
     )
 
 
+def _non_formula_rank_config() -> Rwkv7Config:
+    return Rwkv7Config(
+        vocab_size=31,
+        context_length=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        head_size=4,
+        decay_low_rank_dim=96,
+        aaa_low_rank_dim=80,
+        value_low_rank_dim=48,
+        gate_low_rank_dim=112,
+    )
+
+
 def _save_fast_tokenizer(tokenizer_dir, *, vocab_size=31, special_token_id=0, insert_bos=False) -> None:
     special_token = "<|endoftext|>"
     vocabulary = {f"token-{index}": index for index in range(vocab_size)}
@@ -267,3 +282,42 @@ def test_converter_rejects_unknown_keys_and_wrong_shapes() -> None:
     raw["optimizer.step"] = torch.tensor(1)
     with pytest.raises(ValueError, match="unsupported tensors"):
         convert_state_dict(raw, model.config)
+
+
+def test_converter_infers_non_formula_ranks_and_direct_model_strict_loads() -> None:
+    source = Rwkv7ForCausalLM(_non_formula_rank_config())
+    raw = _legacy_state_dict(source)
+
+    config = infer_rwkv7_config(raw)
+
+    assert config.decay_low_rank_dim == 96
+    assert config.aaa_low_rank_dim == 80
+    assert config.value_low_rank_dim == 48
+    assert config.gate_low_rank_dim == 112
+    assert raw["blocks.0.att.w1"].shape == (16, 96)
+    assert raw["blocks.0.att.w2"].shape == (96, 16)
+    assert raw["blocks.0.att.a1"].shape == (16, 80)
+    assert raw["blocks.0.att.a2"].shape == (80, 16)
+    assert raw["blocks.1.att.v1"].shape == (16, 48)
+    assert raw["blocks.1.att.v2"].shape == (48, 16)
+    assert raw["blocks.0.att.g1"].shape == (16, 112)
+    assert raw["blocks.0.att.g2"].shape == (112, 16)
+
+    converted = convert_state_dict(raw, config)
+    target = Rwkv7ForCausalLM(config)
+    target.load_state_dict(converted, strict=True)
+    for name, tensor in source.state_dict().items():
+        torch.testing.assert_close(target.state_dict()[name], tensor)
+
+
+@pytest.mark.parametrize(
+    ("first_name", "second_name"),
+    [("w1", "w2"), ("a1", "a2"), ("v1", "v2"), ("g1", "g2")],
+)
+def test_converter_cross_validates_each_low_rank_pair(first_name, second_name) -> None:
+    raw = _legacy_state_dict(Rwkv7ForCausalLM(_non_formula_rank_config()))
+    layer_id = 1 if first_name == "v1" else 0
+    raw[f"blocks.{layer_id}.att.{second_name}"] = torch.empty(7, 16)
+
+    with pytest.raises(ValueError, match=f"{first_name}.*{second_name}"):
+        infer_rwkv7_config(raw)
