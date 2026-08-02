@@ -4,7 +4,6 @@
 import importlib
 import inspect
 import json
-import math
 import subprocess
 from dataclasses import dataclass
 from functools import cache
@@ -353,24 +352,21 @@ class Rwkv7TimeMix(nn.Module):
         self.layer_id = layer_id
         self.last_wkv_backend = "uninitialized"
         hidden_size = config.hidden_size
-        decay_rank = max(32, round(2.5 * math.sqrt(hidden_size) / 32) * 32)
-        value_rank = max(32, round(1.7 * math.sqrt(hidden_size) / 32) * 32)
-        gate_rank = max(32, round(5.0 * math.sqrt(hidden_size) / 32) * 32)
 
         for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
             setattr(self, name, nn.Parameter(torch.empty(1, 1, hidden_size)))
         self.w0 = nn.Parameter(torch.empty(1, 1, hidden_size))
-        self.w1 = nn.Linear(hidden_size, decay_rank, bias=False)
-        self.w2 = nn.Linear(decay_rank, hidden_size, bias=False)
+        self.w1 = nn.Linear(hidden_size, config.decay_low_rank_dim, bias=False)
+        self.w2 = nn.Linear(config.decay_low_rank_dim, hidden_size, bias=False)
         self.a0 = nn.Parameter(torch.empty(1, 1, hidden_size))
-        self.a1 = nn.Linear(hidden_size, decay_rank, bias=False)
-        self.a2 = nn.Linear(decay_rank, hidden_size, bias=False)
+        self.a1 = nn.Linear(hidden_size, config.aaa_low_rank_dim, bias=False)
+        self.a2 = nn.Linear(config.aaa_low_rank_dim, hidden_size, bias=False)
         if layer_id > 0:
             self.v0 = nn.Parameter(torch.empty(1, 1, hidden_size))
-            self.v1 = nn.Linear(hidden_size, value_rank, bias=False)
-            self.v2 = nn.Linear(value_rank, hidden_size, bias=False)
-        self.g1 = nn.Linear(hidden_size, gate_rank, bias=False)
-        self.g2 = nn.Linear(gate_rank, hidden_size, bias=False)
+            self.v1 = nn.Linear(hidden_size, config.value_low_rank_dim, bias=False)
+            self.v2 = nn.Linear(config.value_low_rank_dim, hidden_size, bias=False)
+        self.g1 = nn.Linear(hidden_size, config.gate_low_rank_dim, bias=False)
+        self.g2 = nn.Linear(config.gate_low_rank_dim, hidden_size, bias=False)
         self.k_k = nn.Parameter(torch.empty(1, 1, hidden_size))
         self.k_a = nn.Parameter(torch.empty(1, 1, hidden_size))
         self.r_k = nn.Parameter(torch.empty(config.num_attention_heads, config.head_size))

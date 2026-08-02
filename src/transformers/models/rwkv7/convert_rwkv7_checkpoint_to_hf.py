@@ -251,12 +251,29 @@ def validate_rwkv7_artifact_in_subprocess(
     return json.loads(marker_lines[0].removeprefix(_VALIDATION_MARKER))
 
 
-def _projection_ranks(hidden_size: int) -> tuple[int, int, int]:
-    return (
-        max(32, round(2.5 * hidden_size**0.5 / 32) * 32),
-        max(32, round(1.7 * hidden_size**0.5 / 32) * 32),
-        max(32, round(5.0 * hidden_size**0.5 / 32) * 32),
-    )
+def _infer_low_rank_dim(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    first_name: str,
+    second_name: str,
+    hidden_size: int,
+) -> int:
+    missing = [name for name in (first_name, second_name) if name not in state_dict]
+    if missing:
+        raise ValueError(f"Checkpoint is missing low-rank tensors: {missing}.")
+    first_shape = tuple(state_dict[first_name].shape)
+    second_shape = tuple(state_dict[second_name].shape)
+    if len(first_shape) != 2 or first_shape[0] != hidden_size:
+        raise ValueError(
+            f"Checkpoint low-rank tensor `{first_name}` must have shape (hidden_size, rank), got {first_shape}."
+        )
+    rank = first_shape[1]
+    if second_shape != (rank, hidden_size):
+        raise ValueError(
+            f"Checkpoint low-rank tensor pair `{first_name}`/`{second_name}` has incompatible shapes "
+            f"{first_shape} and {second_shape}; expected ({hidden_size}, rank) and (rank, {hidden_size})."
+        )
+    return rank
 
 
 def _validate_tensor_state_dict(state_dict) -> dict[str, torch.Tensor]:
@@ -310,25 +327,28 @@ def infer_rwkv7_config(
     if ffn_key.ndim != 2 or ffn_key.shape[1] != hidden_size:
         raise ValueError(f"Invalid block-0 FFN key shape: {tuple(ffn_key.shape)}.")
 
-    decay_rank, value_rank, gate_rank = _projection_ranks(hidden_size)
-    rank_contract = {
-        "blocks.0.att.w1": (hidden_size, decay_rank),
-        "blocks.0.att.w2": (decay_rank, hidden_size),
-        "blocks.0.att.a1": (hidden_size, decay_rank),
-        "blocks.0.att.a2": (decay_rank, hidden_size),
-        "blocks.1.att.v1": (hidden_size, value_rank),
-        "blocks.1.att.v2": (value_rank, hidden_size),
-        "blocks.0.att.g1": (hidden_size, gate_rank),
-        "blocks.0.att.g2": (gate_rank, hidden_size),
+    rank_specs = {
+        "decay_low_rank_dim": ("w1", "w2", 0),
+        "aaa_low_rank_dim": ("a1", "a2", 0),
+        "value_low_rank_dim": ("v1", "v2", 1),
+        "gate_low_rank_dim": ("g1", "g2", 0),
     }
-    for name, expected_shape in rank_contract.items():
-        if name not in state_dict:
-            raise ValueError(f"Checkpoint is missing low-rank tensor `{name}`.")
-        if tuple(state_dict[name].shape) != expected_shape:
-            raise ValueError(
-                f"Checkpoint low-rank tensor `{name}` must have shape {expected_shape}, "
-                f"got {tuple(state_dict[name].shape)}."
+    inferred_ranks = {}
+    for config_name, (first_suffix, second_suffix, first_layer) in rank_specs.items():
+        observed = []
+        for layer_id in range(first_layer, len(layer_ids)):
+            prefix = f"blocks.{layer_id}.att."
+            observed.append(
+                _infer_low_rank_dim(
+                    state_dict,
+                    first_name=prefix + first_suffix,
+                    second_name=prefix + second_suffix,
+                    hidden_size=hidden_size,
+                )
             )
+        if len(set(observed)) != 1:
+            raise ValueError(f"Checkpoint `{first_suffix}`/`{second_suffix}` rank differs across layers: {observed}.")
+        inferred_ranks[config_name] = observed[0]
 
     context_match = re.search(r"ctx(\d+)", os.path.basename(checkpoint_name), flags=re.IGNORECASE)
     return Rwkv7Config(
@@ -340,6 +360,7 @@ def infer_rwkv7_config(
         head_size=head_size,
         num_attention_heads=num_attention_heads,
         embedding_layer_norm_fused=embedding_layer_norm_fused,
+        **inferred_ranks,
     )
 
 
