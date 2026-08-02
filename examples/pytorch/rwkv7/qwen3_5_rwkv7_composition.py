@@ -2,6 +2,7 @@
 """Compose Qwen3.5-MoE components with RWKV-7 token mixers and LayerNorm."""
 
 import tempfile
+from collections.abc import Callable
 
 import torch
 
@@ -9,15 +10,21 @@ from transformers import AutoModelForCausalLM, Qwen3_5MoeForCausalLM, Qwen3_5Moe
 
 
 RWKV7_HEAD_SIZE_BY_LAYER_TYPE = {"linear_attention": 128, "full_attention": 256}
+LayerSelector = Callable[[int, str], bool]
 
 
 def compose_qwen3_5_rwkv7(
     config: Qwen3_5MoeTextConfig,
+    selector: LayerSelector | None = None,
 ) -> Qwen3_5MoeForCausalLM:
     """Replace Qwen3.5-MoE token mixers while retaining its embedding, MoE, and LM head."""
     config_values = config.to_dict()
-    config_values["layer_types"] = ["rwkv7"] * config.num_hidden_layers
-    config_values["rwkv7_head_sizes"] = [RWKV7_HEAD_SIZE_BY_LAYER_TYPE[kind] for kind in config.layer_types]
+    replace = [selector is None or selector(index, kind) for index, kind in enumerate(config.layer_types)]
+    config_values["layer_types"] = ["rwkv7" if selected else kind for selected, kind in zip(replace, config.layer_types)]
+    config_values["rwkv7_head_sizes"] = [
+        RWKV7_HEAD_SIZE_BY_LAYER_TYPE[kind] if selected else config.rwkv7_head_size
+        for selected, kind in zip(replace, config.layer_types)
+    ]
     config_values["use_rwkv7_layer_norm"] = True
     return Qwen3_5MoeForCausalLM(Qwen3_5MoeTextConfig.from_dict(config_values))
 

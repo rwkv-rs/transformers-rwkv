@@ -199,7 +199,7 @@ class Qwen3_5MoeTextModelTest(CausalLMModelTest, unittest.TestCase):
 @require_torch
 class Qwen3_5MoeRwkv7CompositionTest(unittest.TestCase):
     def test_invalid_per_layer_rwkv7_contract_fails_closed(self):
-        from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import tiny_config
+        from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import compose_qwen3_5_rwkv7, tiny_config
 
         config_values = tiny_config().to_dict()
         config_values["layer_types"] = ["rwkv7"] * 3
@@ -209,6 +209,10 @@ class Qwen3_5MoeRwkv7CompositionTest(unittest.TestCase):
             Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_head_sizes": [128, 256, 96]})
         with self.assertRaisesRegex(ValueError, "rwkv7_backend"):
             Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_backend": "unknown"})
+
+        mixed_model = compose_qwen3_5_rwkv7(tiny_config(), lambda index, _kind: index != 1)
+        self.assertEqual(mixed_model.config.layer_types, ["rwkv7", "full_attention", "rwkv7"])
+        self.assertEqual(mixed_model.config.rwkv7_head_sizes, [128, 64, 128])
 
     def test_public_example_preserves_qwen_moe_and_standard_hf_workflows(self):
         from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import compose_qwen3_5_rwkv7, tiny_config
