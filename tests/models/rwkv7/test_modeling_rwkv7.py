@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -277,6 +278,26 @@ def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
+_ASCII_CONTROL_REPOSITORY_URL_TEMPLATES = (
+    " https://github.com/{repository_path}.git",
+    "\thttps://github.com/{repository_path}.git",
+    "\x00https://github.com/{repository_path}.git",
+    "\x1fhttps://github.com/{repository_path}.git",
+    "https://git\nhub.com/{repository_path}.git",
+    "https://github.com/{repository_path}.git\n",
+    "https://github.com/{repository_path}.git\x7f",
+)
+_ASCII_CONTROL_REPOSITORY_URL_IDS = (
+    "leading-space",
+    "leading-tab",
+    "leading-nul",
+    "leading-unit-separator",
+    "embedded-newline",
+    "trailing-newline",
+    "delete",
+)
+
+
 @pytest.mark.parametrize(
     ("repository", "repository_path"),
     [
@@ -319,6 +340,7 @@ def test_rwkv7_github_repository_canonicalization_accepts_exact_repo(
 @pytest.mark.parametrize(
     "url_template",
     [
+        *_ASCII_CONTROL_REPOSITORY_URL_TEMPLATES,
         "http://github.com/{repository_path}.git",
         "https://user@github.com/{repository_path}.git",
         "https://github.com:443/{repository_path}.git",
@@ -335,6 +357,7 @@ def test_rwkv7_github_repository_canonicalization_accepts_exact_repo(
         "https://github.com/{repository_path}.git.git",
     ],
     ids=(
+        *_ASCII_CONTROL_REPOSITORY_URL_IDS,
         "non-https",
         "userinfo",
         "port",
@@ -366,6 +389,51 @@ def test_rwkv7_github_repository_canonicalization_rejects_hostile_source(
     assert modeling_rwkv7._canonical_github_repository(observed) != modeling_rwkv7._canonical_github_repository(
         repository
     )
+
+
+@pytest.mark.parametrize(
+    "url_template",
+    _ASCII_CONTROL_REPOSITORY_URL_TEMPLATES,
+    ids=_ASCII_CONTROL_REPOSITORY_URL_IDS,
+)
+def test_rwkv7_vcs_direct_url_rejects_ascii_controls(monkeypatch, tmp_path, url_template) -> None:
+    module_origin = tmp_path / "fla" / "__init__.py"
+
+    class HostileVcsDistribution:
+        metadata = {"Name": modeling_rwkv7.RWKV7_FLA_DISTRIBUTION}
+        version = "0.5.2"
+
+        @staticmethod
+        def read_text(_filename):
+            return json.dumps(
+                {
+                    "url": url_template.format(repository_path="rwkv-rs/fla-rwkv"),
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": modeling_rwkv7.RWKV7_FLA_REVISION,
+                        "commit_id": modeling_rwkv7.RWKV7_FLA_REVISION,
+                    },
+                }
+            )
+
+        @staticmethod
+        def locate_file(_filename):
+            return module_origin
+
+    monkeypatch.setattr(modeling_rwkv7.importlib_metadata, "distribution", lambda _name: HostileVcsDistribution())
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib.util,
+        "find_spec",
+        lambda name: importlib.machinery.ModuleSpec(name, loader=None, origin=str(module_origin)),
+    )
+
+    with pytest.raises(RuntimeError, match="repository provenance mismatch"):
+        modeling_rwkv7._validate_rwkv7_distribution_provenance(
+            distribution_name=modeling_rwkv7.RWKV7_FLA_DISTRIBUTION,
+            module_name="fla",
+            repository=modeling_rwkv7.RWKV7_FLA_REPOSITORY,
+            revision=modeling_rwkv7.RWKV7_FLA_REVISION,
+        )
 
 
 @pytest.mark.parametrize(
@@ -494,6 +562,48 @@ def test_rwkv7_runtime_provenance_is_fork_pinned_in_fresh_process() -> None:
         "revision": "88e8ff9d29dcebadb89ebad62ee76951729ea0df",
         "source_kind": "vcs",
     }
+
+
+@run_test_using_subprocess
+def test_rwkv7_runtime_provenance_rejects_ascii_controls_in_fresh_process() -> None:
+    module_origin = Path(__file__).resolve().parent / "synthetic_fla" / "__init__.py"
+
+    class HostileVcsDistribution:
+        metadata = {"Name": modeling_rwkv7.RWKV7_FLA_DISTRIBUTION}
+        version = "0.5.2"
+        repository = modeling_rwkv7.RWKV7_FLA_REPOSITORY
+
+        def read_text(self, _filename):
+            return json.dumps(
+                {
+                    "url": self.repository,
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": modeling_rwkv7.RWKV7_FLA_REVISION,
+                        "commit_id": modeling_rwkv7.RWKV7_FLA_REVISION,
+                    },
+                }
+            )
+
+        @staticmethod
+        def locate_file(_filename):
+            return module_origin
+
+    distribution = HostileVcsDistribution()
+    original_distribution = modeling_rwkv7.importlib_metadata.distribution
+    original_find_spec = modeling_rwkv7.importlib.util.find_spec
+    modeling_rwkv7.importlib_metadata.distribution = lambda _name: distribution
+    modeling_rwkv7.importlib.util.find_spec = lambda name: importlib.machinery.ModuleSpec(
+        name, loader=None, origin=str(module_origin)
+    )
+    try:
+        for url_template in _ASCII_CONTROL_REPOSITORY_URL_TEMPLATES:
+            distribution.repository = url_template.format(repository_path="rwkv-rs/fla-rwkv")
+            with pytest.raises(RuntimeError, match="repository provenance mismatch"):
+                modeling_rwkv7.validate_rwkv7_runtime_provenance()
+    finally:
+        modeling_rwkv7.importlib_metadata.distribution = original_distribution
+        modeling_rwkv7.importlib.util.find_spec = original_find_spec
 
 
 def test_rwkv7_runtime_provenance_rejects_same_name_registry_package(monkeypatch, request) -> None:
