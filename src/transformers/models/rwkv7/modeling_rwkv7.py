@@ -168,7 +168,9 @@ class Rwkv7TimeMix(nn.Module):
         for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
             projection = getattr(self, name, None)
             if projection is not None:
-                nn.init.zeros_(projection.weight)
+                weight = getattr(projection, "weight", None)
+                if weight is not None:
+                    nn.init.zeros_(weight)
 
     def forward(self, hidden_states, v_first, previous_hidden_state, wkv_state):
         batch_size, sequence_length, hidden_size = hidden_states.shape
