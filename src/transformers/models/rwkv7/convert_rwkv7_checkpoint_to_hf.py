@@ -27,6 +27,7 @@ _SUPPORTED_DTYPES = {
 }
 
 _VALIDATION_MARKER = "RWKV7_ARTIFACT_VALIDATION="
+_LEGACY_LOW_RANK_PATTERN = re.compile(r"^(blocks\.\d+\.att\.(?:w1|w2|a1|a2|v1|v2|g1|g2))\.weight$")
 _VALIDATION_SCRIPT = f"""
 import json
 import sys
@@ -232,6 +233,23 @@ def _raw_name(model_name: str) -> str:
     return model_name
 
 
+def _legacy_tensor_spec(model_name: str, tensor: torch.Tensor) -> tuple[str, tuple[int, ...]]:
+    raw_name = _raw_name(model_name)
+    if match := _LEGACY_LOW_RANK_PATTERN.fullmatch(raw_name):
+        return match.group(1), tuple(reversed(tensor.shape))
+    return raw_name, tuple(tensor.shape)
+
+
+def _converted_tensor_spec(raw_name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor]:
+    if _LEGACY_LOW_RANK_PATTERN.fullmatch(f"{raw_name}.weight"):
+        return f"model.{raw_name}.weight", tensor.transpose(0, 1).contiguous()
+    if raw_name == "emb.weight":
+        return "model.embeddings.weight", tensor
+    if raw_name == "head.weight":
+        return raw_name, tensor
+    return f"model.{raw_name}", tensor
+
+
 def convert_state_dict(
     state_dict: dict[str, torch.Tensor],
     config: Rwkv7Config,
@@ -245,7 +263,10 @@ def convert_state_dict(
     validation_config = copy.deepcopy(config)
     validation_config.embedding_layer_norm_fused = False
     expected_model = Rwkv7ForCausalLM(validation_config)
-    expected_shapes = {_raw_name(name): tuple(tensor.shape) for name, tensor in expected_model.state_dict().items()}
+    expected_shapes = {}
+    for name, tensor in expected_model.state_dict().items():
+        raw_name, expected_shape = _legacy_tensor_spec(name, tensor)
+        expected_shapes[raw_name] = expected_shape
     missing = sorted(expected_shapes.keys() - source.keys())
     unexpected = sorted(source.keys() - expected_shapes.keys())
     if missing:
@@ -271,13 +292,8 @@ def convert_state_dict(
 
     converted = {}
     for name, tensor in source.items():
-        if name == "emb.weight":
-            target_name = "model.embeddings.weight"
-        elif name == "head.weight":
-            target_name = name
-        else:
-            target_name = f"model.{name}"
-        converted[target_name] = tensor.detach().clone(memory_format=torch.contiguous_format)
+        target_name, target_tensor = _converted_tensor_spec(name, tensor)
+        converted[target_name] = target_tensor.detach().clone(memory_format=torch.contiguous_format)
     return converted
 
 

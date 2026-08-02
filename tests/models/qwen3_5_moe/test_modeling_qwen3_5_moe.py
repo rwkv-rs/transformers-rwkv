@@ -246,7 +246,7 @@ class Qwen3_5MoeRwkv7CompositionTest(unittest.TestCase):
         self.assertTrue(all(isinstance(layer.mlp, Qwen3_5MoeSparseMoeBlock) for layer in model.model.layers))
         self.assertDictEqual(composed_parameter_shapes, qwen_parameter_shapes)
         self.assertIsNotNone(model.model.embed_tokens.weight.grad)
-        self.assertIsNotNone(model.model.layers[0].rwkv_attn.time_mix.g2.grad)
+        self.assertIsNotNone(model.model.layers[0].rwkv_attn.time_mix.g2.weight.grad)
         self.assertIsNotNone(model.model.layers[0].mlp.gate.weight.grad)
         self.assertIsNotNone(model.model.layers[0].mlp.experts.gate_up_proj.grad)
         self.assertIsNotNone(model.lm_head.weight.grad)

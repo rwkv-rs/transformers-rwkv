@@ -382,7 +382,9 @@ class Qwen3_5Rwkv7Attention(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        head_size = config.rwkv7_head_sizes[layer_idx] if config.rwkv7_head_sizes is not None else config.rwkv7_head_size
+        head_size = (
+            config.rwkv7_head_sizes[layer_idx] if config.rwkv7_head_sizes is not None else config.rwkv7_head_size
+        )
         intermediate_size = getattr(config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = config.moe_intermediate_size
@@ -523,6 +525,7 @@ class Qwen3_5PreTrainedModel(Qwen3NextPreTrainedModel):
         elif isinstance(module, modeling_rwkv7.Rwkv7TimeMix):
             for parameter in module.parameters(recurse=False):
                 init.zeros_(parameter)
+            module._reset_low_rank_parameters()
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
         elif isinstance(module, Qwen3_5RMSNorm):
             init.zeros_(module.weight)

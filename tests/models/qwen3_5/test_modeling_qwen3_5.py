@@ -279,7 +279,7 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
 
         self.assertEqual(output.shape, (2, 5, config.hidden_size))
         self.assertTrue(torch.isfinite(output).all())
-        rwkv_gradient = model.layers[1].rwkv_attn.time_mix.g2.grad
+        rwkv_gradient = model.layers[1].rwkv_attn.time_mix.g2.weight.grad
         self.assertIsNotNone(rwkv_gradient)
         self.assertGreater(rwkv_gradient.abs().sum(), 0)
 
@@ -288,7 +288,7 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
         auto_output = auto_model(input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
         self.assertEqual(auto_output.shape, output.shape)
         auto_output.square().mean().backward()
-        self.assertIsNotNone(auto_model.layers[1].rwkv_attn.time_mix.g2.grad)
+        self.assertIsNotNone(auto_model.layers[1].rwkv_attn.time_mix.g2.weight.grad)
 
     def test_cache_continuation_and_beam_reorder(self):
         torch.manual_seed(0)
@@ -367,6 +367,7 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
             self.get_config(rwkv7_backend="unknown")
         with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
             self.get_config(layer_types=["full_attention", "rwkv7"])
+
 
 class Qwen3_5VisionText2TextModelTester:
     def __init__(

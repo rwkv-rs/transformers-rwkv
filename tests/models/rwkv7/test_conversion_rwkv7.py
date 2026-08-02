@@ -5,6 +5,7 @@ import json
 
 import pytest
 import torch
+from safetensors.torch import load_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 
@@ -39,6 +40,18 @@ def _legacy_state_dict(model: Rwkv7ForCausalLM) -> dict[str, torch.Tensor]:
             raw_name = name.removeprefix("model.")
         else:
             raw_name = name
+        if raw_name.endswith(".weight") and raw_name.rsplit(".", 2)[-2] in {
+            "w1",
+            "w2",
+            "a1",
+            "a2",
+            "v1",
+            "v2",
+            "g1",
+            "g2",
+        }:
+            raw_name = raw_name.removesuffix(".weight")
+            tensor = tensor.transpose(0, 1)
         raw[raw_name] = tensor.detach().clone()
     return raw
 
@@ -48,6 +61,7 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     source = Rwkv7ForCausalLM(_config()).eval()
     input_ids = torch.tensor([[1, 2, 3]])
     expected_logits = source(input_ids).logits
+    expected_generated_ids = source.generate(input_ids, max_new_tokens=2, do_sample=False, use_cache=True)
     checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
     output_dir = tmp_path / "artifact"
     torch.save(_legacy_state_dict(source), checkpoint)
@@ -68,11 +82,18 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     for name, tensor in source.state_dict().items():
         torch.testing.assert_close(converted.state_dict()[name], tensor)
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
+    source(input_ids, labels=input_ids).loss.backward()
+    converted(input_ids, labels=input_ids).loss.backward()
+    for name, parameter in source.named_parameters():
+        torch.testing.assert_close(converted.get_parameter(name).grad, parameter.grad)
+    saved_keys = set(load_file(output_dir / "model.safetensors"))
+    assert "model.blocks.0.att.w1.weight" in saved_keys
+    assert "model.blocks.0.att.w1" not in saved_keys
     assert result["validation"]["architecture"] == "Rwkv7ForCausalLM"
     assert result["validation"]["device"] == "cpu"
     assert result["validation"]["requested_wkv_backend"] == "auto"
     assert result["validation"]["strict_load"]
-    assert result["validation"]["generated_ids"] == [[1, 2, 3, 2, 2]]
+    assert result["validation"]["generated_ids"] == expected_generated_ids.tolist()
     assert "rwkv7_validation.json" in result["validation"]["artifact_files"]
     assert result["conversion"]["source_revision"] == "source-revision-for-test"
     assert len(result["conversion"]["checkpoint_sha256"]) == 64

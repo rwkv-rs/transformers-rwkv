@@ -259,6 +259,7 @@ class Qwen3_5MoePreTrainedModel(Qwen3NextPreTrainedModel):
         elif isinstance(module, modeling_rwkv7.Rwkv7TimeMix):
             for parameter in module.parameters(recurse=False):
                 init.zeros_(parameter)
+            module._reset_low_rank_parameters()
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
         elif isinstance(module, Qwen3_5MoeRMSNorm):
             init.zeros_(module.weight)

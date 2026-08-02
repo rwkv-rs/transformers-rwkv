@@ -140,17 +140,17 @@ class Rwkv7TimeMix(nn.Module):
         for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
             setattr(self, name, nn.Parameter(torch.empty(1, 1, hidden_size)))
         self.w0 = nn.Parameter(torch.empty(1, 1, hidden_size))
-        self.w1 = nn.Parameter(torch.empty(hidden_size, decay_rank))
-        self.w2 = nn.Parameter(torch.empty(decay_rank, hidden_size))
+        self.w1 = nn.Linear(hidden_size, decay_rank, bias=False)
+        self.w2 = nn.Linear(decay_rank, hidden_size, bias=False)
         self.a0 = nn.Parameter(torch.empty(1, 1, hidden_size))
-        self.a1 = nn.Parameter(torch.empty(hidden_size, decay_rank))
-        self.a2 = nn.Parameter(torch.empty(decay_rank, hidden_size))
+        self.a1 = nn.Linear(hidden_size, decay_rank, bias=False)
+        self.a2 = nn.Linear(decay_rank, hidden_size, bias=False)
         if layer_id > 0:
             self.v0 = nn.Parameter(torch.empty(1, 1, hidden_size))
-            self.v1 = nn.Parameter(torch.empty(hidden_size, value_rank))
-            self.v2 = nn.Parameter(torch.empty(value_rank, hidden_size))
-        self.g1 = nn.Parameter(torch.empty(hidden_size, gate_rank))
-        self.g2 = nn.Parameter(torch.empty(gate_rank, hidden_size))
+            self.v1 = nn.Linear(hidden_size, value_rank, bias=False)
+            self.v2 = nn.Linear(value_rank, hidden_size, bias=False)
+        self.g1 = nn.Linear(hidden_size, gate_rank, bias=False)
+        self.g2 = nn.Linear(gate_rank, hidden_size, bias=False)
         self.k_k = nn.Parameter(torch.empty(1, 1, hidden_size))
         self.k_a = nn.Parameter(torch.empty(1, 1, hidden_size))
         self.r_k = nn.Parameter(torch.empty(config.num_attention_heads, config.head_size))
@@ -164,6 +164,12 @@ class Rwkv7TimeMix(nn.Module):
             eps=config.group_norm_epsilon,
         )
 
+    def _reset_low_rank_parameters(self):
+        for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
+            projection = getattr(self, name, None)
+            if projection is not None:
+                nn.init.zeros_(projection.weight)
+
     def forward(self, hidden_states, v_first, previous_hidden_state, wkv_state):
         batch_size, sequence_length, hidden_size = hidden_states.shape
         shifted, final_hidden_state = _token_shift(hidden_states, previous_hidden_state)
@@ -173,13 +179,13 @@ class Rwkv7TimeMix(nn.Module):
         receptance = self.receptance(inputs["r"])
         key = self.key(inputs["k"])
         value = self.value(inputs["v"])
-        raw_decay = self.w0 + torch.tanh(inputs["w"] @ self.w1) @ self.w2
+        raw_decay = self.w0 + self.w2(torch.tanh(self.w1(inputs["w"])))
         if self.layer_id == 0:
             v_first = value
         else:
-            value = value + (v_first - value) * torch.sigmoid(self.v0 + (inputs["v"] @ self.v1) @ self.v2)
-        learning_rate = torch.sigmoid(self.a0 + (inputs["a"] @ self.a1) @ self.a2)
-        gate = torch.sigmoid(inputs["g"] @ self.g1) @ self.g2
+            value = value + (v_first - value) * torch.sigmoid(self.v0 + self.v2(self.v1(inputs["v"])))
+        learning_rate = torch.sigmoid(self.a0 + self.a2(self.a1(inputs["a"])))
+        gate = self.g2(torch.sigmoid(self.g1(inputs["g"])))
         normalized_key = F.normalize(
             (key * self.k_k).view(
                 batch_size,
@@ -302,6 +308,7 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
         elif isinstance(module, Rwkv7TimeMix):
             for parameter in module.parameters(recurse=False):
                 nn.init.zeros_(parameter)
+            module._reset_low_rank_parameters()
         elif isinstance(module, Rwkv7ChannelMix):
             nn.init.zeros_(module.x_k)
 
