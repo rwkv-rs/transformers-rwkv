@@ -4,12 +4,13 @@
 import importlib
 import inspect
 import json
+import unittest
 
 import pytest
 import torch
 
 import transformers.models.rwkv7.modeling_rwkv7 as modeling_rwkv7
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, Trainer, TrainingArguments
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, Trainer, TrainingArguments, is_torch_available
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7ForCausalLM,
@@ -17,9 +18,41 @@ from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7PreTrainedModel,
     rwkv7_reference,
 )
-from transformers.testing_utils import run_test_using_subprocess, slow
+from transformers.testing_utils import require_torch, run_test_using_subprocess, slow
 from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
 from transformers.utils import SAFE_WEIGHTS_NAME
+
+from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
+
+
+class Rwkv7ModelTester(CausalLMModelTester):
+    if is_torch_available():
+        base_model_class = Rwkv7Model
+
+    def __init__(self, parent):
+        super().__init__(
+            parent=parent,
+            batch_size=2,
+            seq_length=4,
+            use_input_mask=False,
+            vocab_size=31,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            max_position_embeddings=16,
+            head_size=4,
+            wkv_backend="reference",
+            bos_token_id=0,
+            eos_token_id=0,
+            pad_token_id=0,
+        )
+
+
+@require_torch
+class Rwkv7ModelTest(CausalLMModelTest, unittest.TestCase):
+    model_tester_class = Rwkv7ModelTester
+    _is_stateful = True
 
 
 def _tiny_config() -> Rwkv7Config:
