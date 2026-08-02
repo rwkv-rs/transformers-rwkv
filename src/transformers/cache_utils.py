@@ -1685,8 +1685,7 @@ def get_layer_types_and_kwargs(config: PreTrainedConfig) -> tuple[list[str], dic
         layer_kwargs["config"] = config
     # We may need more than 1 conv/recurrent state
     if any(
-        layer_type in ("conv", "linear_attention", "rwkv7", "hybrid", "hybrid_sliding")
-        for layer_type in layer_types
+        layer_type in ("conv", "linear_attention", "rwkv7", "hybrid", "hybrid_sliding") for layer_type in layer_types
     ):
         layer_kwargs["number_of_states"] = getattr(config, "number_of_conv_states", 1)
 

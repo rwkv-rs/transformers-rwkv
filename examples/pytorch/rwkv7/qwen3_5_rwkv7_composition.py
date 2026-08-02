@@ -20,7 +20,9 @@ def compose_qwen3_5_rwkv7(
     """Replace Qwen3.5-MoE token mixers while retaining its embedding, MoE, and LM head."""
     config_values = config.to_dict()
     replace = [selector is None or selector(index, kind) for index, kind in enumerate(config.layer_types)]
-    config_values["layer_types"] = ["rwkv7" if selected else kind for selected, kind in zip(replace, config.layer_types)]
+    config_values["layer_types"] = [
+        "rwkv7" if selected else kind for selected, kind in zip(replace, config.layer_types)
+    ]
     config_values["rwkv7_head_sizes"] = [
         RWKV7_HEAD_SIZE_BY_LAYER_TYPE[kind] if selected else config.rwkv7_head_size
         for selected, kind in zip(replace, config.layer_types)
