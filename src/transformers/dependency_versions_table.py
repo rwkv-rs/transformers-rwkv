@@ -15,7 +15,7 @@ deps = {
     "faiss-cpu": "faiss-cpu",
     "fastapi": "fastapi",
     "filelock": "filelock",
-    "flash-linear-attention[flash-rwkv]": "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+    "flash-linear-attention[flash-rwkv]": "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@fcd4502ab957513a3d97dbd8aa64851e5e4dba11",
     "fugashi": "fugashi>=1.0",
     "GitPython": "GitPython<3.1.19",
     "hf-doc-builder": "hf-doc-builder",
