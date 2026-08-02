@@ -38,12 +38,6 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
         Number of key heads used in linear attention layers.
     linear_num_value_heads (`int`, *optional*, defaults to 32):
         Number of value heads used in linear attention layers.
-    rwkv7_head_size (`int`, *optional*, defaults to 64):
-        Default width of each RWKV-7 recurrent head in `"rwkv7"` layers.
-    rwkv7_head_sizes (`list[int]`, *optional*):
-        Per-layer RWKV-7 head sizes. When set, this list must contain one entry per decoder layer.
-    use_rwkv7_layer_norm (`bool`, *optional*, defaults to `False`):
-        Whether to use RWKV-style LayerNorm instead of Qwen3.5-MoE RMSNorm throughout the text decoder.
 
     ```python
     >>> from transformers import Qwen3_5MoeTextModel, Qwen3_5MoeTextConfig
@@ -125,9 +119,6 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
     eos_token_id: int | list[int] | None = None
     base_config_key = "text_config"
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
-    rwkv7_head_size: int = 64
-    rwkv7_head_sizes: list[int] | None = None
-    use_rwkv7_layer_norm: bool = False
 
     def __post_init__(self, **kwargs):
         kwargs.setdefault("partial_rotary_factor", 0.25)  # assign default for BC
@@ -141,24 +132,6 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
             self.layer_types = remap_legacy_layer_types(self.layer_types)
 
         super().__post_init__(**kwargs)
-        if len(self.layer_types) != self.num_hidden_layers:
-            raise ValueError("`layer_types` must contain exactly `num_hidden_layers` entries.")
-        invalid_layer_types = set(self.layer_types) - {"full_attention", "linear_attention", "rwkv7"}
-        if invalid_layer_types:
-            raise ValueError(f"Unsupported Qwen3.5-MoE layer types: {sorted(invalid_layer_types)}.")
-        if self.rwkv7_head_sizes is not None and len(self.rwkv7_head_sizes) != self.num_hidden_layers:
-            raise ValueError("`rwkv7_head_sizes` must contain exactly `num_hidden_layers` entries.")
-        if "rwkv7" in self.layer_types:
-            for layer_idx, layer_type in enumerate(self.layer_types):
-                if layer_type != "rwkv7":
-                    continue
-                head_size = (
-                    self.rwkv7_head_sizes[layer_idx] if self.rwkv7_head_sizes is not None else self.rwkv7_head_size
-                )
-                if head_size <= 0 or self.hidden_size % head_size:
-                    raise ValueError(
-                        f"`hidden_size` must be divisible by the positive RWKV-7 head size at layer {layer_idx}."
-                    )
 
 
 @auto_docstring(checkpoint="Qwen/Qwen3.5-35B-A3B")

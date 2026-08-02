@@ -68,7 +68,6 @@ from ...vision_utils import (
     get_vision_position_ids,
 )
 from ..auto.modeling_auto import AutoModel
-from ..rwkv7 import configuration_rwkv7, modeling_rwkv7
 from .configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 
 
@@ -757,70 +756,6 @@ class Qwen3_5RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-class Qwen3_5Rwkv7Attention(nn.Module):
-    """RWKV-7 token mixer adapted to Qwen3.5's cache and residual layout."""
-
-    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
-        super().__init__()
-        self.layer_idx = layer_idx
-        head_size = (
-            config.rwkv7_head_sizes[layer_idx] if config.rwkv7_head_sizes is not None else config.rwkv7_head_size
-        )
-        intermediate_size = getattr(config, "intermediate_size", None)
-        if intermediate_size is None:
-            intermediate_size = config.moe_intermediate_size
-        rwkv_layer_idx = sum(layer_type == "rwkv7" for layer_type in config.layer_types[: layer_idx + 1]) - 1
-        rwkv_config = configuration_rwkv7.Rwkv7Config(
-            vocab_size=config.vocab_size,
-            context_length=config.max_position_embeddings,
-            hidden_size=config.hidden_size,
-            intermediate_size=intermediate_size,
-            num_hidden_layers=sum(layer_type == "rwkv7" for layer_type in config.layer_types),
-            head_size=head_size,
-            num_attention_heads=config.hidden_size // head_size,
-        )
-        self.time_mix = modeling_rwkv7.Rwkv7TimeMix(rwkv_config, rwkv_layer_idx)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        v_first: torch.Tensor | None,
-        cache_params: Cache | None = None,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        batch_size = hidden_states.shape[0]
-        if cache_params is not None and cache_params.has_previous_state(self.layer_idx):
-            cache_layer = cache_params.layers[self.layer_idx]
-            previous_hidden_state = cache_layer.conv_states[0][..., -1]
-            wkv_state = cache_layer.recurrent_states[0]
-        else:
-            previous_hidden_state = hidden_states.new_zeros(batch_size, self.time_mix.config.hidden_size)
-            wkv_state = torch.zeros(
-                batch_size,
-                self.time_mix.config.num_attention_heads,
-                self.time_mix.config.head_size,
-                self.time_mix.config.head_size,
-                dtype=torch.float32,
-                device=hidden_states.device,
-            )
-
-        output, v_first, _, wkv_state = self.time_mix(
-            hidden_states,
-            v_first,
-            previous_hidden_state,
-            wkv_state,
-        )
-        if cache_params is not None:
-            cache_params.update_conv_state(
-                hidden_states.transpose(1, 2),
-                self.layer_idx,
-                conv_kernel_size=1,
-            )
-            cache_params.update_recurrent_state(wkv_state.float(), self.layer_idx)
-        return output, v_first
-
-
 class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
@@ -830,12 +765,9 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
         elif self.block_type == "full_attention":
             self.self_attn = Qwen3_5Attention(config, layer_idx)
-        elif self.block_type == "rwkv7":
-            self.rwkv_attn = Qwen3_5Rwkv7Attention(config, layer_idx)
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
-        norm_class = nn.LayerNorm if config.use_rwkv7_layer_norm else Qwen3_5RMSNorm
-        self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -844,9 +776,8 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        v_first: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.FloatTensor, torch.Tensor | None]:
+    ) -> torch.FloatTensor:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -869,13 +800,6 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        elif self.block_type == "rwkv7":
-            hidden_states, v_first = self.rwkv_attn(
-                hidden_states=hidden_states,
-                v_first=v_first,
-                cache_params=past_key_values,
-                attention_mask=attention_mask,
-            )
 
         hidden_states = residual + hidden_states
 
@@ -885,7 +809,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, v_first
+        return hidden_states
 
 
 class Qwen3_5PreTrainedModel(PreTrainedModel):
@@ -910,10 +834,6 @@ class Qwen3_5PreTrainedModel(PreTrainedModel):
         if isinstance(module, Qwen3_5GatedDeltaNet):
             init.ones_(module.dt_bias)
             init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
-        elif isinstance(module, modeling_rwkv7.Rwkv7TimeMix):
-            for parameter in module.parameters(recurse=False):
-                init.zeros_(parameter)
-            module._reset_low_rank_parameters()
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
         elif isinstance(module, Qwen3_5RMSNorm):
             init.zeros_(module.weight)
@@ -1237,8 +1157,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        if config.use_rwkv7_layer_norm:
-            self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1291,22 +1209,19 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
                 "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
-                "rwkv7": create_recurrent_attention_mask(**mask_kwargs),
             }
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        v_first = None
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            hidden_states, v_first = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping[self.config.layer_types[i]],
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                v_first=v_first,
                 **kwargs,
             )
 
