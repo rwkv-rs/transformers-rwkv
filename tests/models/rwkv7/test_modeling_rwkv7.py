@@ -1,13 +1,14 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import importlib
 import json
 
 import pytest
 import torch
 
 import transformers.models.rwkv7.modeling_rwkv7 as modeling_rwkv7
-from transformers import AutoModel, AutoModelForCausalLM, Trainer, TrainingArguments
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, Trainer, TrainingArguments
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7ForCausalLM,
@@ -15,6 +16,7 @@ from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7PreTrainedModel,
     rwkv7_reference,
 )
+from transformers.testing_utils import slow
 from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
 from transformers.utils import SAFE_WEIGHTS_NAME
 
@@ -27,6 +29,7 @@ def _tiny_config() -> Rwkv7Config:
         num_hidden_layers=2,
         head_size=4,
         context_length=16,
+        wkv_backend="reference",
     )
 
 
@@ -170,7 +173,8 @@ def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
-def test_rwkv7_auto_backend_falls_back_on_cpu() -> None:
+def test_rwkv7_auto_backend_falls_back_on_cpu(monkeypatch) -> None:
+    monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", lambda *inputs: (None, "provider unavailable"))
     config = _tiny_config()
     config.wkv_backend = "auto"
     model = Rwkv7ForCausalLM(config).eval()
@@ -180,7 +184,8 @@ def test_rwkv7_auto_backend_falls_back_on_cpu() -> None:
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"reference"}
 
 
-def test_rwkv7_explicit_accelerated_backend_fails_closed_on_cpu() -> None:
+def test_rwkv7_explicit_accelerated_backend_fails_closed_on_cpu(monkeypatch) -> None:
+    monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", lambda *inputs: (None, "provider unavailable"))
     config = _tiny_config()
     config.wkv_backend = "flash_rwkv"
     model = Rwkv7ForCausalLM(config).eval()
@@ -226,6 +231,20 @@ def test_rwkv7_save_reload_and_auto_classes(tmp_path) -> None:
     assert isinstance(auto_model, Rwkv7Model)
     assert isinstance(auto_causal_lm, Rwkv7ForCausalLM)
     torch.testing.assert_close(auto_causal_lm(input_ids).logits, expected)
+
+
+@slow
+def test_rwkv7_auto_classes_survive_fla_backend_import(tmp_path) -> None:
+    pytest.importorskip("fla")
+    importlib.import_module("fla.ops.rwkv7.backends.flash_rwkv")
+    model = Rwkv7ForCausalLM(_tiny_config()).eval()
+    model.save_pretrained(tmp_path)
+
+    auto_config = AutoConfig.from_pretrained(tmp_path)
+    auto_model = AutoModelForCausalLM.from_pretrained(tmp_path)
+
+    assert isinstance(auto_config, Rwkv7Config)
+    assert isinstance(auto_model, Rwkv7ForCausalLM)
 
 
 class _TinyCausalLMDataset(torch.utils.data.Dataset):
