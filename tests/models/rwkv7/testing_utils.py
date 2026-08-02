@@ -4,6 +4,9 @@
 import torch
 
 
+_last_rwkv7_kernel = None
+
+
 def _run_sequence(tensors, state):
     r, w, k, v, a, b = tensors
     outputs = []
@@ -35,12 +38,19 @@ def recurrent_rwkv7(
     mode,
 ):
     """CPU oracle for the public recurrent FLA call shape; this is not a FlashRWKV operator E2E helper."""
+    global _last_rwkv7_kernel
     assert output_final_state is True
     assert mode == "fp32io16"
     tensors = (r, w, k, v, a, b)
     if state_indices is None:
+        _last_rwkv7_kernel = (
+            "pretrain_recurrent_fp32io16_forward"
+            if any(tensor.requires_grad for tensor in (*tensors, initial_state))
+            else "rwkv7"
+        )
         return _run_sequence(tensors, initial_state)
 
+    _last_rwkv7_kernel = "rwkv7_recurrent_stateful"
     outputs = []
     for sequence_index in range(state_indices.numel()):
         start = int(cu_seqlens[sequence_index])
@@ -61,3 +71,23 @@ chunk_rwkv7 = recurrent_rwkv7
 
 def get_last_rwkv7_provider():
     return "flash_rwkv"
+
+
+def get_last_rwkv7_kernel():
+    return _last_rwkv7_kernel
+
+
+def _unavailable_fused_operator(*args, **kwargs):
+    del args, kwargs
+    raise RuntimeError("Synthetic CPU contract does not execute FlashRWKV fused operators.")
+
+
+class _FlashRwkvPublicApi:
+    infer_cmix_mix_fp16 = staticmethod(_unavailable_fused_operator)
+    infer_tmix_kk_a_gate_fp16 = staticmethod(_unavailable_fused_operator)
+    infer_tmix_lnx_rkvres_xg_fp16 = staticmethod(_unavailable_fused_operator)
+    infer_tmix_mix6_fp16 = staticmethod(_unavailable_fused_operator)
+    infer_tmix_vres_gate_fp16 = staticmethod(_unavailable_fused_operator)
+
+
+flash_rwkv = _FlashRwkvPublicApi()

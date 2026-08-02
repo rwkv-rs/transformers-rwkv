@@ -62,6 +62,10 @@ def synthetic_fla_public_contract(tmp_path, monkeypatch):
         Path(testing_utils.__file__).read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    (rwkv7_dir / "inference.py").write_text(
+        "def can_use_flash_rwkv_inference(*args, **kwargs):\n    return False\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.syspath_prepend(str(site_packages))
     existing_pythonpath = os.environ.get("PYTHONPATH")
@@ -70,5 +74,11 @@ def synthetic_fla_public_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(
         modeling_rwkv7,
         "_load_fla_rwkv7_contract",
-        lambda: (testing_utils.recurrent_rwkv7, testing_utils.get_last_rwkv7_provider),
+        lambda: modeling_rwkv7._FlaRwkv7Contract(
+            recurrent_rwkv7=testing_utils.recurrent_rwkv7,
+            flash_rwkv=None,
+            can_use_flash_rwkv_inference=lambda *args, **kwargs: False,
+            get_last_provider=testing_utils.get_last_rwkv7_provider,
+            get_last_kernel=testing_utils.get_last_rwkv7_kernel,
+        ),
     )
