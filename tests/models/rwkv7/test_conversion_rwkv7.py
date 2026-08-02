@@ -5,7 +5,10 @@ import json
 
 import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 
+from transformers import PreTrainedTokenizerFast
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import (
     convert_rwkv7_checkpoint_to_hf_format,
@@ -104,6 +107,54 @@ def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
     assert converted.config.embedding_layer_norm_fused
     assert converted.config.wkv_backend == "reference"
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
+
+
+def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(tmp_path) -> None:
+    source = Rwkv7ForCausalLM(_config()).eval()
+    checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
+    tokenizer_dir = tmp_path / "tokenizer"
+    output_dir = tmp_path / "publication"
+    model_card = tmp_path / "MODEL_CARD.md"
+    license_file = tmp_path / "SOURCE_LICENSE"
+    torch.save(_legacy_state_dict(source), checkpoint)
+    vocabulary = {"[UNK]": 0, **{f"token-{index}": index for index in range(1, 31)}}
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocabulary, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    tokenizer.save_pretrained(tokenizer_dir)
+    model_card.write_text("# Native RWKV-7\n", encoding="utf-8")
+    license_file.write_text("Apache License 2.0\n", encoding="utf-8")
+
+    result = convert_rwkv7_checkpoint_to_hf_format(
+        str(checkpoint),
+        str(output_dir),
+        tokenizer_name_or_path=str(tokenizer_dir),
+        source_revision="a" * 40,
+        wkv_backend="reference",
+        publication_ready=True,
+        model_card_path=str(model_card),
+        license_path=str(license_file),
+        validation_max_new_tokens=2,
+    )
+
+    publication = result["publication"]
+    assert publication["artifact"]["fresh_validation"]["strict_load"]
+    assert publication["artifact"]["fresh_validation"]["observed_wkv_backends"] == ["reference"]
+    assert publication["dry_run"]["blockers"] == ["authentication_not_checked", "hub_repo_id_missing"]
+    assert publication["dry_run"]["network_called"] is False
+    assert {
+        "LICENSE",
+        "README.md",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "rwkv7_conversion.json",
+        "rwkv7_hf_upload_manifest.json",
+        "rwkv7_validation.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    }.issubset(path.name for path in output_dir.iterdir())
 
 
 @pytest.mark.parametrize(
