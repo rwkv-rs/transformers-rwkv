@@ -38,6 +38,10 @@ class Qwen3_5TextConfig(PreTrainedConfig):
         Number of key heads used in linear attention layers.
     linear_num_value_heads (`int`, *optional*, defaults to 32):
         Number of value heads used in linear attention layers.
+    rwkv7_head_size (`int`, *optional*, defaults to 64):
+        Width of each RWKV-7 recurrent head in `"rwkv7"` layers.
+    rwkv7_backend (`str`, *optional*, defaults to `"auto"`):
+        RWKV-7 recurrent backend used by `"rwkv7"` layers.
 
     ```python
     >>> from transformers import Qwen3_5TextModel, Qwen3_5TextConfig
@@ -101,6 +105,8 @@ class Qwen3_5TextConfig(PreTrainedConfig):
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 32
     layer_types: list[str] | None = None
+    rwkv7_head_size: int = 64
+    rwkv7_backend: str = "auto"
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
@@ -117,6 +123,17 @@ class Qwen3_5TextConfig(PreTrainedConfig):
             ]
         else:
             self.layer_types = remap_legacy_layer_types(self.layer_types)
+
+        if len(self.layer_types) != self.num_hidden_layers:
+            raise ValueError("`layer_types` must contain exactly `num_hidden_layers` entries.")
+        invalid_layer_types = set(self.layer_types) - {"full_attention", "linear_attention", "rwkv7"}
+        if invalid_layer_types:
+            raise ValueError(f"Unsupported Qwen3.5 layer types: {sorted(invalid_layer_types)}.")
+        if "rwkv7" in self.layer_types:
+            if self.rwkv7_head_size <= 0 or self.hidden_size % self.rwkv7_head_size:
+                raise ValueError("`hidden_size` must be divisible by a positive `rwkv7_head_size`.")
+            if self.rwkv7_backend not in {"auto", "reference", "flash_rwkv"}:
+                raise ValueError("`rwkv7_backend` must be 'auto', 'reference', or 'flash_rwkv'.")
 
         super().__post_init__(**kwargs)
 
