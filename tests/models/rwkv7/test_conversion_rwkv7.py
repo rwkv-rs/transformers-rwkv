@@ -40,8 +40,8 @@ def _non_formula_rank_config() -> Rwkv7Config:
         num_hidden_layers=2,
         head_size=4,
         decay_low_rank_dim=96,
-        aaa_low_rank_dim=80,
-        value_low_rank_dim=48,
+        a_low_rank_dim=80,
+        v_low_rank_dim=48,
         gate_low_rank_dim=112,
     )
 
@@ -291,8 +291,8 @@ def test_converter_infers_non_formula_ranks_and_direct_model_strict_loads() -> N
     config = infer_rwkv7_config(raw)
 
     assert config.decay_low_rank_dim == 96
-    assert config.aaa_low_rank_dim == 80
-    assert config.value_low_rank_dim == 48
+    assert config.a_low_rank_dim == 80
+    assert config.v_low_rank_dim == 48
     assert config.gate_low_rank_dim == 112
     assert raw["blocks.0.att.w1"].shape == (16, 96)
     assert raw["blocks.0.att.w2"].shape == (96, 16)

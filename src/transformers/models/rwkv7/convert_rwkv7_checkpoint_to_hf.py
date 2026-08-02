@@ -329,8 +329,8 @@ def infer_rwkv7_config(
 
     rank_specs = {
         "decay_low_rank_dim": ("w1", "w2", 0),
-        "aaa_low_rank_dim": ("a1", "a2", 0),
-        "value_low_rank_dim": ("v1", "v2", 1),
+        "a_low_rank_dim": ("a1", "a2", 0),
+        "v_low_rank_dim": ("v1", "v2", 1),
         "gate_low_rank_dim": ("g1", "g2", 0),
     }
     inferred_ranks = {}

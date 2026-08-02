@@ -35,9 +35,9 @@ class Rwkv7Config(PreTrainedConfig):
         Dtype used to store the recurrent WKV matrix.
     decay_low_rank_dim (`int`, *optional*):
         Rank of the time-decay ``w1``/``w2`` projections.
-    aaa_low_rank_dim (`int`, *optional*):
+    a_low_rank_dim (`int`, *optional*):
         Rank of the in-context learning-rate ``a1``/``a2`` projections.
-    value_low_rank_dim (`int`, *optional*):
+    v_low_rank_dim (`int`, *optional*):
         Rank of the value-mixing ``v1``/``v2`` projections.
     gate_low_rank_dim (`int`, *optional*):
         Rank of the output-gate ``g1``/``g2`` projections.
@@ -62,8 +62,8 @@ class Rwkv7Config(PreTrainedConfig):
     embedding_layer_norm_fused: bool = False
     wkv_state_dtype: str = "float32"
     decay_low_rank_dim: int | None = None
-    aaa_low_rank_dim: int | None = None
-    value_low_rank_dim: int | None = None
+    a_low_rank_dim: int | None = None
+    v_low_rank_dim: int | None = None
     gate_low_rank_dim: int | None = None
 
     def __post_init__(self, **kwargs):
@@ -76,10 +76,10 @@ class Rwkv7Config(PreTrainedConfig):
         default_gate_rank = max(32, round(5.0 * self.hidden_size**0.5 / 32) * 32)
         if self.decay_low_rank_dim is None:
             self.decay_low_rank_dim = default_decay_rank
-        if self.aaa_low_rank_dim is None:
-            self.aaa_low_rank_dim = default_decay_rank
-        if self.value_low_rank_dim is None:
-            self.value_low_rank_dim = default_value_rank
+        if self.a_low_rank_dim is None:
+            self.a_low_rank_dim = default_decay_rank
+        if self.v_low_rank_dim is None:
+            self.v_low_rank_dim = default_value_rank
         if self.gate_low_rank_dim is None:
             self.gate_low_rank_dim = default_gate_rank
 
@@ -110,7 +110,7 @@ class Rwkv7Config(PreTrainedConfig):
             raise ValueError("Layer and group normalization epsilon values must be positive.")
         if self.wkv_state_dtype != "float32":
             raise ValueError("RWKV-7 requires `wkv_state_dtype='float32'`.")
-        for name in ("decay_low_rank_dim", "aaa_low_rank_dim", "value_low_rank_dim", "gate_low_rank_dim"):
+        for name in ("decay_low_rank_dim", "a_low_rank_dim", "v_low_rank_dim", "gate_low_rank_dim"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"`{name}` must be positive, got {getattr(self, name)}.")
 
