@@ -14,10 +14,8 @@
 """Testing suite for the PyTorch Qwen3.5 model."""
 
 import copy
-import os
 import tempfile
 import unittest
-from unittest import mock
 
 from parameterized import parameterized
 
@@ -40,14 +38,12 @@ from ...test_modeling_common import (
     floats_tensor,
     ids_tensor,
 )
-from ..rwkv7.testing_utils import chunk_rwkv7, get_last_rwkv7_provider
 
 
 if is_torch_available():
     import torch
 
     from transformers import (
-        AutoModel,
         AutoModelForCausalLM,
         AutoModelForImageTextToText,
         DynamicCache,
@@ -243,139 +239,6 @@ class Qwen3_5TextModelTest(CausalLMModelTest, unittest.TestCase):
         under_test_first = multi_out.last_hidden_state[:, 0, :]
 
         torch.testing.assert_close(under_test_first, ref_first, rtol=1e-4, atol=1e-4)
-
-
-@require_torch
-class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
-    def setUp(self):
-        import transformers.models.rwkv7.modeling_rwkv7 as modeling_rwkv7
-
-        environment = mock.patch.dict(os.environ, {"FLA_FLASH_RWKV": "1"})
-        public_contract = mock.patch.object(
-            modeling_rwkv7,
-            "_load_fla_rwkv7_contract",
-            return_value=(chunk_rwkv7, get_last_rwkv7_provider),
-        )
-        environment.start()
-        public_contract.start()
-        self.addCleanup(public_contract.stop)
-        self.addCleanup(environment.stop)
-
-    def get_config(self, **overrides):
-        config_kwargs = {
-            "vocab_size": 97,
-            "hidden_size": 128,
-            "intermediate_size": 256,
-            "num_hidden_layers": 3,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 32,
-            "max_position_embeddings": 64,
-            "layer_types": ["full_attention", "rwkv7", "rwkv7"],
-            "rwkv7_head_size": 128,
-            "rope_parameters": {
-                "rope_type": "default",
-                "rope_theta": 10000.0,
-                "partial_rotary_factor": 0.25,
-                "mrope_section": [2, 2, 0],
-            },
-        }
-        config_kwargs.update(overrides)
-        return Qwen3_5TextConfig(**config_kwargs)
-
-    def test_mixed_layer_forward_backward_and_auto_model(self):
-        torch.manual_seed(0)
-        config = self.get_config()
-        input_ids = torch.randint(0, config.vocab_size, (2, 5))
-        attention_mask = torch.tensor([[1, 1, 1, 1, 1], [0, 0, 1, 1, 1]])
-
-        model = Qwen3_5TextModel(config)
-        output = model(input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
-        output[..., 0].sum().backward()
-
-        self.assertEqual(output.shape, (2, 5, config.hidden_size))
-        self.assertTrue(torch.isfinite(output).all())
-        rwkv_gradient = model.layers[1].rwkv_attn.time_mix.g2.weight.grad
-        self.assertIsNotNone(rwkv_gradient)
-        self.assertGreater(rwkv_gradient.abs().sum(), 0)
-
-        auto_model = AutoModel.from_config(copy.deepcopy(config))
-        self.assertIsInstance(auto_model, Qwen3_5TextModel)
-        auto_output = auto_model(input_ids, attention_mask=attention_mask, use_cache=False).last_hidden_state
-        self.assertEqual(auto_output.shape, output.shape)
-        auto_output.square().mean().backward()
-        self.assertIsNotNone(auto_model.layers[1].rwkv_attn.time_mix.g2.weight.grad)
-
-    def test_cache_continuation_and_beam_reorder(self):
-        torch.manual_seed(0)
-        config = self.get_config()
-        model = Qwen3_5TextModel(config).eval()
-        input_ids = torch.randint(0, config.vocab_size, (2, 7))
-
-        with torch.no_grad():
-            expected = model(input_ids, use_cache=False).last_hidden_state[:, 4:]
-            cache = DynamicCache(config=config)
-            model(input_ids[:, :4], past_key_values=cache, use_cache=True)
-            actual = model(input_ids[:, 4:], past_key_values=cache, use_cache=True).last_hidden_state
-
-        torch.testing.assert_close(actual, expected)
-        for layer_idx in (1, 2):
-            cache_layer = cache.layers[layer_idx]
-            self.assertEqual(cache_layer.conv_states[0].shape, (2, config.hidden_size, 1))
-            self.assertEqual(
-                cache_layer.recurrent_states[0].shape,
-                (2, 1, config.rwkv7_head_size, config.rwkv7_head_size),
-            )
-            self.assertEqual(cache_layer.recurrent_states[0].dtype, torch.float32)
-
-        beam_idx = torch.tensor([1, 0, 1])
-        expected_shift = cache.layers[1].conv_states[0].index_select(0, beam_idx)
-        expected_wkv = cache.layers[1].recurrent_states[0].index_select(0, beam_idx)
-        cache.reorder_cache(beam_idx)
-        torch.testing.assert_close(cache.layers[1].conv_states[0], expected_shift)
-        torch.testing.assert_close(cache.layers[1].recurrent_states[0], expected_wkv)
-        with torch.no_grad():
-            reordered_output = model(
-                torch.randint(0, config.vocab_size, (3, 1)),
-                past_key_values=cache,
-                use_cache=True,
-            ).last_hidden_state
-        self.assertTrue(torch.isfinite(reordered_output).all())
-
-    def test_save_load_preserves_standard_layers(self):
-        torch.manual_seed(0)
-        config = self.get_config()
-        mixed_model = Qwen3_5TextModel(config).eval()
-        standard_model = Qwen3_5TextModel(
-            self.get_config(layer_types=["full_attention", "full_attention", "full_attention"])
-        )
-        standard_layer_keys = {key for key in standard_model.state_dict() if key.startswith("layers.0.")}
-        mixed_layer_keys = {key for key in mixed_model.state_dict() if key.startswith("layers.0.")}
-        self.assertSetEqual(mixed_layer_keys, standard_layer_keys)
-
-        input_ids = torch.randint(0, config.vocab_size, (1, 4))
-        with torch.no_grad():
-            expected = mixed_model(input_ids, use_cache=False).last_hidden_state
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            mixed_model.save_pretrained(tmp_dir)
-            restored = AutoModel.from_pretrained(tmp_dir).eval()
-            with torch.no_grad():
-                actual = restored(input_ids, use_cache=False).last_hidden_state
-
-        self.assertIsInstance(restored, Qwen3_5TextModel)
-        self.assertSetEqual(set(mixed_model.state_dict()), set(restored.state_dict()))
-        torch.testing.assert_close(actual, expected)
-
-    def test_invalid_rwkv7_geometry_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, "divisible"):
-            self.get_config(rwkv7_head_size=96)
-        with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
-            self.get_config(rwkv7_head_sizes=[128, 128])
-        with self.assertRaisesRegex(ValueError, "layer 2"):
-            self.get_config(rwkv7_head_sizes=[128, 128, 96])
-        with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
-            self.get_config(layer_types=["full_attention", "rwkv7"])
-        self.assertFalse(hasattr(self.get_config(), "rwkv7_backend"))
 
 
 class Qwen3_5VisionText2TextModelTester:

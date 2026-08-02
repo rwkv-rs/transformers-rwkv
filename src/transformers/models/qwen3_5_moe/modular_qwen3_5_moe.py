@@ -15,7 +15,6 @@
 
 import torch
 from huggingface_hub.dataclasses import strict
-from torch import nn
 
 from ... import initialization as init
 from ...integrations import use_kernel_forward_from_hub
@@ -25,11 +24,9 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import auto_docstring, logging, no_inherit_decorator
 from ..qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
 from ..qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5DecoderLayer,
     Qwen3_5GatedDeltaNet,
     Qwen3_5MLP,
     Qwen3_5Model,
-    Qwen3_5Rwkv7Attention,
     Qwen3_5TextModel,
     Qwen3_5TextRotaryEmbedding,
     Qwen3_5VisionModel,
@@ -38,6 +35,7 @@ from ..qwen3_5.modeling_qwen3_5 import (
 from ..qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 from ..qwen3_next.modeling_qwen3_next import (
     Qwen3NextAttention,
+    Qwen3NextDecoderLayer,
     Qwen3NextExperts,
     Qwen3NextForCausalLM,
     Qwen3NextPreTrainedModel,
@@ -51,7 +49,6 @@ from ..qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeModelOutputWithPast,
     Qwen3VLMoeTextTopKRouter,
 )
-from ..rwkv7 import modeling_rwkv7
 
 
 logger = logging.get_logger(__name__)
@@ -71,12 +68,6 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
         Number of key heads used in linear attention layers.
     linear_num_value_heads (`int`, *optional*, defaults to 32):
         Number of value heads used in linear attention layers.
-    rwkv7_head_size (`int`, *optional*, defaults to 64):
-        Default width of each RWKV-7 recurrent head in `"rwkv7"` layers.
-    rwkv7_head_sizes (`list[int]`, *optional*):
-        Per-layer RWKV-7 head sizes. When set, this list must contain one entry per decoder layer.
-    use_rwkv7_layer_norm (`bool`, *optional*, defaults to `False`):
-        Whether to use RWKV-style LayerNorm instead of Qwen3.5-MoE RMSNorm throughout the text decoder.
 
     ```python
     >>> from transformers import Qwen3_5MoeTextModel, Qwen3_5MoeTextConfig
@@ -121,9 +112,6 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
     num_hidden_layers: int = 40
     num_experts_per_tok: int = 8
     num_experts: int = 256
-    rwkv7_head_size: int = 64
-    rwkv7_head_sizes: list[int] | None = None
-    use_rwkv7_layer_norm: bool = False
     intermediate_size = AttributeError()
     decoder_sparse_step = AttributeError()
     norm_topk_prob = AttributeError()
@@ -132,24 +120,6 @@ class Qwen3_5MoeTextConfig(Qwen3NextConfig):
     def __post_init__(self, **kwargs):
         super().__post_init__(**kwargs)
         del self.mlp_only_layers
-        if len(self.layer_types) != self.num_hidden_layers:
-            raise ValueError("`layer_types` must contain exactly `num_hidden_layers` entries.")
-        invalid_layer_types = set(self.layer_types) - {"full_attention", "linear_attention", "rwkv7"}
-        if invalid_layer_types:
-            raise ValueError(f"Unsupported Qwen3.5-MoE layer types: {sorted(invalid_layer_types)}.")
-        if self.rwkv7_head_sizes is not None and len(self.rwkv7_head_sizes) != self.num_hidden_layers:
-            raise ValueError("`rwkv7_head_sizes` must contain exactly `num_hidden_layers` entries.")
-        if "rwkv7" in self.layer_types:
-            for layer_idx, layer_type in enumerate(self.layer_types):
-                if layer_type != "rwkv7":
-                    continue
-                head_size = (
-                    self.rwkv7_head_sizes[layer_idx] if self.rwkv7_head_sizes is not None else self.rwkv7_head_size
-                )
-                if head_size <= 0 or self.hidden_size % head_size:
-                    raise ValueError(
-                        f"`hidden_size` must be divisible by the positive RWKV-7 head size at layer {layer_idx}."
-                    )
 
 
 @auto_docstring(checkpoint="Qwen/Qwen3.5-35B-A3B")
@@ -202,10 +172,6 @@ class Qwen3_5MoeAttention(Qwen3NextAttention):
     pass
 
 
-class Qwen3_5MoeRwkv7Attention(Qwen3_5Rwkv7Attention):
-    pass
-
-
 class Qwen3_5MoeMLP(Qwen3_5MLP):
     pass
 
@@ -226,7 +192,7 @@ class Qwen3_5MoeRMSNorm(Qwen3NextRMSNorm):
     pass
 
 
-class Qwen3_5MoeDecoderLayer(Qwen3_5DecoderLayer):
+class Qwen3_5MoeDecoderLayer(Qwen3NextDecoderLayer):
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int):
         GradientCheckpointingLayer.__init__(self)
         self.hidden_size = config.hidden_size
@@ -235,12 +201,9 @@ class Qwen3_5MoeDecoderLayer(Qwen3_5DecoderLayer):
             self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
         elif self.block_type == "full_attention":
             self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
-        elif self.block_type == "rwkv7":
-            self.rwkv_attn = Qwen3_5MoeRwkv7Attention(config, layer_idx)
         self.mlp = Qwen3_5MoeSparseMoeBlock(config)
-        norm_class = nn.LayerNorm if config.use_rwkv7_layer_norm else Qwen3_5MoeRMSNorm
-        self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
 class Qwen3_5MoePreTrainedModel(Qwen3NextPreTrainedModel):
@@ -251,10 +214,6 @@ class Qwen3_5MoePreTrainedModel(Qwen3NextPreTrainedModel):
         if isinstance(module, Qwen3_5MoeGatedDeltaNet):
             init.ones_(module.dt_bias)
             init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
-        elif isinstance(module, modeling_rwkv7.Rwkv7TimeMix):
-            for parameter in module.parameters(recurse=False):
-                init.zeros_(parameter)
-            module._reset_low_rank_parameters()
         # We initialize with 0s to be 1 centered as the RMSNorm here does (1 + weight)
         elif isinstance(module, Qwen3_5MoeRMSNorm):
             init.zeros_(module.weight)
