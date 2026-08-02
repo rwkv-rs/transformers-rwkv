@@ -347,7 +347,9 @@ def test_rwkv7_runtime_provenance_rejects_same_name_registry_package(monkeypatch
         modeling_rwkv7._load_fla_rwkv7_contract()
 
 
-def test_rwkv7_runtime_provenance_rejects_wrong_fork_revision(monkeypatch) -> None:
+def test_rwkv7_runtime_provenance_rejects_wrong_fork_revision(monkeypatch, tmp_path) -> None:
+    module_origin = tmp_path / "fla" / "__init__.py"
+
     class WrongRevisionDistribution:
         metadata = {"Name": "flash-linear-attention"}
         version = "0.5.2"
@@ -363,9 +365,14 @@ def test_rwkv7_runtime_provenance_rejects_wrong_fork_revision(monkeypatch) -> No
 
         @staticmethod
         def locate_file(_filename):
-            return modeling_rwkv7.importlib.util.find_spec("fla").origin
+            return module_origin
 
     monkeypatch.setattr(modeling_rwkv7.importlib_metadata, "distribution", lambda _name: WrongRevisionDistribution())
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib.util,
+        "find_spec",
+        lambda name: importlib.machinery.ModuleSpec(name, loader=None, origin=str(module_origin)),
+    )
 
     with pytest.raises(RuntimeError, match="revision provenance mismatch"):
         modeling_rwkv7.validate_rwkv7_runtime_provenance()
