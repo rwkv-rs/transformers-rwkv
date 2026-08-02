@@ -27,8 +27,8 @@ def rwkv7_reference(
     raw_decay: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    negative_key: torch.Tensor,
-    scaled_key: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
     state: torch.Tensor,
     head_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -37,18 +37,18 @@ def rwkv7_reference(
     num_heads = hidden_size // head_size
     tensors = [
         tensor.view(batch_size, sequence_length, num_heads, head_size)
-        for tensor in (receptance, raw_decay, key, value, negative_key, scaled_key)
+        for tensor in (receptance, raw_decay, key, value, a, b)
     ]
-    receptance, raw_decay, key, value, negative_key, scaled_key = tensors
+    receptance, raw_decay, key, value, a, b = tensors
     log_decay = -F.softplus(-raw_decay) - 0.5
     outputs = []
     current_state = state
     for token_index in range(sequence_length):
         decay = log_decay[:, token_index].exp().unsqueeze(-1)
-        state_projection = torch.einsum("bhk,bhkv->bhv", scaled_key[:, token_index], current_state)
+        state_projection = torch.einsum("bhk,bhkv->bhv", a[:, token_index], current_state)
         current_state = (
             decay * current_state
-            + negative_key[:, token_index].unsqueeze(-1) * state_projection.unsqueeze(-2)
+            + b[:, token_index].unsqueeze(-1) * state_projection.unsqueeze(-2)
             + key[:, token_index].unsqueeze(-1) * value[:, token_index].unsqueeze(-2)
         )
         outputs.append(torch.einsum("bhk,bhkv->bhv", receptance[:, token_index], current_state))
@@ -305,10 +305,27 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, value):
         self.head = value
 
-    def prepare_inputs_for_generation(self, input_ids, state=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, state=None, use_cache=None, **kwargs):
+        use_cache = self.config.use_cache if use_cache is None else use_cache
         if state is not None:
             input_ids = input_ids[:, -1:]
-        return {"input_ids": input_ids, "state": state, "use_cache": True}
+        return {"input_ids": input_ids, "state": state, "use_cache": use_cache}
+
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs,
+        model_kwargs,
+        is_encoder_decoder=False,
+        num_new_tokens=1,
+    ):
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs,
+            model_kwargs,
+            is_encoder_decoder=is_encoder_decoder,
+            num_new_tokens=num_new_tokens,
+        )
+        model_kwargs["state"] = outputs.state
+        return model_kwargs
 
     def forward(self, input_ids=None, labels=None, state=None, return_dict=None, **kwargs):
         outputs = self.model(input_ids=input_ids, state=state, return_dict=True, **kwargs)

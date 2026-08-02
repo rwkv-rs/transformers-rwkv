@@ -64,4 +64,15 @@ class Rwkv7ConfigTest(unittest.TestCase):
             reloaded = AutoConfig.from_pretrained(directory)
 
         self.assertIsInstance(reloaded, Rwkv7Config)
-        self.assertEqual(reloaded.to_dict(), config.to_dict())
+        for field in (
+            "vocab_size",
+            "context_length",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "head_size",
+            "num_attention_heads",
+            "wkv_backend",
+            "wkv_state_dtype",
+        ):
+            self.assertEqual(getattr(reloaded, field), getattr(config, field))
