@@ -56,8 +56,10 @@ jobs:
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_runtime_provenance_rejects_unproven_flash_rwkv \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_missing_public_fla_contract_fails_closed \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_contract_does_not_fall_back_to_chunk \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_contract_requires_fused_inference_surface \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_signature_is_importable_in_fresh_process \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_fla_contract_rejects_provider_fallback \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_generate_updates_recurrent_state \

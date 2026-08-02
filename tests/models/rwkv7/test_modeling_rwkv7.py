@@ -27,7 +27,7 @@ from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_N
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
-from .testing_utils import get_last_rwkv7_provider, recurrent_rwkv7
+from .testing_utils import get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
 
 
 class Rwkv7ModelTester(CausalLMModelTester):
@@ -63,7 +63,13 @@ class Rwkv7ModelTest(CausalLMModelTest, unittest.TestCase):
         public_contract = mock.patch.object(
             modeling_rwkv7,
             "_load_fla_rwkv7_contract",
-            return_value=(recurrent_rwkv7, get_last_rwkv7_provider),
+            return_value=modeling_rwkv7._FlaRwkv7Contract(
+                recurrent_rwkv7=recurrent_rwkv7,
+                flash_rwkv=None,
+                can_use_flash_rwkv_inference=lambda *args, **kwargs: False,
+                get_last_provider=get_last_rwkv7_provider,
+                get_last_kernel=get_last_rwkv7_kernel,
+            ),
         )
         public_contract.start()
         self.addCleanup(public_contract.stop)
@@ -88,6 +94,21 @@ def _tiny_flash_config() -> Rwkv7Config:
         num_hidden_layers=2,
         head_size=64,
         context_length=16,
+    )
+
+
+def _cpu_public_contract(
+    recurrent=recurrent_rwkv7,
+    *,
+    provider=get_last_rwkv7_provider,
+    kernel=get_last_rwkv7_kernel,
+):
+    return modeling_rwkv7._FlaRwkv7Contract(
+        recurrent_rwkv7=recurrent,
+        flash_rwkv=None,
+        can_use_flash_rwkv_inference=lambda *args, **kwargs: False,
+        get_last_provider=provider,
+        get_last_kernel=kernel,
     )
 
 
@@ -729,14 +750,51 @@ def test_rwkv7_public_contract_does_not_fall_back_to_chunk(monkeypatch, request)
         modeling_rwkv7._load_fla_rwkv7_contract()
 
 
+def test_rwkv7_public_contract_requires_fused_inference_surface(monkeypatch, request) -> None:
+    class IncompleteFlashRwkv:
+        infer_tmix_mix6_fp16 = staticmethod(lambda *args, **kwargs: None)
+
+    class PublicRwkv7Module:
+        recurrent_rwkv7 = staticmethod(recurrent_rwkv7)
+        flash_rwkv = IncompleteFlashRwkv()
+        get_last_rwkv7_provider = staticmethod(get_last_rwkv7_provider)
+        get_last_rwkv7_kernel = staticmethod(get_last_rwkv7_kernel)
+
+    class PublicInferenceModule:
+        can_use_flash_rwkv_inference = staticmethod(lambda *args, **kwargs: False)
+
+    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib,
+        "import_module",
+        lambda name: PublicInferenceModule() if name.endswith(".inference") else PublicRwkv7Module(),
+    )
+    modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
+    request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
+
+    with pytest.raises(RuntimeError, match="lacks public inference operators.*infer_cmix_mix_fp16"):
+        modeling_rwkv7._load_fla_rwkv7_contract()
+
+
 def test_rwkv7_public_recurrent_signature_is_importable_in_fresh_process(synthetic_fla_public_contract) -> None:
     code = """
 import inspect
-from fla.ops.rwkv7 import get_last_rwkv7_provider, recurrent_rwkv7
+from fla.ops.rwkv7 import flash_rwkv, get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
+from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
 required = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
 assert required <= inspect.signature(recurrent_rwkv7).parameters.keys()
 assert callable(get_last_rwkv7_provider)
+assert callable(get_last_rwkv7_kernel)
+assert callable(can_use_flash_rwkv_inference)
+for operator in {
+    "infer_cmix_mix_fp16",
+    "infer_tmix_kk_a_gate_fp16",
+    "infer_tmix_lnx_rkvres_xg_fp16",
+    "infer_tmix_mix6_fp16",
+    "infer_tmix_vres_gate_fp16",
+}:
+    assert callable(getattr(flash_rwkv, operator))
 """
     subprocess.run([sys.executable, "-c", code], check=True)
 
@@ -746,6 +804,7 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
     """Validate the HF call contract on CPU; this does not execute the real FLA or FlashRWKV operator."""
     required_parameters = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
     calls = []
+    telemetry = {}
 
     def public_recurrent_rwkv7(
         r,
@@ -762,6 +821,11 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
         mode,
     ):
         calls.append((r, w, k, v, a, b, initial_state, output_final_state, cu_seqlens, state_indices, mode))
+        telemetry["kernel"] = (
+            "pretrain_recurrent_fp32io16_forward"
+            if any(tensor.requires_grad for tensor in (r, w, k, v, a, b, initial_state))
+            else "rwkv7"
+        )
         output = (r + w + k + v + a + b) / 6
         if state_indices is not None:
             initial_state.add_(1)
@@ -774,7 +838,11 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
     monkeypatch.setattr(
         modeling_rwkv7,
         "_load_fla_rwkv7_contract",
-        lambda: (public_recurrent_rwkv7, lambda: "flash_rwkv"),
+        lambda: _cpu_public_contract(
+            public_recurrent_rwkv7,
+            provider=lambda: "flash_rwkv",
+            kernel=lambda: telemetry.get("kernel"),
+        ),
     )
     model = Rwkv7ForCausalLM(_tiny_flash_config()).train(training)
     input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
@@ -803,8 +871,117 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"flash_rwkv"}
 
 
+def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry(monkeypatch) -> None:
+    """Validate the public fused call contract on CPU; this does not execute real FlashRWKV operators."""
+    calls = []
+    telemetry = {}
+    telemetry_checks = []
+
+    def record(kernel, result):
+        calls.append(kernel)
+        telemetry.update(provider="flash_rwkv", kernel=kernel)
+        return result
+
+    class PublicFlashRwkv:
+        @staticmethod
+        def infer_tmix_mix6_fp16(hidden_states, shift_state, mixes):
+            shift_state.copy_(hidden_states[:, -1])
+            return record("infer_tmix_mix6_fp16", tuple(hidden_states + mix * 0 for mix in mixes))
+
+        @staticmethod
+        def infer_tmix_vres_gate_fp16(value, first_value, gate_bias, gate_delta):
+            del first_value, gate_bias, gate_delta
+            return record("infer_tmix_vres_gate_fp16", value)
+
+        @staticmethod
+        def infer_tmix_kk_a_gate_fp16(key, key_scale, gate_bias, gate_delta, key_gate_scale):
+            del key_scale, gate_bias, gate_delta, key_gate_scale
+            return record(
+                "infer_tmix_kk_a_gate_fp16",
+                (key, -torch.ones_like(key), torch.full_like(key, 0.25)),
+            )
+
+        @staticmethod
+        def infer_tmix_lnx_rkvres_xg_fp16(
+            output,
+            receptance,
+            key,
+            value,
+            residual_scale,
+            norm_weight,
+            norm_bias,
+            gate,
+        ):
+            del receptance, key, value, residual_scale, norm_weight, norm_bias, gate
+            return record("infer_tmix_lnx_rkvres_xg_fp16", output)
+
+        @staticmethod
+        def infer_cmix_mix_fp16(hidden_states, shift_state, mix):
+            del mix
+            shift_state.copy_(hidden_states[:, -1])
+            return record("infer_cmix_mix_fp16", hidden_states)
+
+    def public_recurrent_rwkv7(
+        r,
+        w,
+        k,
+        v,
+        a,
+        b,
+        *,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
+    ):
+        assert output_final_state is True
+        assert cu_seqlens is None and state_indices is None and mode == "fp32io16"
+        output = (r + w + k + v + a + b) / 6
+        final_state = initial_state + torch.einsum("bthk,bthv->bhkv", k.float(), v.float())
+        return record("rwkv7", (output, final_state))
+
+    def get_last_provider():
+        telemetry_checks.append(("provider", telemetry.get("provider")))
+        return telemetry.get("provider")
+
+    def get_last_kernel():
+        telemetry_checks.append(("kernel", telemetry.get("kernel")))
+        return telemetry.get("kernel")
+
+    contract = modeling_rwkv7._FlaRwkv7Contract(
+        recurrent_rwkv7=public_recurrent_rwkv7,
+        flash_rwkv=PublicFlashRwkv,
+        can_use_flash_rwkv_inference=lambda *args, **kwargs: True,
+        get_last_provider=get_last_provider,
+        get_last_kernel=get_last_kernel,
+    )
+    monkeypatch.setattr(modeling_rwkv7, "_load_fla_rwkv7_contract", lambda: contract)
+    model = Rwkv7ForCausalLM(_tiny_flash_config()).eval()
+
+    with torch.no_grad():
+        output = model(torch.tensor([[1, 2, 3]]), use_cache=True)
+
+    assert output.state is not None
+    assert calls == [
+        "infer_tmix_mix6_fp16",
+        "infer_tmix_kk_a_gate_fp16",
+        "rwkv7",
+        "infer_tmix_lnx_rkvres_xg_fp16",
+        "infer_cmix_mix_fp16",
+        "infer_tmix_mix6_fp16",
+        "infer_tmix_vres_gate_fp16",
+        "infer_tmix_kk_a_gate_fp16",
+        "rwkv7",
+        "infer_tmix_lnx_rkvres_xg_fp16",
+        "infer_cmix_mix_fp16",
+    ]
+    assert telemetry_checks == [item for kernel in calls for item in (("provider", "flash_rwkv"), ("kernel", kernel))]
+
+
 def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeypatch) -> None:
     calls = []
+    telemetry = {}
 
     def public_recurrent_rwkv7(
         r,
@@ -821,6 +998,7 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
         mode,
     ):
         calls.append((initial_state, output_final_state, cu_seqlens, state_indices, mode))
+        telemetry["kernel"] = "rwkv7_recurrent_stateful"
         for state_index in state_indices.tolist():
             initial_state[state_index].add_(1)
         return torch.zeros_like(v), initial_state
@@ -828,7 +1006,11 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
     monkeypatch.setattr(
         modeling_rwkv7,
         "_load_fla_rwkv7_contract",
-        lambda: (public_recurrent_rwkv7, lambda: "flash_rwkv"),
+        lambda: _cpu_public_contract(
+            public_recurrent_rwkv7,
+            provider=lambda: "flash_rwkv",
+            kernel=lambda: telemetry.get("kernel"),
+        ),
     )
     inputs = [torch.randn(1, 5, 64) for _ in range(6)]
     state_pool = torch.zeros(4, 1, 64, 64)
@@ -876,11 +1058,15 @@ def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> Non
     monkeypatch.setattr(
         modeling_rwkv7,
         "_load_fla_rwkv7_contract",
-        lambda: (public_recurrent_rwkv7, lambda: "fla"),
+        lambda: _cpu_public_contract(
+            public_recurrent_rwkv7,
+            provider=lambda: "fla",
+            kernel=lambda: "rwkv7",
+        ),
     )
     model = Rwkv7ForCausalLM(_tiny_flash_config()).eval()
 
-    with torch.no_grad(), pytest.raises(RuntimeError, match="fallback is disabled"):
+    with torch.no_grad(), pytest.raises(RuntimeError, match="telemetry did not report"):
         model(torch.tensor([[1, 2, 3]]))
 
 

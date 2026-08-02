@@ -25,6 +25,15 @@ from .configuration_rwkv7 import Rwkv7Config
 _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
     {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
 )
+_FLA_RWKV7_FUSED_INFERENCE_OPERATORS = frozenset(
+    {
+        "infer_cmix_mix_fp16",
+        "infer_tmix_kk_a_gate_fp16",
+        "infer_tmix_lnx_rkvres_xg_fp16",
+        "infer_tmix_mix6_fp16",
+        "infer_tmix_vres_gate_fp16",
+    }
+)
 RWKV7_FLA_DISTRIBUTION = "flash-linear-attention"
 RWKV7_FLA_EXTRA = "flash-rwkv"
 RWKV7_FLA_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
@@ -35,6 +44,15 @@ RWKV7_FLA_REQUIREMENT = (
 RWKV7_FLASH_RWKV_DISTRIBUTION = "flash-rwkv"
 RWKV7_FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
 RWKV7_FLASH_RWKV_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
+
+
+@dataclass(frozen=True)
+class _FlaRwkv7Contract:
+    recurrent_rwkv7: object
+    flash_rwkv: object
+    can_use_flash_rwkv_inference: object
+    get_last_provider: object
+    get_last_kernel: object
 
 
 class Rwkv7DynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
@@ -277,12 +295,27 @@ def validate_rwkv7_runtime_provenance() -> dict[str, str]:
 def _load_fla_rwkv7_contract():
     validate_rwkv7_runtime_provenance()
     rwkv7 = importlib.import_module("fla.ops.rwkv7")
+    inference = importlib.import_module("fla.ops.rwkv7.inference")
     recurrent_rwkv7 = getattr(rwkv7, "recurrent_rwkv7", None)
+    flash_rwkv = getattr(rwkv7, "flash_rwkv", None)
+    can_use_flash_rwkv_inference = getattr(inference, "can_use_flash_rwkv_inference", None)
     get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
-    if not callable(recurrent_rwkv7) or not callable(get_last_provider):
+    get_last_kernel = getattr(rwkv7, "get_last_rwkv7_kernel", None)
+    if not all(
+        callable(function)
+        for function in (recurrent_rwkv7, can_use_flash_rwkv_inference, get_last_provider, get_last_kernel)
+    ):
         raise RuntimeError(
-            "The installed FLA RWKV-7 API must publicly expose recurrent_rwkv7 and get_last_rwkv7_provider."
+            "The installed FLA RWKV-7 API must publicly expose recurrent_rwkv7, fused inference eligibility, "
+            "and provider/kernel telemetry."
         )
+    missing_operators = sorted(
+        operator
+        for operator in _FLA_RWKV7_FUSED_INFERENCE_OPERATORS
+        if not callable(getattr(flash_rwkv, operator, None))
+    )
+    if missing_operators:
+        raise RuntimeError(f"The installed FLA FlashRWKV API lacks public inference operators: {missing_operators}.")
     try:
         parameters = inspect.signature(recurrent_rwkv7).parameters
     except (TypeError, ValueError) as error:
@@ -290,7 +323,23 @@ def _load_fla_rwkv7_contract():
     missing = sorted(_FLA_RWKV7_REQUIRED_PARAMETERS - parameters.keys())
     if missing:
         raise RuntimeError(f"The installed FLA recurrent_rwkv7 API lacks required stateful parameters: {missing}.")
-    return recurrent_rwkv7, get_last_provider
+    return _FlaRwkv7Contract(
+        recurrent_rwkv7=recurrent_rwkv7,
+        flash_rwkv=flash_rwkv,
+        can_use_flash_rwkv_inference=can_use_flash_rwkv_inference,
+        get_last_provider=get_last_provider,
+        get_last_kernel=get_last_kernel,
+    )
+
+
+def _require_flash_rwkv_telemetry(contract, expected_kernel):
+    provider = contract.get_last_provider()
+    kernel = contract.get_last_kernel()
+    if provider != "flash_rwkv" or kernel != expected_kernel:
+        raise RuntimeError(
+            "FLA public RWKV-7 telemetry did not report the required FlashRWKV kernel: "
+            f"provider={provider!r}, kernel={kernel!r}, expected_kernel={expected_kernel!r}."
+        )
 
 
 def _rwkv7_flash(
@@ -305,10 +354,11 @@ def _rwkv7_flash(
     *,
     cu_seqlens=None,
     state_indices=None,
+    contract=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run FlashRWKV exclusively through FLA's public recurrent contract."""
     try:
-        recurrent_rwkv7, get_last_provider = _load_fla_rwkv7_contract()
+        contract = _load_fla_rwkv7_contract() if contract is None else contract
     except (ImportError, RuntimeError) as error:
         raise RuntimeError(f"RWKV-7 requires the pinned public FLA FlashRWKV contract: {error}") from error
 
@@ -321,7 +371,7 @@ def _rwkv7_flash(
     tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
 
     try:
-        result = recurrent_rwkv7(
+        result = contract.recurrent_rwkv7(
             *tensors,
             initial_state=state,
             output_final_state=True,
@@ -331,8 +381,15 @@ def _rwkv7_flash(
         )
     except (RuntimeError, TypeError, ValueError) as error:
         raise RuntimeError(f"FLA public recurrent_rwkv7 execution failed: {error}") from error
-    if get_last_provider() != "flash_rwkv":
-        raise RuntimeError("FLA public recurrent_rwkv7 did not select FlashRWKV; fallback is disabled.")
+    requires_grad = any(tensor.requires_grad for tensor in (*tensors, state))
+    expected_kernel = (
+        "rwkv7_recurrent_stateful"
+        if state_indices is not None
+        else "pretrain_recurrent_fp32io16_forward"
+        if requires_grad
+        else "rwkv7"
+    )
+    _require_flash_rwkv_telemetry(contract, expected_kernel)
     if not isinstance(result, tuple) or len(result) != 2:
         raise RuntimeError("FLA public recurrent_rwkv7 must return (output, final_state).")
     output, final_state = result
@@ -389,11 +446,25 @@ class Rwkv7TimeMix(nn.Module):
                     nn.init.zeros_(weight)
 
     def forward(self, hidden_states, v_first, previous_hidden_state, wkv_state):
+        try:
+            contract = _load_fla_rwkv7_contract()
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                f"RWKV-7 FlashRWKV execution failed closed: pinned public FLA contract unavailable: {error}"
+            ) from error
         batch_size, sequence_length, hidden_size = hidden_states.shape
-        shifted, final_hidden_state = _token_shift(hidden_states, previous_hidden_state)
-        inputs = {
-            name: hidden_states + shifted * getattr(self, f"x_{name}") for name in ("r", "w", "k", "v", "a", "g")
-        }
+        mix_names = ("r", "w", "k", "v", "a", "g")
+        mixes = tuple(getattr(self, f"x_{name}").reshape(-1) for name in mix_names)
+        if contract.can_use_flash_rwkv_inference(hidden_states, previous_hidden_state, *mixes):
+            mixed = contract.flash_rwkv.infer_tmix_mix6_fp16(hidden_states, previous_hidden_state, mixes)
+            _require_flash_rwkv_telemetry(contract, "infer_tmix_mix6_fp16")
+            if not isinstance(mixed, tuple) or len(mixed) != len(mix_names):
+                raise RuntimeError("FLA public infer_tmix_mix6_fp16 must return six mixed tensors.")
+            inputs = dict(zip(mix_names, mixed, strict=True))
+            final_hidden_state = previous_hidden_state
+        else:
+            shifted, final_hidden_state = _token_shift(hidden_states, previous_hidden_state)
+            inputs = {name: hidden_states + shifted * getattr(self, f"x_{name}") for name in mix_names}
         receptance = self.receptance(inputs["r"])
         key = self.key(inputs["k"])
         value = self.value(inputs["v"])
@@ -401,59 +472,108 @@ class Rwkv7TimeMix(nn.Module):
         if self.layer_id == 0:
             v_first = value
         else:
-            value = value + (v_first - value) * torch.sigmoid(self.v0 + self.v2(self.v1(inputs["v"])))
-        learning_rate = torch.sigmoid(self.a0 + self.a2(self.a1(inputs["a"])))
+            value_delta = self.v2(self.v1(inputs["v"]))
+            if contract.can_use_flash_rwkv_inference(value, v_first, self.v0, value_delta):
+                value = contract.flash_rwkv.infer_tmix_vres_gate_fp16(value, v_first, self.v0, value_delta)
+                _require_flash_rwkv_telemetry(contract, "infer_tmix_vres_gate_fp16")
+            else:
+                value = value + (v_first - value) * torch.sigmoid(self.v0 + value_delta)
+        learning_rate_delta = self.a2(self.a1(inputs["a"]))
         gate = self.g2(torch.sigmoid(self.g1(inputs["g"])))
-        normalized_key = F.normalize(
-            (key * self.k_k).view(
-                batch_size,
-                sequence_length,
-                self.config.num_attention_heads,
-                self.config.head_size,
-            ),
-            dim=-1,
-        ).view(batch_size, sequence_length, hidden_size)
-        key = key * (1 + (learning_rate - 1) * self.k_a)
+        if contract.can_use_flash_rwkv_inference(
+            key,
+            self.k_k,
+            self.a0,
+            learning_rate_delta,
+            self.k_a,
+            head_dim=self.config.head_size,
+        ):
+            key, recurrent_a, recurrent_b = contract.flash_rwkv.infer_tmix_kk_a_gate_fp16(
+                key,
+                self.k_k,
+                self.a0,
+                learning_rate_delta,
+                self.k_a,
+            )
+            _require_flash_rwkv_telemetry(contract, "infer_tmix_kk_a_gate_fp16")
+        else:
+            learning_rate = torch.sigmoid(self.a0 + learning_rate_delta)
+            normalized_key = F.normalize(
+                (key * self.k_k).view(
+                    batch_size,
+                    sequence_length,
+                    self.config.num_attention_heads,
+                    self.config.head_size,
+                ),
+                dim=-1,
+            ).view(batch_size, sequence_length, hidden_size)
+            key = key * (1 + (learning_rate - 1) * self.k_a)
+            recurrent_a = -normalized_key
+            recurrent_b = normalized_key * learning_rate
         wkv_inputs = (
             receptance,
             raw_decay,
             key,
             value,
-            -normalized_key,
-            normalized_key * learning_rate,
+            recurrent_a,
+            recurrent_b,
             wkv_state,
             self.config.head_size,
         )
         try:
-            output, wkv_state = _rwkv7_flash(*wkv_inputs)
+            output, wkv_state = _rwkv7_flash(*wkv_inputs, contract=contract)
         except RuntimeError as error:
             raise RuntimeError(f"RWKV-7 FlashRWKV execution failed closed: {error}") from error
         self.last_wkv_backend = "flash_rwkv"
-        output = self.ln_x(output.flatten(0, 1)).view_as(output)
-        local = (
-            (
-                receptance.view(
-                    batch_size,
-                    sequence_length,
-                    self.config.num_attention_heads,
-                    self.config.head_size,
-                )
-                * key.view(
-                    batch_size,
-                    sequence_length,
-                    self.config.num_attention_heads,
-                    self.config.head_size,
-                )
-                * self.r_k
-            ).sum(-1, keepdim=True)
-            * value.view(
-                batch_size,
-                sequence_length,
-                self.config.num_attention_heads,
-                self.config.head_size,
+        if self.config.group_norm_epsilon == 64e-5 and contract.can_use_flash_rwkv_inference(
+            output,
+            receptance,
+            key,
+            value,
+            self.r_k.reshape(-1),
+            self.ln_x.weight,
+            self.ln_x.bias,
+            gate,
+            head_dim=self.config.head_size,
+        ):
+            output = contract.flash_rwkv.infer_tmix_lnx_rkvres_xg_fp16(
+                output,
+                receptance,
+                key,
+                value,
+                self.r_k.reshape(-1),
+                self.ln_x.weight,
+                self.ln_x.bias,
+                gate,
             )
-        ).view_as(output)
-        return self.output((output + local) * gate), v_first, final_hidden_state, wkv_state
+            _require_flash_rwkv_telemetry(contract, "infer_tmix_lnx_rkvres_xg_fp16")
+        else:
+            output = self.ln_x(output.flatten(0, 1)).view_as(output)
+            local = (
+                (
+                    receptance.view(
+                        batch_size,
+                        sequence_length,
+                        self.config.num_attention_heads,
+                        self.config.head_size,
+                    )
+                    * key.view(
+                        batch_size,
+                        sequence_length,
+                        self.config.num_attention_heads,
+                        self.config.head_size,
+                    )
+                    * self.r_k
+                ).sum(-1, keepdim=True)
+                * value.view(
+                    batch_size,
+                    sequence_length,
+                    self.config.num_attention_heads,
+                    self.config.head_size,
+                )
+            ).view_as(output)
+            output = (output + local) * gate
+        return self.output(output), v_first, final_hidden_state, wkv_state
 
 
 class Rwkv7ChannelMix(nn.Module):
@@ -464,8 +584,21 @@ class Rwkv7ChannelMix(nn.Module):
         self.value = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden_states, previous_hidden_state):
-        shifted, final_hidden_state = _token_shift(hidden_states, previous_hidden_state)
-        output = self.value(F.relu(self.key(hidden_states + shifted * self.x_k)).square())
+        try:
+            contract = _load_fla_rwkv7_contract()
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                f"RWKV-7 FlashRWKV execution failed closed: pinned public FLA contract unavailable: {error}"
+            ) from error
+        mix = self.x_k.reshape(-1)
+        if contract.can_use_flash_rwkv_inference(hidden_states, previous_hidden_state, mix):
+            mixed = contract.flash_rwkv.infer_cmix_mix_fp16(hidden_states, previous_hidden_state, mix)
+            _require_flash_rwkv_telemetry(contract, "infer_cmix_mix_fp16")
+            final_hidden_state = previous_hidden_state
+        else:
+            shifted, final_hidden_state = _token_shift(hidden_states, previous_hidden_state)
+            mixed = hidden_states + shifted * self.x_k
+        output = self.value(F.relu(self.key(mixed)).square())
         return output, final_hidden_state
 
 
