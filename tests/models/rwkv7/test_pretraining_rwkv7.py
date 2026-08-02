@@ -20,7 +20,7 @@ pretraining = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(pretraining)
 
 
-def _artifact(path: Path, backend: str = "reference") -> Path:
+def _artifact(path: Path) -> Path:
     model = Rwkv7ForCausalLM(
         Rwkv7Config(
             vocab_size=31,
@@ -29,7 +29,6 @@ def _artifact(path: Path, backend: str = "reference") -> Path:
             num_hidden_layers=2,
             head_size=4,
             context_length=16,
-            wkv_backend=backend,
         )
     )
     model.save_pretrained(path)
@@ -58,14 +57,13 @@ def _validation() -> dict:
         "checkpoint_resume_step": 2,
         "device": "cpu",
         "dtype": "float32",
-        "expected_wkv_backend": "reference",
         "minimum_logged_steps": 2,
         "validation_input_ids": [1, 2, 3],
         "validation_max_new_tokens": 2,
     }
 
 
-def test_rwkv7_pretraining_config_requires_explicit_matching_backend(tmp_path) -> None:
+def test_rwkv7_pretraining_rejects_legacy_selectable_backend_in_artifact(tmp_path) -> None:
     artifact = _artifact(tmp_path / "artifact")
     run_config = {
         "do_train": True,
@@ -78,9 +76,9 @@ def test_rwkv7_pretraining_config_requires_explicit_matching_backend(tmp_path) -
     pretraining._validate_config(run_config, _validation())
 
     artifact_config = json.loads((artifact / "config.json").read_text(encoding="utf-8"))
-    artifact_config["wkv_backend"] = "auto"
+    artifact_config["wkv_backend"] = "flash_rwkv"
     (artifact / "config.json").write_text(json.dumps(artifact_config), encoding="utf-8")
-    with pytest.raises(ValueError, match="explicit fail-closed backend"):
+    with pytest.raises(ValueError, match="must not serialize a selectable"):
         pretraining._validate_config(run_config, _validation())
 
 
@@ -107,7 +105,7 @@ def test_rwkv7_pretraining_runs_checkpoint_then_resume_and_records_evidence(tmp_
         pretraining,
         "validate_rwkv7_artifact_in_subprocess",
         lambda *args, **kwargs: {
-            "observed_wkv_backends": [kwargs["expected_wkv_backend"]],
+            "observed_wkv_backends": ["flash_rwkv"],
             "strict_load": True,
         },
     )
@@ -120,7 +118,7 @@ def test_rwkv7_pretraining_runs_checkpoint_then_resume_and_records_evidence(tmp_
     assert result["training"]["final_global_step"] == 4
     assert len(result["training"]["logged_losses"]) == 4
     assert len(result["training"]["gradient_norms"]) == 4
-    assert result["artifact_validation"] == {"observed_wkv_backends": ["reference"], "strict_load": True}
+    assert result["artifact_validation"] == {"observed_wkv_backends": ["flash_rwkv"], "strict_load": True}
 
 
 def test_rwkv7_pretraining_refuses_to_reuse_nonempty_two_phase_output(tmp_path) -> None:

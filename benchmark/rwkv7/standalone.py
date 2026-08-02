@@ -29,6 +29,7 @@ _DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+_REQUIRED_PROVIDER = "flash_rwkv"
 _CANONICAL_MANIFEST_NAME = "rwkv7_hf_upload_manifest.json"
 _TOKENIZER_FILES = frozenset(
     {
@@ -60,7 +61,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Explicit local Hugging Face artifact path or Hub repository ID.",
     )
     parser.add_argument("--output", type=Path, required=True, help="JSON result path.")
-    parser.add_argument("--backend", choices=("auto", "reference", "flash_rwkv"), default="auto")
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--prompt-tokens", type=int, default=128)
@@ -118,19 +118,19 @@ def _observed_backends(model: torch.nn.Module) -> set[str]:
     return {str(module.last_wkv_backend) for module in model.modules() if hasattr(module, "last_wkv_backend")}
 
 
-def _require_observed_backend(requested: str, observed: set[str]) -> None:
+def _require_observed_backend(observed: set[str]) -> None:
     if not observed:
         raise RuntimeError("RWKV7 benchmark could not observe the selected WKV backend")
     if len(observed) != 1:
         raise RuntimeError(f"RWKV7 layers selected inconsistent WKV backends: {sorted(observed)}")
-    if requested != "auto" and observed != {requested}:
-        raise RuntimeError(f"Explicit {requested!r} backend request failed closed; observed {sorted(observed)!r}")
+    if observed != {_REQUIRED_PROVIDER}:
+        raise RuntimeError(f"FlashRWKV provider requirement failed closed; observed {sorted(observed)!r}")
 
 
-def _capture_observed_backend(model: torch.nn.Module, requested: str, stage: str) -> set[str]:
+def _capture_observed_backend(model: torch.nn.Module, stage: str) -> set[str]:
     observed = _observed_backends(model)
     try:
-        _require_observed_backend(requested, observed)
+        _require_observed_backend(observed)
     except RuntimeError as error:
         raise RuntimeError(f"RWKV7 {stage} backend observation failed: {error}") from error
     return observed
@@ -163,15 +163,14 @@ def _correctness_gate(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     prompt_tokens: int,
-    requested_backend: str,
     dtype: torch.dtype,
 ) -> tuple[dict[str, Any], tuple[torch.Tensor, ...]]:
     one_shot = model(input_ids=input_ids, use_cache=True)
-    one_shot_backend = _capture_observed_backend(model, requested_backend, "correctness one-shot")
+    one_shot_backend = _capture_observed_backend(model, "correctness one-shot")
     if one_shot.state is None:
         raise RuntimeError("RWKV7 one-shot correctness call did not return recurrent state with use_cache=True")
     prefix = model(input_ids=input_ids[:, :prompt_tokens], use_cache=True)
-    prefix_backend = _capture_observed_backend(model, requested_backend, "correctness prefix prefill")
+    prefix_backend = _capture_observed_backend(model, "correctness prefix prefill")
     if prefix.state is None:
         raise RuntimeError("RWKV7 prefill did not return recurrent state with use_cache=True")
 
@@ -187,7 +186,6 @@ def _correctness_gate(
         )
         decode_backend_observations[f"staged_decode_token_{token_index - prompt_tokens}"] = _capture_observed_backend(
             model,
-            requested_backend,
             f"correctness staged decode token {token_index - prompt_tokens}",
         )
         if step.state is None:
@@ -249,7 +247,6 @@ def _measure_cuda(
     setup,
     *,
     model: torch.nn.Module,
-    requested_backend: str,
     stage: str,
     warmup: int,
     iterations: int,
@@ -265,7 +262,7 @@ def _measure_cuda(
         torch.cuda.synchronize(device)
         result = operation(payload)
         backend_observations[f"warmup_{len(backend_observations)}"] = _capture_observed_backend(
-            model, requested_backend, f"{stage} warmup"
+            model, f"{stage} warmup"
         )
         torch.cuda.synchronize(device)
         del result, payload
@@ -283,7 +280,7 @@ def _measure_cuda(
         result = operation(payload)
         end.record()
         backend_observations[f"timed_{iteration}"] = _capture_observed_backend(
-            model, requested_backend, f"{stage} timed iteration {iteration}"
+            model, f"{stage} timed iteration {iteration}"
         )
         torch.cuda.synchronize(device)
         samples_ms.append(start.elapsed_time(end))
@@ -477,9 +474,8 @@ def _distribution_provenance(name: str) -> dict[str, Any] | None:
     return result
 
 
-def _validated_operator_provenance(observed: set[str]) -> dict[str, str] | None:
-    if observed != {"flash_rwkv"}:
-        return None
+def _validated_operator_provenance(observed: set[str]) -> dict[str, str]:
+    _require_observed_backend(observed)
     return dict(validate_rwkv7_runtime_provenance())
 
 
@@ -526,7 +522,6 @@ def main(argv: list[str] | None = None) -> int:
             f"{args.prompt_tokens} + {args.decode_tokens} > {config.context_length}"
         )
     artifact_provenance = _artifact_provenance(args.model, config)
-    config.wkv_backend = args.backend
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         config=config,
@@ -550,7 +545,6 @@ def main(argv: list[str] | None = None) -> int:
             model,
             full_input_ids,
             args.prompt_tokens,
-            args.backend,
             dtype,
         )
         correctness_backends = set(correctness["observed_backends"])
@@ -560,7 +554,6 @@ def main(argv: list[str] | None = None) -> int:
             lambda _: model(input_ids=prompt_input_ids, use_cache=True),
             lambda: None,
             model=model,
-            requested_backend=args.backend,
             stage="prefill",
             warmup=args.warmup,
             iterations=args.iterations,
@@ -571,7 +564,6 @@ def main(argv: list[str] | None = None) -> int:
             lambda state: model(input_ids=decode_input_ids, state=state, use_cache=True),
             lambda: _clone_state(prefix_state),
             model=model,
-            requested_backend=args.backend,
             stage="decode",
             warmup=args.warmup,
             iterations=args.iterations,
@@ -585,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
                 "decode": set(decode["observed_backends"]),
             }
         )
-        if observed == {"flash_rwkv"} and operator_provenance is None:
+        if not operator_provenance:
             raise RuntimeError("FlashRWKV benchmark result lacks validated public runtime provenance")
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -597,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
         "artifact": artifact_provenance,
         "runtime": {
             "dtype": args.dtype,
-            "requested_backend": args.backend,
+            "required_provider": _REQUIRED_PROVIDER,
             "observed_backends": sorted(observed),
             "validated_operator_provenance": operator_provenance,
             "provider_packages": {

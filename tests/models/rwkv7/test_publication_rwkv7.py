@@ -31,8 +31,7 @@ def _artifact(path) -> None:
             "generated_ids": [[1, 2, 3, 4]],
             "input_ids": [[1, 2, 3]],
             "max_new_tokens": 1,
-            "observed_wkv_backends": ["reference"],
-            "requested_wkv_backend": "reference",
+            "observed_wkv_backends": ["flash_rwkv"],
             "strict_load": True,
         },
     )
@@ -56,8 +55,7 @@ def test_rwkv7_publication_audits_files_and_renders_side_effect_free_upload(tmp_
             "generated_ids": [[1, 2, 3, 4]],
             "input_ids": [[1, 2, 3]],
             "max_new_tokens": 1,
-            "observed_wkv_backends": ["reference"],
-            "requested_wkv_backend": "reference",
+            "observed_wkv_backends": ["flash_rwkv"],
             "strict_load": True,
         },
     )

@@ -101,6 +101,8 @@ def _validate_artifact(artifact_dir: Path) -> dict[str, Any]:
         raise ValueError("rwkv7_conversion.json requires a SHA-256 checkpoint identity.")
     if validation.get("strict_load") is not True or not validation.get("generated_ids"):
         raise ValueError("rwkv7_validation.json must record strict load and deterministic generated_ids.")
+    if validation.get("observed_wkv_backends") != ["flash_rwkv"]:
+        raise ValueError("rwkv7_validation.json must record the fail-closed FlashRWKV provider.")
     for name in ("README.md", "LICENSE"):
         if not (artifact_dir / name).read_text(encoding="utf-8").strip():
             raise ValueError(f"Publication file must not be empty: {name}")
@@ -142,14 +144,12 @@ def prepare_rwkv7_hf_upload(
         or not isinstance(recorded_input_ids[0], list)
     ):
         raise ValueError("rwkv7_validation.json requires one validation input_ids row.")
-    requested_backend = recorded_validation.get("requested_wkv_backend", "auto")
     fresh_validation = validate_rwkv7_artifact_in_subprocess(
         artifact_path,
         input_ids=recorded_input_ids[0],
         max_new_tokens=recorded_validation.get("max_new_tokens", 4),
         device=recorded_validation.get("device", "cpu"),
         dtype=recorded_validation.get("dtype", "auto"),
-        expected_wkv_backend=None if requested_backend == "auto" else requested_backend,
     )
     for name in ("architecture", "generated_ids", "input_ids", "observed_wkv_backends", "strict_load"):
         if fresh_validation.get(name) != recorded_validation.get(name):

@@ -28,7 +28,6 @@ def _config() -> Rwkv7Config:
         intermediate_size=32,
         num_hidden_layers=2,
         head_size=4,
-        wkv_backend="reference",
     )
 
 
@@ -79,7 +78,7 @@ def _legacy_state_dict(model: Rwkv7ForCausalLM) -> dict[str, torch.Tensor]:
     return raw
 
 
-def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
+def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path, synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     source = Rwkv7ForCausalLM(_config()).eval()
     input_ids = torch.tensor([[1, 2, 3]])
@@ -96,6 +95,7 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
         str(output_dir),
         tokenizer_name_or_path=str(tokenizer_dir),
         source_revision="a" * 40,
+        validation_device="cpu",
         validation_input_ids=[1, 2, 3],
         validation_max_new_tokens=2,
     )
@@ -103,8 +103,7 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
 
     assert isinstance(converted, Rwkv7ForCausalLM)
     assert converted.config.context_length == 32
-    assert converted.config.wkv_backend == "auto"
-    converted.config.wkv_backend = "reference"
+    assert not hasattr(converted.config, "wkv_backend")
     for name, tensor in source.state_dict().items():
         torch.testing.assert_close(converted.state_dict()[name], tensor)
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
@@ -117,7 +116,7 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     assert "model.blocks.0.att.w1" not in saved_keys
     assert result["validation"]["architecture"] == "Rwkv7ForCausalLM"
     assert result["validation"]["device"] == "cpu"
-    assert result["validation"]["requested_wkv_backend"] == "auto"
+    assert result["validation"]["observed_wkv_backends"] == ["flash_rwkv"]
     assert result["validation"]["strict_load"]
     assert result["validation"]["config_class"] == "Rwkv7Config"
     assert result["validation"]["context_length"] == 32
@@ -145,7 +144,7 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     assert json.loads((output_dir / "rwkv7_validation.json").read_text())["strict_load"]
 
 
-def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
+def test_converter_can_fuse_embedding_layer_norm(tmp_path, synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     source = Rwkv7ForCausalLM(_config()).eval()
     input_ids = torch.tensor([[1, 2, 3]])
@@ -162,17 +161,19 @@ def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
         fuse_embedding_layer_norm=True,
         tokenizer_name_or_path=str(tokenizer_dir),
         source_revision="b" * 40,
-        wkv_backend="reference",
+        validation_device="cpu",
         validation_max_new_tokens=2,
     )
     converted = Rwkv7ForCausalLM.from_pretrained(output_dir).eval()
 
     assert converted.config.embedding_layer_norm_fused
-    assert converted.config.wkv_backend == "reference"
+    assert not hasattr(converted.config, "wkv_backend")
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
 
 
-def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(tmp_path) -> None:
+def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(
+    tmp_path, synthetic_fla_public_contract
+) -> None:
     source = Rwkv7ForCausalLM(_config()).eval()
     checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
     tokenizer_dir = tmp_path / "tokenizer"
@@ -189,7 +190,7 @@ def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(tmp_p
         str(output_dir),
         tokenizer_name_or_path=str(tokenizer_dir),
         source_revision="a" * 40,
-        wkv_backend="reference",
+        validation_device="cpu",
         publication_ready=True,
         model_card_path=str(model_card),
         license_path=str(license_file),
@@ -198,7 +199,7 @@ def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(tmp_p
 
     publication = result["publication"]
     assert publication["artifact"]["fresh_validation"]["strict_load"]
-    assert publication["artifact"]["fresh_validation"]["observed_wkv_backends"] == ["reference"]
+    assert publication["artifact"]["fresh_validation"]["observed_wkv_backends"] == ["flash_rwkv"]
     assert publication["dry_run"]["blockers"] == ["authentication_not_checked", "hub_repo_id_missing"]
     assert publication["dry_run"]["network_called"] is False
     assert {

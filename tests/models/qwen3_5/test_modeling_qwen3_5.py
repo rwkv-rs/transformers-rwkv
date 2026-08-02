@@ -14,8 +14,10 @@
 """Testing suite for the PyTorch Qwen3.5 model."""
 
 import copy
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 from parameterized import parameterized
 
@@ -38,6 +40,7 @@ from ...test_modeling_common import (
     floats_tensor,
     ids_tensor,
 )
+from ..rwkv7.testing_utils import chunk_rwkv7, get_last_rwkv7_provider
 
 
 if is_torch_available():
@@ -244,6 +247,20 @@ class Qwen3_5TextModelTest(CausalLMModelTest, unittest.TestCase):
 
 @require_torch
 class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
+    def setUp(self):
+        import transformers.models.rwkv7.modeling_rwkv7 as modeling_rwkv7
+
+        environment = mock.patch.dict(os.environ, {"FLA_FLASH_RWKV": "1"})
+        public_contract = mock.patch.object(
+            modeling_rwkv7,
+            "_load_fla_rwkv7_contract",
+            return_value=(chunk_rwkv7, get_last_rwkv7_provider),
+        )
+        environment.start()
+        public_contract.start()
+        self.addCleanup(public_contract.stop)
+        self.addCleanup(environment.stop)
+
     def get_config(self, **overrides):
         config_kwargs = {
             "vocab_size": 97,
@@ -256,7 +273,6 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
             "max_position_embeddings": 64,
             "layer_types": ["full_attention", "rwkv7", "rwkv7"],
             "rwkv7_head_size": 128,
-            "rwkv7_backend": "reference",
             "rope_parameters": {
                 "rope_type": "default",
                 "rope_theta": 10000.0,
@@ -350,12 +366,6 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
         self.assertSetEqual(set(mixed_model.state_dict()), set(restored.state_dict()))
         torch.testing.assert_close(actual, expected)
 
-    def test_head_size_128_explicit_flash_request_fails_closed(self):
-        config = self.get_config(rwkv7_backend="flash_rwkv")
-        model = Qwen3_5TextModel(config).eval()
-        with self.assertRaisesRegex(RuntimeError, "Explicit FlashRWKV request failed closed"):
-            model(torch.randint(0, config.vocab_size, (1, 3)), use_cache=False)
-
     def test_invalid_rwkv7_geometry_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             self.get_config(rwkv7_head_size=96)
@@ -363,10 +373,9 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
             self.get_config(rwkv7_head_sizes=[128, 128])
         with self.assertRaisesRegex(ValueError, "layer 2"):
             self.get_config(rwkv7_head_sizes=[128, 128, 96])
-        with self.assertRaisesRegex(ValueError, "rwkv7_backend"):
-            self.get_config(rwkv7_backend="unknown")
         with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
             self.get_config(layer_types=["full_attention", "rwkv7"])
+        self.assertFalse(hasattr(self.get_config(), "rwkv7_backend"))
 
 
 class Qwen3_5VisionText2TextModelTester:

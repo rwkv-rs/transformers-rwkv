@@ -42,8 +42,6 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
         Default width of each RWKV-7 recurrent head in `"rwkv7"` layers.
     rwkv7_head_sizes (`list[int]`, *optional*):
         Per-layer RWKV-7 head sizes. When set, this list must contain one entry per decoder layer.
-    rwkv7_backend (`str`, *optional*, defaults to `"auto"`):
-        RWKV-7 recurrent backend used by `"rwkv7"` layers.
     use_rwkv7_layer_norm (`bool`, *optional*, defaults to `False`):
         Whether to use RWKV-style LayerNorm instead of Qwen3.5-MoE RMSNorm throughout the text decoder.
 
@@ -129,7 +127,6 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
     ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
     rwkv7_head_size: int = 64
     rwkv7_head_sizes: list[int] | None = None
-    rwkv7_backend: str = "auto"
     use_rwkv7_layer_norm: bool = False
 
     def __post_init__(self, **kwargs):
@@ -162,8 +159,6 @@ class Qwen3_5MoeTextConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`hidden_size` must be divisible by the positive RWKV-7 head size at layer {layer_idx}."
                     )
-            if self.rwkv7_backend not in {"auto", "reference", "flash_rwkv"}:
-                raise ValueError("`rwkv7_backend` must be 'auto', 'reference', or 'flash_rwkv'.")
 
 
 @auto_docstring(checkpoint="Qwen/Qwen3.5-35B-A3B")

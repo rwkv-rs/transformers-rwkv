@@ -27,7 +27,6 @@ _CONFIG_EXAMPLE = """
 The JSON object is forwarded to examples/pytorch/language-modeling/run_clm.py after removing:
 
   "rwkv7_validation": {
-    "expected_wkv_backend": "flash_rwkv",
     "checkpoint_resume_step": 100,
     "minimum_logged_steps": 2,
     "validation_input_ids": [1, 2, 3],
@@ -36,7 +35,7 @@ The JSON object is forwarded to examples/pytorch/language-modeling/run_clm.py af
     "dtype": "bfloat16"
   }
 
-Use an artifact whose config.json already requests the same explicit backend. Typical run_clm keys include
+The RWKV-7 model always requires the pinned public FLA FlashRWKV provider. Typical run_clm keys include
 model_name_or_path, train_file or dataset_name, output_dir, do_train=true, block_size,
 per_device_train_batch_size, learning_rate, max_steps, logging_strategy="steps", and logging_steps.
 """
@@ -107,17 +106,11 @@ def _validate_config(run_config: dict[str, Any], validation: dict[str, Any]) -> 
             "`logging_steps` is too large to produce the required `minimum_logged_steps` gradient evidence."
         )
 
-    expected_backend = validation.get("expected_wkv_backend")
-    if expected_backend not in {"reference", "flash_rwkv"}:
-        raise ValueError("`expected_wkv_backend` must explicitly select `reference` or `flash_rwkv`.")
     model_config = AutoConfig.from_pretrained(run_config["model_name_or_path"])
     if model_config.model_type != "rwkv7":
         raise ValueError(f"Expected an RWKV-7 artifact, got model_type={model_config.model_type!r}.")
-    if model_config.wkv_backend != expected_backend:
-        raise ValueError(
-            f"Artifact requests wkv_backend={model_config.wkv_backend!r}; expected {expected_backend!r}. "
-            "Convert or save the artifact with an explicit fail-closed backend."
-        )
+    if hasattr(model_config, "wkv_backend"):
+        raise ValueError("RWKV-7 artifacts must not serialize a selectable `wkv_backend` runtime escape.")
 
     input_ids = validation.get("validation_input_ids", [1, 2, 3])
     if not isinstance(input_ids, list) or not input_ids or not all(isinstance(token, int) for token in input_ids):
@@ -255,7 +248,6 @@ def _run(run_config: dict[str, Any], validation: dict[str, Any], explicit_resume
         max_new_tokens=validation["validation_max_new_tokens"],
         device=validation["device"],
         dtype=validation["dtype"],
-        expected_wkv_backend=validation["expected_wkv_backend"],
     )
     return {
         "artifact_validation": artifact,
