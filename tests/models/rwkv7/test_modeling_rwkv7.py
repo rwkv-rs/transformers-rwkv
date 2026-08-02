@@ -125,6 +125,17 @@ def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
+@pytest.mark.parametrize("backend", ["auto", "flash_rwkv"])
+def test_rwkv7_accelerated_backend_falls_back_on_cpu(backend) -> None:
+    config = _tiny_config()
+    config.wkv_backend = backend
+    model = Rwkv7ForCausalLM(config).eval()
+
+    model(torch.tensor([[1, 2, 3]]))
+
+    assert {block.att.last_wkv_backend for block in model.model.blocks} == {"reference"}
+
+
 def test_rwkv7_generate_updates_recurrent_state() -> None:
     torch.manual_seed(0)
     model = Rwkv7ForCausalLM(_tiny_config()).eval()

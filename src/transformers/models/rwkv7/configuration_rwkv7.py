@@ -35,7 +35,8 @@ class Rwkv7Config(PreTrainedConfig):
     embedding_layer_norm_fused (`bool`, *optional*, defaults to `False`):
         Whether the block-0 layer normalization has already been fused into the embedding table.
     wkv_backend (`str`, *optional*, defaults to `"auto"`):
-        WKV execution backend selected by the model implementation.
+        WKV execution backend selected by the model implementation. Supported values are `"auto"`, `"reference"`,
+        and `"flash_rwkv"`. Accelerated requests fall back to the reference implementation when unsupported.
     wkv_state_dtype (`str`, *optional*, defaults to `"float32"`):
         Dtype used to store the recurrent WKV matrix.
     """
@@ -94,8 +95,8 @@ class Rwkv7Config(PreTrainedConfig):
             raise ValueError("Layer and group normalization epsilon values must be positive.")
         if self.rescale_every < 0:
             raise ValueError(f"`rescale_every` must be non-negative, got {self.rescale_every}.")
-        if not self.wkv_backend:
-            raise ValueError("`wkv_backend` must be a non-empty string.")
+        if self.wkv_backend not in {"auto", "reference", "flash_rwkv"}:
+            raise ValueError("`wkv_backend` must be one of 'auto', 'reference', or 'flash_rwkv'.")
         if self.wkv_state_dtype != "float32":
             raise ValueError("RWKV-7 requires `wkv_state_dtype='float32'`.")
 

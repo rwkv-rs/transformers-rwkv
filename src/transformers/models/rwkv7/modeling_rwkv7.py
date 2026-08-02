@@ -57,11 +57,36 @@ def rwkv7_reference(
     return output, current_state
 
 
+def _rwkv7_flash(
+    receptance, raw_decay, key, value, a, b, state, head_size
+) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, str]:
+    """Run the optional FlashRWKV provider when its published capability contract accepts the call."""
+    try:
+        from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
+    except ImportError:
+        return None, "reference"
+
+    batch_size, sequence_length, hidden_size = receptance.shape
+    num_heads = hidden_size // head_size
+    tensors = [
+        tensor.view(batch_size, sequence_length, num_heads, head_size).contiguous()
+        for tensor in (receptance, raw_decay, key, value, a, b)
+    ]
+    tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
+    backend = FlashRWKVBackend()
+    accepted, _ = backend.chunk_rwkv7_verifier(*tensors, initial_state=state, output_final_state=True)
+    if not FlashRWKVBackend.is_available() or not accepted:
+        return None, "reference"
+    output, final_state = backend.chunk_rwkv7(*tensors, initial_state=state, output_final_state=True)
+    return (output.reshape(batch_size, sequence_length, hidden_size), final_state), "flash_rwkv"
+
+
 class Rwkv7TimeMix(nn.Module):
     def __init__(self, config: Rwkv7Config, layer_id: int):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+        self.last_wkv_backend = "reference"
         hidden_size = config.hidden_size
         decay_rank = max(32, round(2.5 * math.sqrt(hidden_size) / 32) * 32)
         value_rank = max(32, round(1.7 * math.sqrt(hidden_size) / 32) * 32)
@@ -120,7 +145,7 @@ class Rwkv7TimeMix(nn.Module):
             dim=-1,
         ).view(batch_size, sequence_length, hidden_size)
         key = key * (1 + (learning_rate - 1) * self.k_a)
-        output, wkv_state = rwkv7_reference(
+        wkv_inputs = (
             receptance,
             raw_decay,
             key,
@@ -130,6 +155,14 @@ class Rwkv7TimeMix(nn.Module):
             wkv_state,
             self.config.head_size,
         )
+        accelerated = None
+        if self.config.wkv_backend != "reference":
+            accelerated, self.last_wkv_backend = _rwkv7_flash(*wkv_inputs)
+        if accelerated is None:
+            output, wkv_state = rwkv7_reference(*wkv_inputs)
+            self.last_wkv_backend = "reference"
+        else:
+            output, wkv_state = accelerated
         output = self.ln_x(output.flatten(0, 1)).view_as(output)
         local = (
             (
