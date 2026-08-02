@@ -73,7 +73,8 @@ ALLOWED_ATTN_LAYER_TYPES = (
     "hybrid_sliding",  # layers that combine sliding attention + linear-attention-shaped states (zaya1)
     "deepseek_sparse_attention",  # for models with DSA indexer (GLM MoE DSA, DeepSeek V32)
     # Recurrent layers (mamba / mamba2 / GDN / minimax-lightning)
-    "linear_attention",
+            "linear_attention",
+            "rwkv7",
 )
 
 ALLOWED_MLP_LAYER_TYPES = (
