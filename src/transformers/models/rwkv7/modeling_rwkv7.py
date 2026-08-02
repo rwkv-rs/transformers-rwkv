@@ -141,6 +141,8 @@ def _editable_git_value(source_dir: Path, *arguments: str) -> str:
 def _canonical_github_repository(url: str) -> str | None:
     """Return one strict ASCII identity for an HTTPS GitHub repository URL."""
     candidate = url.removeprefix("git+")
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in candidate):
+        return None
     try:
         candidate.encode("ascii")
     except UnicodeEncodeError:
