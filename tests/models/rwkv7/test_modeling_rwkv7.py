@@ -1,6 +1,7 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import pytest
 import torch
 
 from transformers import AutoModel, AutoModelForCausalLM
@@ -33,9 +34,39 @@ def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
 
     assert output.logits.shape == (1, 4, 31)
     assert model.head.weight.grad is not None
-    prefix = model(input_ids[:, :3])
+    prefix = model(input_ids[:, :3], use_cache=True)
     resumed = model(input_ids[:, 3:], state=prefix.state)
     torch.testing.assert_close(resumed.logits[:, -1], output.logits[:, -1])
+
+
+def test_rwkv7_all_ones_attention_mask_matches_unmasked_input() -> None:
+    torch.manual_seed(0)
+    model = Rwkv7ForCausalLM(_tiny_config()).eval()
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    unmasked = model(input_ids)
+    masked = model(input_ids, attention_mask=torch.ones_like(input_ids))
+
+    torch.testing.assert_close(masked.logits, unmasked.logits)
+    for masked_state, unmasked_state in zip(masked.state, unmasked.state, strict=True):
+        torch.testing.assert_close(masked_state, unmasked_state)
+
+
+def test_rwkv7_rejects_attention_mask_with_padding() -> None:
+    model = Rwkv7ForCausalLM(_tiny_config()).eval()
+    input_ids = torch.tensor([[1, 2, 0]])
+
+    with pytest.raises(ValueError, match="does not yet support padding"):
+        model(input_ids, attention_mask=torch.tensor([[1, 1, 0]]))
+
+
+def test_rwkv7_cache_default_depends_on_training_mode() -> None:
+    model = Rwkv7ForCausalLM(_tiny_config())
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    assert model(input_ids).state is None
+    model.eval()
+    assert model(input_ids).state is not None
 
 
 def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:

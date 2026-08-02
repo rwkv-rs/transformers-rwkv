@@ -256,9 +256,22 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             torch.zeros(layers, batch_size, hidden, dtype=dtype, device=device),
         )
 
-    def forward(self, input_ids=None, inputs_embeds=None, state=None, use_cache=None, return_dict=None, **kwargs):
+    def forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        state=None,
+        use_cache=None,
+        return_dict=None,
+        **kwargs,
+    ):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
+        if attention_mask is not None and not torch.all(attention_mask == 1):
+            raise ValueError(
+                "Rwkv7Model does not yet support padding in attention_mask; pass an all-ones mask or unpadded input."
+            )
         hidden_states = self.embeddings(input_ids) if inputs_embeds is None else inputs_embeds
         if state is None:
             state = self._init_state(hidden_states.shape[0], hidden_states.dtype, hidden_states.device)
@@ -274,7 +287,7 @@ class Rwkv7Model(Rwkv7PreTrainedModel):
             next_wkv.append(wkv_state)
             next_ffn.append(ffn_shift)
         hidden_states = self.ln_out(hidden_states)
-        use_cache = self.config.use_cache if use_cache is None else use_cache
+        use_cache = self.config.use_cache and not self.training if use_cache is None else use_cache
         next_state = None
         if use_cache:
             next_state = (
@@ -306,11 +319,16 @@ class Rwkv7ForCausalLM(Rwkv7PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, value):
         self.head = value
 
-    def prepare_inputs_for_generation(self, input_ids, state=None, use_cache=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, state=None, use_cache=None, **kwargs):
         use_cache = self.config.use_cache if use_cache is None else use_cache
         if state is not None:
             input_ids = input_ids[:, -1:]
-        return {"input_ids": input_ids, "state": state, "use_cache": use_cache}
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "state": state,
+            "use_cache": use_cache,
+        }
 
     def _update_model_kwargs_for_generation(
         self,
