@@ -763,15 +763,21 @@ class Qwen3_5Rwkv7Attention(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        head_size = (
+            config.rwkv7_head_sizes[layer_idx] if config.rwkv7_head_sizes is not None else config.rwkv7_head_size
+        )
+        intermediate_size = getattr(config, "intermediate_size", None)
+        if intermediate_size is None:
+            intermediate_size = config.moe_intermediate_size
         rwkv_layer_idx = sum(layer_type == "rwkv7" for layer_type in config.layer_types[: layer_idx + 1]) - 1
         rwkv_config = configuration_rwkv7.Rwkv7Config(
             vocab_size=config.vocab_size,
             context_length=config.max_position_embeddings,
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=intermediate_size,
             num_hidden_layers=sum(layer_type == "rwkv7" for layer_type in config.layer_types),
-            head_size=config.rwkv7_head_size,
-            num_attention_heads=config.hidden_size // config.rwkv7_head_size,
+            head_size=head_size,
+            num_attention_heads=config.hidden_size // head_size,
             wkv_backend=config.rwkv7_backend,
         )
         self.time_mix = modeling_rwkv7.Rwkv7TimeMix(rwkv_config, rwkv_layer_idx)
@@ -828,8 +834,9 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         elif self.block_type == "rwkv7":
             self.rwkv_attn = Qwen3_5Rwkv7Attention(config, layer_idx)
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm_class = nn.LayerNorm if config.use_rwkv7_layer_norm else Qwen3_5RMSNorm
+        self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1230,6 +1237,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        if config.use_rwkv7_layer_norm:
+            self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Initialize weights and apply final processing
         self.post_init()
 

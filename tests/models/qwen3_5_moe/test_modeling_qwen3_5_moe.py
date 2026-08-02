@@ -40,10 +40,12 @@ from ...test_modeling_common import (
 
 if is_torch_available():
     import torch
+    from torch import nn
 
     from transformers import (
         AutoModelForCausalLM,
         AutoModelForImageTextToText,
+        DynamicCache,
         Qwen3_5MoeConfig,
         Qwen3_5MoeForCausalLM,
         Qwen3_5MoeForConditionalGeneration,
@@ -51,6 +53,7 @@ if is_torch_available():
         Qwen3_5MoeTextConfig,
         Qwen3_5MoeTextModel,
     )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 
 
 class Qwen3_5MoeTextModelTester(CausalLMModelTester):
@@ -191,6 +194,77 @@ class Qwen3_5MoeTextModelTest(CausalLMModelTest, unittest.TestCase):
             logits_padfree = res_padfree.logits[0]
 
             torch.testing.assert_close(logits_padded, logits_padfree, atol=1e-5, rtol=1e-5)
+
+
+@require_torch
+class Qwen3_5MoeRwkv7CompositionTest(unittest.TestCase):
+    def test_invalid_per_layer_rwkv7_contract_fails_closed(self):
+        from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import tiny_config
+
+        config_values = tiny_config().to_dict()
+        config_values["layer_types"] = ["rwkv7"] * 3
+        with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
+            Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_head_sizes": [128, 256]})
+        with self.assertRaisesRegex(ValueError, "layer 2"):
+            Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_head_sizes": [128, 256, 96]})
+        with self.assertRaisesRegex(ValueError, "rwkv7_backend"):
+            Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_backend": "unknown"})
+
+    def test_public_example_preserves_qwen_moe_and_standard_hf_workflows(self):
+        from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import compose_qwen3_5_rwkv7, tiny_config
+
+        def qwen_component_parameter_shapes(candidate):
+            return {
+                name: parameter.shape
+                for name, parameter in candidate.named_parameters()
+                if name.startswith(("model.embed_tokens.", "lm_head."))
+                or (name.startswith("model.layers.") and ".mlp." in name)
+            }
+
+        torch.manual_seed(0)
+        qwen_model = Qwen3_5MoeForCausalLM(tiny_config())
+        qwen_parameter_shapes = qwen_component_parameter_shapes(qwen_model)
+        model = compose_qwen3_5_rwkv7(tiny_config())
+        composed_parameter_shapes = qwen_component_parameter_shapes(model)
+        input_ids = torch.tensor([[1, 5, 8, 13]])
+        output = model(input_ids, labels=input_ids, use_cache=False)
+        output.loss.backward()
+
+        self.assertEqual(model.config.layer_types, ["rwkv7", "rwkv7", "rwkv7"])
+        self.assertEqual(model.config.rwkv7_head_sizes, [128, 256, 128])
+        self.assertTrue(model.config.use_rwkv7_layer_norm)
+        self.assertEqual([layer.rwkv_attn.time_mix.config.head_size for layer in model.model.layers], [128, 256, 128])
+        self.assertTrue(all(isinstance(layer.input_layernorm, nn.LayerNorm) for layer in model.model.layers))
+        self.assertTrue(all(isinstance(layer.post_attention_layernorm, nn.LayerNorm) for layer in model.model.layers))
+        self.assertIsInstance(model.model.norm, nn.LayerNorm)
+        self.assertIsInstance(model.model.embed_tokens, nn.Embedding)
+        self.assertIsInstance(model.lm_head, nn.Linear)
+        self.assertTrue(all(isinstance(layer.mlp, Qwen3_5MoeSparseMoeBlock) for layer in model.model.layers))
+        self.assertDictEqual(composed_parameter_shapes, qwen_parameter_shapes)
+        self.assertIsNotNone(model.model.embed_tokens.weight.grad)
+        self.assertIsNotNone(model.model.layers[0].rwkv_attn.time_mix.g2.grad)
+        self.assertIsNotNone(model.model.layers[0].mlp.gate.weight.grad)
+        self.assertIsNotNone(model.model.layers[0].mlp.experts.gate_up_proj.grad)
+        self.assertIsNotNone(model.lm_head.weight.grad)
+        cache = DynamicCache(config=model.config)
+        model(input_ids[:, :3], past_key_values=cache, use_cache=True)
+        self.assertEqual(cache.get_seq_length(), 3)
+        model(input_ids[:, 3:], past_key_values=cache, use_cache=True)
+        self.assertEqual(cache.get_seq_length(), 4)
+        generated = model.generate(input_ids[:, :2], max_new_tokens=2)
+        self.assertEqual(generated.shape, (1, 4))
+        beam_generated = model.generate(input_ids[:, :2], max_new_tokens=2, num_beams=2)
+        self.assertEqual(beam_generated.shape, (1, 4))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+            restored = AutoModelForCausalLM.from_pretrained(tmp_dir)
+            actual = restored(input_ids, use_cache=False).logits
+        expected = model(input_ids, use_cache=False).logits
+
+        self.assertIsInstance(restored, Qwen3_5MoeForCausalLM)
+        self.assertSetEqual(set(model.state_dict()), set(restored.state_dict()))
+        torch.testing.assert_close(actual, expected)
 
 
 class Qwen3_5MoeVisionText2TextModelTester:

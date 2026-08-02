@@ -359,44 +359,14 @@ class Qwen3_5Rwkv7AdapterTest(unittest.TestCase):
     def test_invalid_rwkv7_geometry_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             self.get_config(rwkv7_head_size=96)
+        with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
+            self.get_config(rwkv7_head_sizes=[128, 128])
+        with self.assertRaisesRegex(ValueError, "layer 2"):
+            self.get_config(rwkv7_head_sizes=[128, 128, 96])
         with self.assertRaisesRegex(ValueError, "rwkv7_backend"):
             self.get_config(rwkv7_backend="unknown")
         with self.assertRaisesRegex(ValueError, "num_hidden_layers"):
             self.get_config(layer_types=["full_attention", "rwkv7"])
-
-    def test_public_composition_example_forward_backward_generate_and_reload(self):
-        from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import (
-            compose_qwen3_5_rwkv7,
-            tiny_config,
-        )
-
-        model = compose_qwen3_5_rwkv7(
-            tiny_config(),
-            lambda index, _layer_type: index in {0, 2},
-        )
-        input_ids = torch.tensor([[1, 5, 8, 13]])
-        output = model(input_ids, labels=input_ids, use_cache=False)
-        output.loss.backward()
-
-        self.assertEqual(model.config.layer_types, ["rwkv7", "full_attention", "rwkv7"])
-        self.assertIsNotNone(model.model.embed_tokens.weight.grad)
-        self.assertIsNotNone(model.model.layers[0].rwkv_attn.time_mix.g2.grad)
-        self.assertIsNotNone(model.model.layers[1].self_attn.q_proj.weight.grad)
-        self.assertIsNotNone(model.model.layers[0].mlp.gate_proj.weight.grad)
-        self.assertIsNotNone(model.lm_head.weight.grad)
-        generated = model.generate(input_ids[:, :2], max_new_tokens=2)
-        self.assertEqual(generated.shape, (1, 4))
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_pretrained(tmp_dir)
-            restored = AutoModelForCausalLM.from_pretrained(tmp_dir)
-            actual = restored(input_ids, use_cache=False).logits
-        expected = model(input_ids, use_cache=False).logits
-
-        self.assertIsInstance(restored, Qwen3_5ForCausalLM)
-        self.assertEqual(restored.config.layer_types, model.config.layer_types)
-        torch.testing.assert_close(actual, expected)
-
 
 class Qwen3_5VisionText2TextModelTester:
     def __init__(

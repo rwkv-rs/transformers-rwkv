@@ -82,8 +82,13 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         Number of value heads used in linear attention layers.
     rwkv7_head_size (`int`, *optional*, defaults to 64):
         Width of each RWKV-7 recurrent head in `"rwkv7"` layers.
+    rwkv7_head_sizes (`list[int]`, *optional*):
+        Per-layer RWKV-7 head sizes. When set, this list must contain one entry per decoder layer and overrides
+        `rwkv7_head_size` for `"rwkv7"` layers.
     rwkv7_backend (`str`, *optional*, defaults to `"auto"`):
         RWKV-7 recurrent backend used by `"rwkv7"` layers.
+    use_rwkv7_layer_norm (`bool`, *optional*, defaults to `False`):
+        Whether to use RWKV-style LayerNorm instead of Qwen3.5 RMSNorm throughout the text decoder.
 
     ```python
     >>> from transformers import Qwen3_5TextModel, Qwen3_5TextConfig
@@ -127,7 +132,9 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
     num_hidden_layers: int = 32
     num_key_value_heads: int = 4
     rwkv7_head_size: int = 64
+    rwkv7_head_sizes: list[int] | None = None
     rwkv7_backend: str = "auto"
+    use_rwkv7_layer_norm: bool = False
 
     decoder_sparse_step = AttributeError()
     norm_topk_prob = AttributeError()
@@ -147,9 +154,19 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         invalid_layer_types = set(self.layer_types) - {"full_attention", "linear_attention", "rwkv7"}
         if invalid_layer_types:
             raise ValueError(f"Unsupported Qwen3.5 layer types: {sorted(invalid_layer_types)}.")
+        if self.rwkv7_head_sizes is not None and len(self.rwkv7_head_sizes) != self.num_hidden_layers:
+            raise ValueError("`rwkv7_head_sizes` must contain exactly `num_hidden_layers` entries.")
         if "rwkv7" in self.layer_types:
-            if self.rwkv7_head_size <= 0 or self.hidden_size % self.rwkv7_head_size:
-                raise ValueError("`hidden_size` must be divisible by a positive `rwkv7_head_size`.")
+            for layer_idx, layer_type in enumerate(self.layer_types):
+                if layer_type != "rwkv7":
+                    continue
+                head_size = (
+                    self.rwkv7_head_sizes[layer_idx] if self.rwkv7_head_sizes is not None else self.rwkv7_head_size
+                )
+                if head_size <= 0 or self.hidden_size % head_size:
+                    raise ValueError(
+                        f"`hidden_size` must be divisible by the positive RWKV-7 head size at layer {layer_idx}."
+                    )
             if self.rwkv7_backend not in {"auto", "reference", "flash_rwkv"}:
                 raise ValueError("`rwkv7_backend` must be 'auto', 'reference', or 'flash_rwkv'.")
 
@@ -365,15 +382,19 @@ class Qwen3_5Rwkv7Attention(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        head_size = config.rwkv7_head_sizes[layer_idx] if config.rwkv7_head_sizes is not None else config.rwkv7_head_size
+        intermediate_size = getattr(config, "intermediate_size", None)
+        if intermediate_size is None:
+            intermediate_size = config.moe_intermediate_size
         rwkv_layer_idx = sum(layer_type == "rwkv7" for layer_type in config.layer_types[: layer_idx + 1]) - 1
         rwkv_config = configuration_rwkv7.Rwkv7Config(
             vocab_size=config.vocab_size,
             context_length=config.max_position_embeddings,
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=intermediate_size,
             num_hidden_layers=sum(layer_type == "rwkv7" for layer_type in config.layer_types),
-            head_size=config.rwkv7_head_size,
-            num_attention_heads=config.hidden_size // config.rwkv7_head_size,
+            head_size=head_size,
+            num_attention_heads=config.hidden_size // head_size,
             wkv_backend=config.rwkv7_backend,
         )
         self.time_mix = modeling_rwkv7.Rwkv7TimeMix(rwkv_config, rwkv_layer_idx)
@@ -430,8 +451,9 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         elif self.block_type == "rwkv7":
             self.rwkv_attn = Qwen3_5Rwkv7Attention(config, layer_idx)
         self.mlp = Qwen3_5MLP(config, config.intermediate_size)
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm_class = nn.LayerNorm if config.use_rwkv7_layer_norm else Qwen3_5RMSNorm
+        self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -579,6 +601,8 @@ class Qwen3_5TextModel(Qwen3NextModel):
 
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__(config)
+        if config.use_rwkv7_layer_norm:
+            self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
 
     def forward(
