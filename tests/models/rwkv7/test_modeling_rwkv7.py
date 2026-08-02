@@ -530,14 +530,14 @@ def test_rwkv7_runtime_provenance_is_fork_pinned_in_fresh_process() -> None:
             "0.5.2",
             "fla",
             "https://github.com/rwkv-rs/fla-rwkv",
-            "88e8ff9d29dcebadb89ebad62ee76951729ea0df",
+            "f1888c9a81cb24bfa46d84dc9ab38c4abd746225",
         ),
         "flash-rwkv": PinnedVcsDistribution(
             "flash-rwkv",
             "0.1.0",
             "flash_rwkv",
             "https://github.com/rwkv-rs/flashrwkv",
-            "c637985558c398de1db6a3c0523b1eec206a88d4",
+            "9fe104c8c748771ba981058a6efcd95c150e453d",
         ),
     }
     original_distribution = modeling_rwkv7.importlib_metadata.distribution
@@ -555,11 +555,11 @@ def test_rwkv7_runtime_provenance_is_fork_pinned_in_fresh_process() -> None:
         "flash_rwkv_distribution": "flash-rwkv",
         "flash_rwkv_distribution_version": "0.1.0",
         "flash_rwkv_repository": "https://github.com/rwkv-rs/FlashRWKV.git",
-        "flash_rwkv_revision": "c637985558c398de1db6a3c0523b1eec206a88d4",
+        "flash_rwkv_revision": "9fe104c8c748771ba981058a6efcd95c150e453d",
         "flash_rwkv_source_kind": "vcs",
         "repository": "https://github.com/rwkv-rs/fla-rwkv.git",
-        "requirement": "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@88e8ff9d29dcebadb89ebad62ee76951729ea0df",
-        "revision": "88e8ff9d29dcebadb89ebad62ee76951729ea0df",
+        "requirement": "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@f1888c9a81cb24bfa46d84dc9ab38c4abd746225",
+        "revision": "f1888c9a81cb24bfa46d84dc9ab38c4abd746225",
         "source_kind": "vcs",
     }
 
