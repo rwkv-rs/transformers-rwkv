@@ -36,7 +36,8 @@ class Rwkv7Config(PreTrainedConfig):
         Whether the block-0 layer normalization has already been fused into the embedding table.
     wkv_backend (`str`, *optional*, defaults to `"auto"`):
         WKV execution backend selected by the model implementation. Supported values are `"auto"`, `"reference"`,
-        and `"flash_rwkv"`. Accelerated requests fall back to the reference implementation when unsupported.
+        and `"flash_rwkv"`. `"auto"` falls back to the reference implementation when unsupported; an explicit
+        `"flash_rwkv"` request fails closed.
     wkv_state_dtype (`str`, *optional*, defaults to `"float32"`):
         Dtype used to store the recurrent WKV matrix.
     """
