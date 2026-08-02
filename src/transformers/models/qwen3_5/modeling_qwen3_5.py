@@ -778,7 +778,6 @@ class Qwen3_5Rwkv7Attention(nn.Module):
             num_hidden_layers=sum(layer_type == "rwkv7" for layer_type in config.layer_types),
             head_size=head_size,
             num_attention_heads=config.hidden_size // head_size,
-            wkv_backend=config.rwkv7_backend,
         )
         self.time_mix = modeling_rwkv7.Rwkv7TimeMix(rwkv_config, rwkv_layer_idx)
 

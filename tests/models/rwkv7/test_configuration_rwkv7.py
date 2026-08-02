@@ -56,7 +56,6 @@ class Rwkv7ConfigTest(unittest.TestCase):
             hidden_size=64,
             num_hidden_layers=3,
             head_size=8,
-            wkv_backend="reference",
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -72,7 +71,6 @@ class Rwkv7ConfigTest(unittest.TestCase):
             "num_hidden_layers",
             "head_size",
             "num_attention_heads",
-            "wkv_backend",
             "wkv_state_dtype",
         ):
             self.assertEqual(getattr(reloaded, field), getattr(config, field))

@@ -99,7 +99,7 @@ def rwkv7_reference(
     state: torch.Tensor,
     head_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Differentiable token-by-token RWKV-7 recurrence."""
+    """Numerical RWKV-7 oracle for tests; standard model execution never calls this helper."""
     batch_size, sequence_length, hidden_size = receptance.shape
     num_heads = hidden_size // head_size
     output_dtype = value.dtype
@@ -264,16 +264,12 @@ def _rwkv7_flash(
     b,
     state,
     head_size,
-    *,
-    explicit=False,
-) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, str]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run FlashRWKV exclusively through FLA's public stateful dispatch contract."""
-    if not explicit and os.environ.get("FLA_FLASH_RWKV") != "1":
-        return None, "FLA FlashRWKV provider is not enabled"
     try:
         chunk_rwkv7, get_last_provider = _load_fla_rwkv7_contract()
-    except ImportError as error:
-        return None, f"FLA RWKV-7 public API import failed: {error}"
+    except (ImportError, RuntimeError) as error:
+        raise RuntimeError(f"RWKV-7 requires the pinned public FLA FlashRWKV contract: {error}") from error
 
     batch_size, sequence_length, hidden_size = receptance.shape
     num_heads = hidden_size // head_size
@@ -329,7 +325,7 @@ def _rwkv7_flash(
         raise RuntimeError("FLA public chunk_rwkv7 returned an incompatible final state.")
     if state_indices is not None and final_state is not state_pool:
         raise RuntimeError("FLA packed FlashRWKV must update the supplied state pool in place.")
-    return (output.reshape(batch_size, sequence_length, hidden_size), final_state), "flash_rwkv"
+    return output.reshape(batch_size, sequence_length, hidden_size), final_state
 
 
 class Rwkv7TimeMix(nn.Module):
@@ -337,7 +333,7 @@ class Rwkv7TimeMix(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
-        self.last_wkv_backend = "reference"
+        self.last_wkv_backend = "uninitialized"
         hidden_size = config.hidden_size
         decay_rank = max(32, round(2.5 * math.sqrt(hidden_size) / 32) * 32)
         value_rank = max(32, round(1.7 * math.sqrt(hidden_size) / 32) * 32)
@@ -414,24 +410,11 @@ class Rwkv7TimeMix(nn.Module):
             wkv_state,
             self.config.head_size,
         )
-        accelerated = None
-        if self.config.wkv_backend != "reference":
-            try:
-                accelerated, self.last_wkv_backend = _rwkv7_flash(
-                    *wkv_inputs,
-                    explicit=self.config.wkv_backend == "flash_rwkv",
-                )
-            except RuntimeError as error:
-                if self.config.wkv_backend == "flash_rwkv":
-                    raise RuntimeError(f"Explicit FlashRWKV request failed closed: {error}") from error
-                raise
-        if accelerated is None:
-            if self.config.wkv_backend == "flash_rwkv":
-                raise RuntimeError(f"Explicit FlashRWKV request failed closed: {self.last_wkv_backend}")
-            output, wkv_state = rwkv7_reference(*wkv_inputs)
-            self.last_wkv_backend = "reference"
-        else:
-            output, wkv_state = accelerated
+        try:
+            output, wkv_state = _rwkv7_flash(*wkv_inputs)
+        except RuntimeError as error:
+            raise RuntimeError(f"RWKV-7 FlashRWKV execution failed closed: {error}") from error
+        self.last_wkv_backend = "flash_rwkv"
         output = self.ln_x(output.flatten(0, 1)).view_as(output)
         local = (
             (
@@ -674,6 +657,5 @@ __all__ = [
     "Rwkv7Model",
     "Rwkv7Output",
     "Rwkv7PreTrainedModel",
-    "rwkv7_reference",
     "validate_rwkv7_runtime_provenance",
 ]

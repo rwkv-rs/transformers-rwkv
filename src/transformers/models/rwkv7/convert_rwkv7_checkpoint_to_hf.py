@@ -42,7 +42,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
-artifact_dir, encoded_input_ids, encoded_max_new_tokens, encoded_device, encoded_dtype, expected_backend = sys.argv[1:]
+artifact_dir, encoded_input_ids, encoded_max_new_tokens, encoded_device, encoded_dtype = sys.argv[1:]
 artifact_path = Path(artifact_dir)
 config_payload = json.loads((artifact_path / "config.json").read_text(encoding="utf-8"))
 tokenizer_payload = json.loads((artifact_path / "tokenizer_config.json").read_text(encoding="utf-8"))
@@ -126,10 +126,8 @@ for first_state, second_state in zip(first_continuation.state, second_continuati
     torch.testing.assert_close(second_state, first_state)
 
 observed_backends = sorted({block.att.last_wkv_backend for block in model.model.blocks})
-if expected_backend and observed_backends != [expected_backend]:
-    raise RuntimeError(
-        f"RWKV-7 artifact requested backend {expected_backend!r} but observed {observed_backends!r}."
-    )
+if observed_backends != ["flash_rwkv"]:
+    raise RuntimeError(f"RWKV-7 artifact must execute with FlashRWKV, observed {observed_backends!r}.")
 result = {
     "architecture": type(model).__name__,
     "config_class": type(config).__name__,
@@ -143,7 +141,6 @@ result = {
     "no_auto_map": True,
     "observed_wkv_backends": observed_backends,
     "recurrent_continuation": True,
-    "requested_wkv_backend": model.config.wkv_backend,
     "strict_load": True,
     "token_zero_semantics": special_ids,
     "tokenizer_class": type(tokenizer).__name__,
@@ -223,7 +220,6 @@ def validate_rwkv7_artifact_in_subprocess(
     max_new_tokens: int = 4,
     device: str = "cpu",
     dtype: str = "auto",
-    expected_wkv_backend: str | None = None,
 ) -> dict:
     """Strict-load and deterministically generate on the selected device in a fresh Python process."""
     if len(input_ids) < 2:
@@ -234,8 +230,6 @@ def validate_rwkv7_artifact_in_subprocess(
         raise ValueError("Artifact validation requires a non-empty `device`.")
     if dtype != "auto" and dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"Unsupported validation dtype `{dtype}`. Choose from auto or {sorted(_SUPPORTED_DTYPES)}.")
-    if expected_wkv_backend not in {None, "reference", "flash_rwkv"}:
-        raise ValueError("Expected WKV backend must be `reference`, `flash_rwkv`, or omitted.")
     command = [
         sys.executable,
         "-c",
@@ -245,7 +239,6 @@ def validate_rwkv7_artifact_in_subprocess(
         str(max_new_tokens),
         device,
         dtype,
-        expected_wkv_backend or "",
     ]
     try:
         completed = subprocess.run(command, check=True, capture_output=True, text=True)
@@ -432,7 +425,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
     max_shard_size: str = "5GB",
     tokenizer_name_or_path: str | None = None,
     source_revision: str | None = None,
-    wkv_backend: str = "auto",
+    validation_device: str = "cuda",
     publication_ready: bool = False,
     model_card_path: str | None = None,
     license_path: str | None = None,
@@ -450,8 +443,8 @@ def convert_rwkv7_checkpoint_to_hf_format(
     source_revision = source_revision.lower()
     if dtype is not None and dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"Unsupported dtype `{dtype}`. Choose from {sorted(_SUPPORTED_DTYPES)} or preserve it.")
-    if wkv_backend not in {"auto", "reference", "flash_rwkv"}:
-        raise ValueError("`wkv_backend` must be `auto`, `reference`, or `flash_rwkv`.")
+    if not validation_device:
+        raise ValueError("RWKV-7 conversion requires a non-empty validation device.")
     if publication_ready and (tokenizer_name_or_path is None or model_card_path is None or license_path is None):
         raise ValueError(
             "Publication-ready conversion requires tokenizer_name_or_path, model_card_path, and license_path."
@@ -463,7 +456,6 @@ def convert_rwkv7_checkpoint_to_hf_format(
         checkpoint_path,
         embedding_layer_norm_fused=fuse_embedding_layer_norm,
     )
-    config.wkv_backend = wkv_backend
     config.bos_token_id = 0
     config.eos_token_id = 0
     config.pad_token_id = 0
@@ -515,7 +507,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
             "source_revision": source_revision,
             "tokenizer_files": tokenizer_files,
             "tokenizer_source": Path(tokenizer_name_or_path).name,
-            "wkv_backend": wkv_backend,
+            "wkv_provider": "flash_rwkv",
         }
 
     (output_path / "rwkv7_conversion.json").write_text(
@@ -526,9 +518,8 @@ def convert_rwkv7_checkpoint_to_hf_format(
         output_path,
         input_ids=validation_input_ids,
         max_new_tokens=validation_max_new_tokens,
-        device="cuda" if wkv_backend == "flash_rwkv" else "cpu",
+        device=validation_device,
         dtype=dtype or "auto",
-        expected_wkv_backend=None if wkv_backend == "auto" else wkv_backend,
     )
     validation["artifact_files"] = sorted(
         [path.name for path in output_path.iterdir() if path.is_file()] + ["rwkv7_validation.json"]
@@ -561,7 +552,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max_shard_size", default="5GB")
     parser.add_argument("--tokenizer_name_or_path", required=True)
     parser.add_argument("--source_revision", required=True)
-    parser.add_argument("--wkv_backend", choices=("auto", "reference", "flash_rwkv"), default="auto")
+    parser.add_argument("--validation_device", default="cuda")
     parser.add_argument("--publication_ready", action="store_true")
     parser.add_argument("--model_card_path")
     parser.add_argument("--license_path")
@@ -579,7 +570,7 @@ def main(argv: list[str] | None = None) -> None:
         max_shard_size=args.max_shard_size,
         tokenizer_name_or_path=args.tokenizer_name_or_path,
         source_revision=args.source_revision,
-        wkv_backend=args.wkv_backend,
+        validation_device=args.validation_device,
         publication_ready=args.publication_ready,
         model_card_path=args.model_card_path,
         license_path=args.license_path,

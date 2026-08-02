@@ -45,7 +45,6 @@ def tiny_config() -> Qwen3_5MoeTextConfig:
         num_experts_per_tok=2,
         max_position_embeddings=32,
         layer_types=["linear_attention", "full_attention", "linear_attention"],
-        rwkv7_backend="reference",
         bos_token_id=1,
         eos_token_id=2,
         pad_token_id=0,

@@ -14,8 +14,10 @@
 """Testing suite for the PyTorch Qwen3.5 model."""
 
 import copy
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 from parameterized import parameterized
 
@@ -36,6 +38,7 @@ from ...test_modeling_common import (
     floats_tensor,
     ids_tensor,
 )
+from ..rwkv7.testing_utils import chunk_rwkv7, get_last_rwkv7_provider
 
 
 if is_torch_available():
@@ -198,6 +201,20 @@ class Qwen3_5MoeTextModelTest(CausalLMModelTest, unittest.TestCase):
 
 @require_torch
 class Qwen3_5MoeRwkv7CompositionTest(unittest.TestCase):
+    def setUp(self):
+        import transformers.models.rwkv7.modeling_rwkv7 as modeling_rwkv7
+
+        environment = mock.patch.dict(os.environ, {"FLA_FLASH_RWKV": "1"})
+        public_contract = mock.patch.object(
+            modeling_rwkv7,
+            "_load_fla_rwkv7_contract",
+            return_value=(chunk_rwkv7, get_last_rwkv7_provider),
+        )
+        environment.start()
+        public_contract.start()
+        self.addCleanup(public_contract.stop)
+        self.addCleanup(environment.stop)
+
     def test_invalid_per_layer_rwkv7_contract_fails_closed(self):
         from examples.pytorch.rwkv7.qwen3_5_rwkv7_composition import compose_qwen3_5_rwkv7, tiny_config
 
@@ -207,8 +224,7 @@ class Qwen3_5MoeRwkv7CompositionTest(unittest.TestCase):
             Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_head_sizes": [128, 256]})
         with self.assertRaisesRegex(ValueError, "layer 2"):
             Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_head_sizes": [128, 256, 96]})
-        with self.assertRaisesRegex(ValueError, "rwkv7_backend"):
-            Qwen3_5MoeTextConfig.from_dict(config_values | {"rwkv7_backend": "unknown"})
+        self.assertFalse(hasattr(Qwen3_5MoeTextConfig.from_dict(config_values), "rwkv7_backend"))
 
         mixed_model = compose_qwen3_5_rwkv7(tiny_config(), lambda index, _kind: index != 1)
         self.assertEqual(mixed_model.config.layer_types, ["rwkv7", "full_attention", "rwkv7"])

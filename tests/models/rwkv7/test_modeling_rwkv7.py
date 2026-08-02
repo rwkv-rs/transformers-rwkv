@@ -4,7 +4,9 @@
 import importlib
 import inspect
 import json
+import os
 import unittest
+from unittest import mock
 
 import pytest
 import torch
@@ -23,6 +25,17 @@ from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_N
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
+from .testing_utils import chunk_rwkv7, get_last_rwkv7_provider
+
+
+@pytest.fixture
+def synthetic_fla_public_contract(monkeypatch):
+    monkeypatch.setenv("FLA_FLASH_RWKV", "1")
+    monkeypatch.setattr(
+        modeling_rwkv7,
+        "_load_fla_rwkv7_contract",
+        lambda: (chunk_rwkv7, get_last_rwkv7_provider),
+    )
 
 
 class Rwkv7ModelTester(CausalLMModelTester):
@@ -42,7 +55,6 @@ class Rwkv7ModelTester(CausalLMModelTester):
             num_attention_heads=4,
             max_position_embeddings=16,
             head_size=4,
-            wkv_backend="reference",
             bos_token_id=0,
             eos_token_id=0,
             pad_token_id=0,
@@ -54,6 +66,19 @@ class Rwkv7ModelTest(CausalLMModelTest, unittest.TestCase):
     model_tester_class = Rwkv7ModelTester
     _is_stateful = True
 
+    def setUp(self):
+        super().setUp()
+        environment = mock.patch.dict(os.environ, {"FLA_FLASH_RWKV": "1"})
+        public_contract = mock.patch.object(
+            modeling_rwkv7,
+            "_load_fla_rwkv7_contract",
+            return_value=(chunk_rwkv7, get_last_rwkv7_provider),
+        )
+        environment.start()
+        public_contract.start()
+        self.addCleanup(public_contract.stop)
+        self.addCleanup(environment.stop)
+
 
 def _tiny_config() -> Rwkv7Config:
     return Rwkv7Config(
@@ -63,7 +88,6 @@ def _tiny_config() -> Rwkv7Config:
         num_hidden_layers=2,
         head_size=4,
         context_length=16,
-        wkv_backend="reference",
     )
 
 
@@ -75,7 +99,6 @@ def _tiny_flash_config() -> Rwkv7Config:
         num_hidden_layers=2,
         head_size=64,
         context_length=16,
-        wkv_backend="flash_rwkv",
     )
 
 
@@ -110,7 +133,9 @@ def test_rwkv7_skips_packed_linear_without_weight() -> None:
     torch.testing.assert_close(linear.weight_scale, expected_scale)
 
 
-def test_rwkv7_low_rank_projections_are_standard_linear_modules_and_can_be_frozen() -> None:
+def test_rwkv7_low_rank_projections_are_standard_linear_modules_and_can_be_frozen(
+    synthetic_fla_public_contract,
+) -> None:
     model = Rwkv7ForCausalLM(_tiny_config()).train()
     time_mix = model.model.blocks[1].att
     projection_names = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
@@ -167,7 +192,7 @@ def test_rwkv7_quantized_low_rank_initialization_preserves_packed_weights_in_fre
         torch.testing.assert_close(projection.weight_scale, expected_scale)
 
 
-def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
+def test_rwkv7_causal_lm_forward_backward_and_recurrent_state(synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     model = Rwkv7ForCausalLM(_tiny_config())
     input_ids = torch.tensor([[1, 2, 3, 4]])
@@ -182,7 +207,7 @@ def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
     torch.testing.assert_close(resumed.logits[:, -1], output.logits[:, -1])
 
 
-def test_rwkv7_all_ones_attention_mask_matches_unmasked_input() -> None:
+def test_rwkv7_all_ones_attention_mask_matches_unmasked_input(synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     model = Rwkv7ForCausalLM(_tiny_config()).eval()
     input_ids = torch.tensor([[1, 2, 3]])
@@ -195,7 +220,7 @@ def test_rwkv7_all_ones_attention_mask_matches_unmasked_input() -> None:
         torch.testing.assert_close(masked_state, unmasked_state)
 
 
-def test_rwkv7_rejects_attention_mask_with_padding() -> None:
+def test_rwkv7_rejects_attention_mask_with_padding(synthetic_fla_public_contract) -> None:
     model = Rwkv7ForCausalLM(_tiny_config()).eval()
     input_ids = torch.tensor([[1, 2, 0]])
 
@@ -203,7 +228,7 @@ def test_rwkv7_rejects_attention_mask_with_padding() -> None:
         model(input_ids, attention_mask=torch.tensor([[1, 1, 0]]))
 
 
-def test_rwkv7_cache_default_depends_on_training_mode() -> None:
+def test_rwkv7_cache_default_depends_on_training_mode(synthetic_fla_public_contract) -> None:
     model = Rwkv7ForCausalLM(_tiny_config())
     input_ids = torch.tensor([[1, 2, 3]])
 
@@ -378,8 +403,29 @@ def test_rwkv7_runtime_provenance_rejects_wrong_fork_revision(monkeypatch, tmp_p
         modeling_rwkv7.validate_rwkv7_runtime_provenance()
 
 
-def test_rwkv7_runtime_provenance_rejects_unproven_flash_rwkv(monkeypatch) -> None:
-    pytest.importorskip("fla")
+def test_rwkv7_runtime_provenance_rejects_unproven_flash_rwkv(monkeypatch, tmp_path) -> None:
+    fla_origin = tmp_path / "fla" / "__init__.py"
+
+    class PinnedFlaDistribution:
+        metadata = {"Name": "flash-linear-attention"}
+        version = "0.5.2"
+
+        @staticmethod
+        def read_text(_filename):
+            return json.dumps(
+                {
+                    "url": modeling_rwkv7.RWKV7_FLA_REPOSITORY,
+                    "vcs_info": {
+                        "vcs": "git",
+                        "requested_revision": modeling_rwkv7.RWKV7_FLA_REVISION,
+                        "commit_id": modeling_rwkv7.RWKV7_FLA_REVISION,
+                    },
+                }
+            )
+
+        @staticmethod
+        def locate_file(_filename):
+            return fla_origin
 
     class RegistryFlashRwkvDistribution:
         metadata = {"Name": "flash-rwkv"}
@@ -389,57 +435,38 @@ def test_rwkv7_runtime_provenance_rejects_unproven_flash_rwkv(monkeypatch) -> No
         def read_text(_filename):
             return None
 
-    installed_distribution = modeling_rwkv7.importlib_metadata.distribution
     monkeypatch.setattr(
         modeling_rwkv7.importlib_metadata,
         "distribution",
-        lambda name: RegistryFlashRwkvDistribution() if name == "flash-rwkv" else installed_distribution(name),
+        lambda name: RegistryFlashRwkvDistribution() if name == "flash-rwkv" else PinnedFlaDistribution(),
+    )
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib.util,
+        "find_spec",
+        lambda name: importlib.machinery.ModuleSpec(name, loader=None, origin=str(fla_origin)),
     )
 
     with pytest.raises(RuntimeError, match="`flash-rwkv` provenance.*registry packages are rejected"):
         modeling_rwkv7.validate_rwkv7_runtime_provenance()
 
 
-def test_rwkv7_auto_backend_falls_back_on_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", lambda *inputs, **kwargs: (None, "provider unavailable"))
-    config = _tiny_config()
-    config.wkv_backend = "auto"
-    model = Rwkv7ForCausalLM(config).eval()
+def test_rwkv7_missing_public_fla_contract_fails_closed(monkeypatch) -> None:
+    def unavailable_contract():
+        raise RuntimeError("provider unavailable")
 
-    model(torch.tensor([[1, 2, 3]]))
+    monkeypatch.setattr(modeling_rwkv7, "_load_fla_rwkv7_contract", unavailable_contract)
+    model = Rwkv7ForCausalLM(_tiny_config()).eval()
 
-    assert {block.att.last_wkv_backend for block in model.model.blocks} == {"reference"}
-
-
-def test_rwkv7_explicit_accelerated_backend_fails_closed_on_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", lambda *inputs, **kwargs: (None, "provider unavailable"))
-    config = _tiny_config()
-    config.wkv_backend = "flash_rwkv"
-    model = Rwkv7ForCausalLM(config).eval()
-
-    with pytest.raises(RuntimeError, match="Explicit FlashRWKV request failed closed"):
+    with pytest.raises(RuntimeError, match="FlashRWKV execution failed closed.*provider unavailable"):
         model(torch.tensor([[1, 2, 3]]))
 
-
-def test_rwkv7_accelerated_backend_selection_is_observable(monkeypatch) -> None:
-    def accelerated(*inputs, **kwargs):
-        return rwkv7_reference(*inputs), "flash_rwkv"
-
-    monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", accelerated)
-    config = _tiny_config()
-    config.wkv_backend = "flash_rwkv"
-    model = Rwkv7ForCausalLM(config).eval()
-
-    model(torch.tensor([[1, 2, 3]]))
-
-    assert {block.att.last_wkv_backend for block in model.model.blocks} == {"flash_rwkv"}
+    assert {block.att.last_wkv_backend for block in model.model.blocks} == {"uninitialized"}
 
 
 @pytest.mark.parametrize("training", [False, True])
-def test_rwkv7_public_fla_contract_drives_two_layer_inference_and_training(monkeypatch, request, training) -> None:
-    fla_rwkv7 = pytest.importorskip("fla.ops.rwkv7")
+def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monkeypatch, training) -> None:
+    """Validate the HF call contract on CPU; this does not execute the real FLA or FlashRWKV operator."""
     required_parameters = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
-    assert required_parameters <= inspect.signature(fla_rwkv7.chunk_rwkv7).parameters.keys()
     calls = []
 
     def chunk_rwkv7(
@@ -465,11 +492,12 @@ def test_rwkv7_public_fla_contract_drives_two_layer_inference_and_training(monke
             final_state = initial_state + torch.einsum("bthk,bthv->bhkv", k.float(), v.float())
         return output, final_state
 
-    monkeypatch.setattr(fla_rwkv7, "chunk_rwkv7", chunk_rwkv7)
-    monkeypatch.setattr(fla_rwkv7, "get_last_rwkv7_provider", lambda: "flash_rwkv")
-    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
-    modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
-    request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
+    assert required_parameters <= inspect.signature(chunk_rwkv7).parameters.keys()
+    monkeypatch.setattr(
+        modeling_rwkv7,
+        "_load_fla_rwkv7_contract",
+        lambda: (chunk_rwkv7, lambda: "flash_rwkv"),
+    )
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
     model = Rwkv7ForCausalLM(_tiny_flash_config()).train(training)
     input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
@@ -505,9 +533,7 @@ def test_rwkv7_public_fla_contract_drives_two_layer_inference_and_training(monke
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"flash_rwkv"}
 
 
-def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch, request) -> None:
-    fla_rwkv7 = pytest.importorskip("fla.ops.rwkv7")
-
+def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> None:
     def chunk_rwkv7(
         r,
         w,
@@ -524,21 +550,19 @@ def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch, reques
     ):
         return torch.zeros_like(v), initial_state
 
-    monkeypatch.setattr(fla_rwkv7, "chunk_rwkv7", chunk_rwkv7)
-    monkeypatch.setattr(fla_rwkv7, "get_last_rwkv7_provider", lambda: "fla")
-    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
-    modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
-    request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
+    monkeypatch.setattr(
+        modeling_rwkv7,
+        "_load_fla_rwkv7_contract",
+        lambda: (chunk_rwkv7, lambda: "fla"),
+    )
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
-    config = _tiny_flash_config()
-    config.wkv_backend = "auto"
-    model = Rwkv7ForCausalLM(config).eval()
+    model = Rwkv7ForCausalLM(_tiny_flash_config()).eval()
 
     with torch.no_grad(), pytest.raises(RuntimeError, match="fallback is disabled"):
         model(torch.tensor([[1, 2, 3]]))
 
 
-def test_rwkv7_generate_updates_recurrent_state() -> None:
+def test_rwkv7_generate_updates_recurrent_state(synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     model = Rwkv7ForCausalLM(_tiny_config()).eval()
     input_ids = torch.tensor([[1, 2, 3]])
@@ -549,7 +573,7 @@ def test_rwkv7_generate_updates_recurrent_state() -> None:
     assert torch.equal(cached, uncached)
 
 
-def test_rwkv7_save_reload_and_auto_classes(tmp_path) -> None:
+def test_rwkv7_save_reload_and_auto_classes(tmp_path, synthetic_fla_public_contract) -> None:
     model = Rwkv7ForCausalLM(_tiny_config()).eval()
     input_ids = torch.tensor([[1, 2, 3]])
     expected = model(input_ids).logits
@@ -624,7 +648,9 @@ def _training_arguments(output_dir, *, max_steps: int, use_cpu: bool = True) -> 
     )
 
 
-def test_rwkv7_trainer_checkpoint_resume_matches_uninterrupted_training(tmp_path) -> None:
+def test_rwkv7_trainer_checkpoint_resume_matches_uninterrupted_training(
+    tmp_path, synthetic_fla_public_contract
+) -> None:
     dataset = _TinyCausalLMDataset()
 
     torch.manual_seed(11)

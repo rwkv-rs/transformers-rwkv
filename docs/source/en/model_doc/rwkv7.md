@@ -41,6 +41,4 @@ explicit model state.
 
 ## Runtime helpers
 
-[[autodoc]] models.rwkv7.modeling_rwkv7.rwkv7_reference
-
 [[autodoc]] models.rwkv7.modeling_rwkv7.validate_rwkv7_runtime_provenance

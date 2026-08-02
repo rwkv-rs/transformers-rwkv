@@ -28,7 +28,6 @@ def _tiny_model():
         num_hidden_layers=2,
         head_size=4,
         context_length=16,
-        wkv_backend="reference",
     )
     return AutoModelForCausalLM.from_config(config).eval()
 
@@ -38,7 +37,7 @@ def test_rwkv7_benchmark_requires_explicit_model() -> None:
         benchmark_rwkv7._parse_args(["--output", "result.json"])
 
 
-def test_rwkv7_benchmark_correctness_gate_carries_recurrent_state() -> None:
+def test_rwkv7_benchmark_correctness_gate_carries_recurrent_state(synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     model = _tiny_model()
     input_ids = torch.tensor([[1, 2, 3, 4, 5]])
@@ -47,17 +46,16 @@ def test_rwkv7_benchmark_correctness_gate_carries_recurrent_state() -> None:
         model,
         input_ids,
         prompt_tokens=3,
-        requested_backend="reference",
         dtype=torch.float32,
     )
 
     assert result["passed"] is True
     assert result["compared_tokens"] == 2
-    assert result["observed_backends"] == ["reference"]
+    assert result["observed_backends"] == ["flash_rwkv"]
     assert result["backend_observations"] == {
-        "one_shot": ["reference"],
-        "prefix_prefill": ["reference"],
-        "staged_decode": ["reference"],
+        "one_shot": ["flash_rwkv"],
+        "prefix_prefill": ["flash_rwkv"],
+        "staged_decode": ["flash_rwkv"],
     }
     assert result["state_components"] == 3
     assert result["input_state_preserved"] is True
@@ -66,10 +64,10 @@ def test_rwkv7_benchmark_correctness_gate_carries_recurrent_state() -> None:
 
 def test_rwkv7_benchmark_explicit_backend_observation_fails_closed() -> None:
     with pytest.raises(RuntimeError, match="failed closed"):
-        benchmark_rwkv7._require_observed_backend("flash_rwkv", {"reference"})
+        benchmark_rwkv7._require_observed_backend({"unexpected_provider"})
 
 
-def test_rwkv7_benchmark_rejects_corrupt_final_recurrent_state() -> None:
+def test_rwkv7_benchmark_rejects_corrupt_final_recurrent_state(synthetic_fla_public_contract) -> None:
     class CorruptFinalState(torch.nn.Module):
         def __init__(self, wrapped):
             super().__init__()
@@ -90,12 +88,11 @@ def test_rwkv7_benchmark_rejects_corrupt_final_recurrent_state() -> None:
             model,
             torch.tensor([[1, 2, 3, 4, 5]]),
             prompt_tokens=3,
-            requested_backend="reference",
             dtype=torch.float32,
         )
 
 
-def test_rwkv7_benchmark_rejects_input_state_mutation() -> None:
+def test_rwkv7_benchmark_rejects_input_state_mutation(synthetic_fla_public_contract) -> None:
     class MutateInputState(torch.nn.Module):
         def __init__(self, wrapped):
             super().__init__()
@@ -115,14 +112,15 @@ def test_rwkv7_benchmark_rejects_input_state_mutation() -> None:
             model,
             torch.tensor([[1, 2, 3, 4, 5]]),
             prompt_tokens=3,
-            requested_backend="reference",
             dtype=torch.float32,
         )
 
 
 def test_rwkv7_benchmark_rejects_cross_stage_backend_changes() -> None:
     with pytest.raises(RuntimeError, match="stages selected inconsistent"):
-        benchmark_rwkv7._require_consistent_backend_observations({"prefill": {"reference"}, "decode": {"flash_rwkv"}})
+        benchmark_rwkv7._require_consistent_backend_observations(
+            {"prefill": {"unexpected_provider"}, "decode": {"flash_rwkv"}}
+        )
 
 
 def test_rwkv7_benchmark_validates_flash_runtime_provenance(monkeypatch) -> None:
@@ -133,7 +131,8 @@ def test_rwkv7_benchmark_validates_flash_runtime_provenance(monkeypatch) -> None
         return {"repository": "https://github.com/rwkv-rs/fla-rwkv.git", "revision": "a" * 40}
 
     monkeypatch.setattr(benchmark_rwkv7, "validate_rwkv7_runtime_provenance", validate)
-    assert benchmark_rwkv7._validated_operator_provenance({"reference"}) is None
+    with pytest.raises(RuntimeError, match="failed closed"):
+        benchmark_rwkv7._validated_operator_provenance({"unexpected_provider"})
     assert benchmark_rwkv7._validated_operator_provenance({"flash_rwkv"}) == {
         "repository": "https://github.com/rwkv-rs/fla-rwkv.git",
         "revision": "a" * 40,
@@ -218,7 +217,7 @@ def test_rwkv7_benchmark_memory_excludes_setup_and_warms_after_empty_cache(monke
     class BackendLayer(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.last_wkv_backend = "reference"
+            self.last_wkv_backend = "flash_rwkv"
 
     model = torch.nn.Sequential(BackendLayer())
 
@@ -251,7 +250,6 @@ def test_rwkv7_benchmark_memory_excludes_setup_and_warms_after_empty_cache(monke
         operation,
         setup,
         model=model,
-        requested_backend="reference",
         stage="decode",
         warmup=1,
         iterations=1,
@@ -261,7 +259,7 @@ def test_rwkv7_benchmark_memory_excludes_setup_and_warms_after_empty_cache(monke
 
     assert order.index("empty_cache") < order.index("setup")
     assert order.index("reset_peak") > [index for index, value in enumerate(order) if value == "setup"][1]
-    assert result["observed_backends"] == ["reference"]
+    assert result["observed_backends"] == ["flash_rwkv"]
     assert result["torch_allocator_memory"] == {
         "scope": "PyTorch allocator only; excludes state setup and may not include native external allocations",
         "resident_before_operation_bytes_samples": [140],
