@@ -30,13 +30,13 @@ _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
 RWKV7_FLA_DISTRIBUTION = "flash-linear-attention"
 RWKV7_FLA_EXTRA = "flash-rwkv"
 RWKV7_FLA_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
-RWKV7_FLA_REVISION = "a4a8aa98df6ec5322f194a80ec57363dd045adfc"
+RWKV7_FLA_REVISION = "fcd4502ab957513a3d97dbd8aa64851e5e4dba11"
 RWKV7_FLA_REQUIREMENT = (
     f"{RWKV7_FLA_DISTRIBUTION}[{RWKV7_FLA_EXTRA}] @ git+{RWKV7_FLA_REPOSITORY}@{RWKV7_FLA_REVISION}"
 )
 RWKV7_FLASH_RWKV_DISTRIBUTION = "flash-rwkv"
 RWKV7_FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
-RWKV7_FLASH_RWKV_REVISION = "866aafd2eed146b0eda1ce03444009ae030f89e3"
+RWKV7_FLASH_RWKV_REVISION = "69afbec2db9ffd3362962017a1fb36f2f333d1c6"
 
 
 class Rwkv7DynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):

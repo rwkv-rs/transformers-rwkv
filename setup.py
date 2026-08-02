@@ -83,7 +83,7 @@ _deps = [
     "faiss-cpu",
     "fastapi",
     "filelock",
-    "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+    "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@fcd4502ab957513a3d97dbd8aa64851e5e4dba11",
     "fugashi>=1.0",
     "GitPython<3.1.19",
     "hf-doc-builder",
