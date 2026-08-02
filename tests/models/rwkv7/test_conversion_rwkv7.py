@@ -8,6 +8,7 @@ import torch
 from safetensors.torch import load_file
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
+from tokenizers.processors import TemplateProcessing
 
 from transformers import PreTrainedTokenizerFast
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
@@ -29,6 +30,28 @@ def _config() -> Rwkv7Config:
         head_size=4,
         wkv_backend="reference",
     )
+
+
+def _save_fast_tokenizer(tokenizer_dir, *, vocab_size=31, special_token_id=0, insert_bos=False) -> None:
+    special_token = "<|endoftext|>"
+    vocabulary = {f"token-{index}": index for index in range(vocab_size)}
+    del vocabulary[f"token-{special_token_id}"]
+    vocabulary[special_token] = special_token_id
+    tokenizer_backend = Tokenizer(WordLevel(vocabulary, unk_token=special_token))
+    if insert_bos:
+        tokenizer_backend.post_processor = TemplateProcessing(
+            single=f"{special_token} $A",
+            pair=f"{special_token} $A $B",
+            special_tokens=[(special_token, special_token_id)],
+        )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_backend,
+        bos_token=special_token,
+        eos_token=special_token,
+        pad_token=special_token,
+        unk_token=special_token,
+    )
+    tokenizer.save_pretrained(tokenizer_dir)
 
 
 def _legacy_state_dict(model: Rwkv7ForCausalLM) -> dict[str, torch.Tensor]:
@@ -63,13 +86,16 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     expected_logits = source(input_ids).logits
     expected_generated_ids = source.generate(input_ids, max_new_tokens=2, do_sample=False, use_cache=True)
     checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
+    tokenizer_dir = tmp_path / "tokenizer"
     output_dir = tmp_path / "artifact"
     torch.save(_legacy_state_dict(source), checkpoint)
+    _save_fast_tokenizer(tokenizer_dir)
 
     result = convert_rwkv7_checkpoint_to_hf_format(
         str(checkpoint),
         str(output_dir),
-        source_revision="source-revision-for-test",
+        tokenizer_name_or_path=str(tokenizer_dir),
+        source_revision="a" * 40,
         validation_input_ids=[1, 2, 3],
         validation_max_new_tokens=2,
     )
@@ -93,16 +119,28 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     assert result["validation"]["device"] == "cpu"
     assert result["validation"]["requested_wkv_backend"] == "auto"
     assert result["validation"]["strict_load"]
+    assert result["validation"]["config_class"] == "Rwkv7Config"
+    assert result["validation"]["context_length"] == 32
+    assert result["validation"]["model_identity"] == result["conversion"]["model_identity"]
+    assert result["validation"]["no_auto_map"]
+    assert result["validation"]["recurrent_continuation"]
+    assert result["validation"]["token_zero_semantics"] == {"bos": 0, "eos": 0, "pad": 0}
     assert result["validation"]["generated_ids"] == expected_generated_ids.tolist()
     assert "rwkv7_validation.json" in result["validation"]["artifact_files"]
-    assert result["conversion"]["source_revision"] == "source-revision-for-test"
+    assert result["conversion"]["source_revision"] == "a" * 40
     assert len(result["conversion"]["checkpoint_sha256"]) == 64
+    assert len(result["conversion"]["model_identity"]) == 64
+    assert "tokenizer.json" in result["conversion"]["tokenizer_files"]
+    assert result["conversion"]["tokenizer_source"] == "tokenizer"
+    assert str(tmp_path) not in json.dumps(result["conversion"], sort_keys=True)
     assert {
         "config.json",
         "generation_config.json",
         "model.safetensors",
         "rwkv7_conversion.json",
         "rwkv7_validation.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
     }.issubset(path.name for path in output_dir.iterdir())
     assert json.loads((output_dir / "rwkv7_validation.json").read_text())["strict_load"]
 
@@ -113,13 +151,17 @@ def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
     input_ids = torch.tensor([[1, 2, 3]])
     expected_logits = source(input_ids).logits
     checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
+    tokenizer_dir = tmp_path / "tokenizer"
     output_dir = tmp_path / "fused-artifact"
     torch.save(_legacy_state_dict(source), checkpoint)
+    _save_fast_tokenizer(tokenizer_dir)
 
     convert_rwkv7_checkpoint_to_hf_format(
         str(checkpoint),
         str(output_dir),
         fuse_embedding_layer_norm=True,
+        tokenizer_name_or_path=str(tokenizer_dir),
+        source_revision="b" * 40,
         wkv_backend="reference",
         validation_max_new_tokens=2,
     )
@@ -138,12 +180,7 @@ def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(tmp_p
     model_card = tmp_path / "MODEL_CARD.md"
     license_file = tmp_path / "SOURCE_LICENSE"
     torch.save(_legacy_state_dict(source), checkpoint)
-    vocabulary = {"[UNK]": 0, **{f"token-{index}": index for index in range(1, 31)}}
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(WordLevel(vocabulary, unk_token="[UNK]")),
-        unk_token="[UNK]",
-    )
-    tokenizer.save_pretrained(tokenizer_dir)
+    _save_fast_tokenizer(tokenizer_dir)
     model_card.write_text("# Native RWKV-7\n", encoding="utf-8")
     license_file.write_text("Apache License 2.0\n", encoding="utf-8")
 
@@ -176,6 +213,34 @@ def test_converter_builds_publication_ready_hf_artifact_and_upload_dry_run(tmp_p
         "tokenizer.json",
         "tokenizer_config.json",
     }.issubset(path.name for path in output_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    "failure", ["revision", "safe_serialization", "tokenizer_json", "vocab", "token_zero", "bos_insertion"]
+)
+def test_converter_rejects_nonstandard_artifact_before_writing_output(tmp_path, failure) -> None:
+    source = Rwkv7ForCausalLM(_config()).eval()
+    checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
+    tokenizer_dir = tmp_path / "tokenizer"
+    output_dir = tmp_path / "artifact"
+    torch.save(_legacy_state_dict(source), checkpoint)
+    _save_fast_tokenizer(
+        tokenizer_dir,
+        vocab_size=30 if failure == "vocab" else 31,
+        special_token_id=1 if failure == "token_zero" else 0,
+        insert_bos=failure == "bos_insertion",
+    )
+    if failure == "tokenizer_json":
+        (tokenizer_dir / "tokenizer.json").unlink()
+
+    kwargs = {
+        "tokenizer_name_or_path": str(tokenizer_dir),
+        "source_revision": "not-a-full-commit" if failure == "revision" else "c" * 40,
+        "safe_serialization": failure != "safe_serialization",
+    }
+    with pytest.raises((ValueError, OSError)):
+        convert_rwkv7_checkpoint_to_hf_format(str(checkpoint), str(output_dir), **kwargs)
+    assert not output_dir.exists()
 
 
 @pytest.mark.parametrize(
