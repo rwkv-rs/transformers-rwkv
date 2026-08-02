@@ -246,7 +246,9 @@ class Rwkv7PreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            weight = getattr(module, "weight", None)
+            if weight is not None:
+                nn.init.normal_(weight, mean=0.0, std=0.02)
         elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
