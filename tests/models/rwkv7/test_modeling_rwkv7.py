@@ -231,6 +231,135 @@ def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
+@run_test_using_subprocess
+def test_rwkv7_runtime_provenance_is_fork_pinned_in_fresh_process() -> None:
+    pytest.importorskip("fla")
+    pytest.importorskip("flash_rwkv")
+    from transformers.dependency_versions_table import deps
+    from transformers.models.rwkv7 import RWKV7_FLA_REQUIREMENT, validate_rwkv7_runtime_provenance
+
+    class PinnedVcsDistribution:
+        def __init__(self, name, version, module_name, repository, revision):
+            self.metadata = {"Name": name}
+            self.version = version
+            self.module_name = module_name
+            self.direct_url = json.dumps(
+                {
+                    "url": repository,
+                    "vcs_info": {"vcs": "git", "requested_revision": revision, "commit_id": revision},
+                }
+            )
+
+        def read_text(self, _filename):
+            return self.direct_url
+
+        def locate_file(self, _filename):
+            return modeling_rwkv7.importlib.util.find_spec(self.module_name).origin
+
+    distributions = {
+        "flash-linear-attention": PinnedVcsDistribution(
+            "flash-linear-attention",
+            "0.5.2",
+            "fla",
+            "https://github.com/rwkv-rs/fla-rwkv.git",
+            "a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+        ),
+        "flash-rwkv": PinnedVcsDistribution(
+            "flash-rwkv",
+            "0.1.0",
+            "flash_rwkv",
+            "https://github.com/rwkv-rs/FlashRWKV.git",
+            "866aafd2eed146b0eda1ce03444009ae030f89e3",
+        ),
+    }
+    original_distribution = modeling_rwkv7.importlib_metadata.distribution
+    modeling_rwkv7.importlib_metadata.distribution = distributions.__getitem__
+    try:
+        provenance = validate_rwkv7_runtime_provenance()
+    finally:
+        modeling_rwkv7.importlib_metadata.distribution = original_distribution
+
+    assert deps["flash-linear-attention[flash-rwkv]"] == RWKV7_FLA_REQUIREMENT
+    assert provenance == {
+        "distribution": "flash-linear-attention",
+        "distribution_version": "0.5.2",
+        "extra": "flash-rwkv",
+        "flash_rwkv_distribution": "flash-rwkv",
+        "flash_rwkv_distribution_version": "0.1.0",
+        "flash_rwkv_repository": "https://github.com/rwkv-rs/FlashRWKV.git",
+        "flash_rwkv_revision": "866aafd2eed146b0eda1ce03444009ae030f89e3",
+        "flash_rwkv_source_kind": "vcs",
+        "repository": "https://github.com/rwkv-rs/fla-rwkv.git",
+        "requirement": "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+        "revision": "a4a8aa98df6ec5322f194a80ec57363dd045adfc",
+        "source_kind": "vcs",
+    }
+
+
+def test_rwkv7_runtime_provenance_rejects_same_name_registry_package(monkeypatch, request) -> None:
+    class RegistryDistribution:
+        metadata = {"Name": "flash-linear-attention"}
+        version = "0.5.2"
+
+        @staticmethod
+        def read_text(filename):
+            assert filename == "direct_url.json"
+            return None
+
+    monkeypatch.setattr(modeling_rwkv7.importlib_metadata, "distribution", lambda _name: RegistryDistribution())
+    modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
+    request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
+
+    with pytest.raises(RuntimeError, match="registry packages are rejected"):
+        modeling_rwkv7._load_fla_rwkv7_contract()
+
+
+def test_rwkv7_runtime_provenance_rejects_wrong_fork_revision(monkeypatch) -> None:
+    class WrongRevisionDistribution:
+        metadata = {"Name": "flash-linear-attention"}
+        version = "0.5.2"
+
+        @staticmethod
+        def read_text(_filename):
+            return json.dumps(
+                {
+                    "url": "https://github.com/rwkv-rs/fla-rwkv.git",
+                    "vcs_info": {"vcs": "git", "requested_revision": "0" * 40, "commit_id": "0" * 40},
+                }
+            )
+
+        @staticmethod
+        def locate_file(_filename):
+            return modeling_rwkv7.importlib.util.find_spec("fla").origin
+
+    monkeypatch.setattr(modeling_rwkv7.importlib_metadata, "distribution", lambda _name: WrongRevisionDistribution())
+
+    with pytest.raises(RuntimeError, match="revision provenance mismatch"):
+        modeling_rwkv7.validate_rwkv7_runtime_provenance()
+
+
+def test_rwkv7_runtime_provenance_rejects_unproven_flash_rwkv(monkeypatch) -> None:
+    pytest.importorskip("fla")
+
+    class RegistryFlashRwkvDistribution:
+        metadata = {"Name": "flash-rwkv"}
+        version = "0.1.0"
+
+        @staticmethod
+        def read_text(_filename):
+            return None
+
+    installed_distribution = modeling_rwkv7.importlib_metadata.distribution
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib_metadata,
+        "distribution",
+        lambda name: RegistryFlashRwkvDistribution() if name == "flash-rwkv" else installed_distribution(name),
+    )
+
+    with pytest.raises(RuntimeError, match="`flash-rwkv` provenance.*registry packages are rejected"):
+        modeling_rwkv7.validate_rwkv7_runtime_provenance()
+
+
 def test_rwkv7_auto_backend_falls_back_on_cpu(monkeypatch) -> None:
     monkeypatch.setattr(modeling_rwkv7, "_rwkv7_flash", lambda *inputs, **kwargs: (None, "provider unavailable"))
     config = _tiny_config()
@@ -298,6 +427,7 @@ def test_rwkv7_public_fla_contract_drives_two_layer_inference_and_training(monke
 
     monkeypatch.setattr(fla_rwkv7, "chunk_rwkv7", chunk_rwkv7)
     monkeypatch.setattr(fla_rwkv7, "get_last_rwkv7_provider", lambda: "flash_rwkv")
+    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
     modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
     request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")
@@ -356,6 +486,7 @@ def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch, reques
 
     monkeypatch.setattr(fla_rwkv7, "chunk_rwkv7", chunk_rwkv7)
     monkeypatch.setattr(fla_rwkv7, "get_last_rwkv7_provider", lambda: "fla")
+    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
     modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
     request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
     monkeypatch.setenv("FLA_FLASH_RWKV", "1")

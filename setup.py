@@ -83,6 +83,7 @@ _deps = [
     "faiss-cpu",
     "fastapi",
     "filelock",
+    "flash-linear-attention[flash-rwkv] @ git+https://github.com/rwkv-rs/fla-rwkv.git@a4a8aa98df6ec5322f194a80ec57363dd045adfc",
     "fugashi>=1.0",
     "GitPython<3.1.19",
     "hf-doc-builder",
@@ -186,6 +187,7 @@ extras["quality"] = deps_list(
 )
 extras["docs"] = deps_list("hf-doc-builder")
 extras["kernels"] = deps_list("kernels")
+extras["rwkv7"] = deps_list("flash-linear-attention[flash-rwkv]")
 extras["sentencepiece"] = deps_list("sentencepiece", "protobuf")
 extras["tiktoken"] = deps_list("tiktoken", "blobfile")
 extras["mistral-common"] = deps_list("mistral-common[image]")
