@@ -48,6 +48,7 @@ class AnyToRwkvConvertedConfig(PretrainedConfig):
         vocab_size=64,
         hidden_size=256,
         source_architecture="qwen3_5_moe_text",
+        source_config=None,
         source_layer_types=("linear_attention", "full_attention"),
         layer_norm_eps=1e-5,
         **kwargs,
@@ -65,6 +66,7 @@ class AnyToRwkvConvertedConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.source_architecture = source_architecture
+        self.source_config = source_config
         self.source_layer_types = list(source_layer_types)
         self.head_sizes = head_sizes
         self.num_hidden_layers = len(source_layer_types)
@@ -102,6 +104,8 @@ class AnyToRwkvRecurrentMixer(nn.Module):
             *inputs,
             initial_state=initial_state,
             output_final_state=True,
+            cu_seqlens=None,
+            state_indices=None,
             mode="fp32io16",
         )
         if get_last_provider() != "flash_rwkv":
@@ -131,8 +135,13 @@ class AnyToRwkvConvertedForCausalLM(PreTrainedModel):
     config_class = AnyToRwkvConvertedConfig
     base_model_prefix = "any_to_rwkv"
 
-    def __init__(self, config, source_model):
+    def __init__(self, config, source_model=None):
         super().__init__(config)
+        reloading = source_model is None
+        if reloading:
+            if config.source_config is None:
+                raise ValueError("Reloading the converted model requires its saved Qwen source component config.")
+            source_model = Qwen3_5MoeForCausalLM(Qwen3_5MoeTextConfig.from_dict(config.source_config))
         source_layers = source_model.model.layers
         if len(source_layers) != config.num_hidden_layers:
             raise ValueError("The source Qwen layer count must match the independent converted config.")
@@ -148,6 +157,22 @@ class AnyToRwkvConvertedForCausalLM(PreTrainedModel):
         )
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.lm_head = source_model.lm_head
+        if reloading:
+            self.post_init()
+
+    @classmethod
+    def from_source(cls, source_model):
+        config = AnyToRwkvConvertedConfig(
+            vocab_size=source_model.config.vocab_size,
+            hidden_size=source_model.config.hidden_size,
+            source_architecture=source_model.config.model_type,
+            source_config=source_model.config.to_dict(),
+            source_layer_types=source_model.config.layer_types,
+            bos_token_id=source_model.config.bos_token_id,
+            eos_token_id=source_model.config.eos_token_id,
+            pad_token_id=source_model.config.pad_token_id,
+        )
+        return cls(config, source_model)
 
     def forward(self, input_ids, labels=None):
         hidden_states = self.embed_tokens(input_ids)
@@ -182,16 +207,7 @@ def tiny_qwen_source():
 
 def main():
     source = tiny_qwen_source()
-    config = AnyToRwkvConvertedConfig(
-        vocab_size=source.config.vocab_size,
-        hidden_size=source.config.hidden_size,
-        source_architecture=source.config.model_type,
-        source_layer_types=source.config.layer_types,
-        bos_token_id=source.config.bos_token_id,
-        eos_token_id=source.config.eos_token_id,
-        pad_token_id=source.config.pad_token_id,
-    )
-    converted = AnyToRwkvConvertedForCausalLM(config, source)
+    converted = AnyToRwkvConvertedForCausalLM.from_source(source)
 
     assert "qwen" not in converted.config.model_type
     assert converted.config.model_type != "rwkv7"
