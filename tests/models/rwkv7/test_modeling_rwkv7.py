@@ -8,6 +8,7 @@ from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.modeling_rwkv7 import (
     Rwkv7ForCausalLM,
     Rwkv7Model,
+    rwkv7_reference,
 )
 
 
@@ -35,6 +36,54 @@ def test_rwkv7_causal_lm_forward_backward_and_recurrent_state() -> None:
     prefix = model(input_ids[:, :3])
     resumed = model(input_ids[:, 3:], state=prefix.state)
     torch.testing.assert_close(resumed.logits[:, -1], output.logits[:, -1])
+
+
+def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:
+    receptance = torch.tensor([[[0.2, -0.4], [0.3, 0.1]]])
+    raw_decay = torch.tensor([[[0.5, -0.2], [0.1, 0.7]]])
+    key = torch.tensor([[[0.6, -0.3], [0.2, 0.8]]])
+    value = torch.tensor([[[0.4, -0.5], [0.7, 0.9]]])
+    a = torch.tensor([[[-0.2, 0.9], [0.5, -0.1]]])
+    b = torch.tensor([[[0.7, 0.3], [-0.4, 0.6]]])
+    initial_state = torch.tensor([[[[0.2, 0.1], [-0.3, 0.4]]]])
+
+    output, final_state = rwkv7_reference(
+        receptance,
+        raw_decay,
+        key,
+        value,
+        a,
+        b,
+        initial_state,
+        head_size=2,
+    )
+    state = initial_state
+    expected_outputs = []
+    log_decay = -torch.nn.functional.softplus(-raw_decay) - 0.5
+    for token in range(2):
+        previous_state = state
+        a_state = torch.einsum("bhk,bhkv->bhv", a[:, token : token + 1], previous_state)
+        state = (
+            log_decay[:, token : token + 1].exp().unsqueeze(-1) * previous_state
+            + b[:, token : token + 1].unsqueeze(-1) * a_state.unsqueeze(-2)
+            + key[:, token : token + 1].unsqueeze(-1) * value[:, token : token + 1].unsqueeze(-2)
+        )
+        expected_outputs.append(torch.einsum("bhk,bhkv->bhv", receptance[:, token : token + 1], state))
+    expected_output = torch.stack(expected_outputs, dim=1).reshape_as(output)
+
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(final_state, state)
+
+
+def test_rwkv7_generate_updates_recurrent_state() -> None:
+    torch.manual_seed(0)
+    model = Rwkv7ForCausalLM(_tiny_config()).eval()
+    input_ids = torch.tensor([[1, 2, 3]])
+
+    cached = model.generate(input_ids, max_new_tokens=3, do_sample=False, use_cache=True)
+    uncached = model.generate(input_ids, max_new_tokens=3, do_sample=False, use_cache=False)
+
+    assert torch.equal(cached, uncached)
 
 
 def test_rwkv7_save_reload_and_auto_classes(tmp_path) -> None:
