@@ -1,8 +1,12 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import importlib
+import inspect
 import math
+import os
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 from torch import nn
@@ -13,6 +17,11 @@ from ...generation import GenerationMixin
 from ...modeling_utils import PreTrainedModel
 from ...utils import ModelOutput, auto_docstring
 from .configuration_rwkv7 import Rwkv7Config
+
+
+_FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
+    {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+)
 
 
 class Rwkv7DynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
@@ -100,14 +109,44 @@ def rwkv7_reference(
     return output, current_state
 
 
-def _rwkv7_flash(
-    receptance, raw_decay, key, value, a, b, state, head_size
-) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, str]:
-    """Run the optional FlashRWKV provider when its published capability contract accepts the call."""
+@cache
+def _load_fla_rwkv7_contract():
+    rwkv7 = importlib.import_module("fla.ops.rwkv7")
+    chunk_rwkv7 = getattr(rwkv7, "chunk_rwkv7", None)
+    get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
+    if not callable(chunk_rwkv7) or not callable(get_last_provider):
+        raise RuntimeError(
+            "The installed FLA RWKV-7 API must publicly expose chunk_rwkv7 and get_last_rwkv7_provider."
+        )
     try:
-        from fla.ops.rwkv7.backends.flash_rwkv import FlashRWKVBackend
+        parameters = inspect.signature(chunk_rwkv7).parameters
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("The installed FLA chunk_rwkv7 API is not inspectable.") from error
+    missing = sorted(_FLA_RWKV7_REQUIRED_PARAMETERS - parameters.keys())
+    if missing:
+        raise RuntimeError(f"The installed FLA chunk_rwkv7 API lacks required stateful parameters: {missing}.")
+    return chunk_rwkv7, get_last_provider
+
+
+def _rwkv7_flash(
+    receptance,
+    raw_decay,
+    key,
+    value,
+    a,
+    b,
+    state,
+    head_size,
+    *,
+    explicit=False,
+) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, str]:
+    """Run FlashRWKV exclusively through FLA's public stateful dispatch contract."""
+    if not explicit and os.environ.get("FLA_FLASH_RWKV") != "1":
+        return None, "FLA FlashRWKV provider is not enabled"
+    try:
+        chunk_rwkv7, get_last_provider = _load_fla_rwkv7_contract()
     except ImportError as error:
-        return None, f"FlashRWKV provider import failed: {error}"
+        return None, f"FLA RWKV-7 public API import failed: {error}"
 
     batch_size, sequence_length, hidden_size = receptance.shape
     num_heads = hidden_size // head_size
@@ -116,13 +155,53 @@ def _rwkv7_flash(
         for tensor in (receptance, raw_decay, key, value, a, b)
     ]
     tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
-    backend = FlashRWKVBackend()
-    accepted, reason = backend.chunk_rwkv7_verifier(*tensors, initial_state=state, output_final_state=True)
-    if not FlashRWKVBackend.is_available():
-        return None, "FlashRWKV provider is unavailable"
-    if not accepted:
-        return None, reason or "FlashRWKV provider rejected the call"
-    output, final_state = backend.chunk_rwkv7(*tensors, initial_state=state, output_final_state=True)
+    requires_grad = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (*tensors, state))
+    if requires_grad:
+        if os.environ.get("FLA_FLASH_RWKV") != "1":
+            raise RuntimeError(
+                "FLA_FLASH_RWKV=1 is required for differentiable fixed-batch FlashRWKV execution; fallback is disabled."
+            )
+        call_tensors = tensors
+        state_pool = state
+        cu_seqlens = None
+        state_indices = None
+    else:
+        call_tensors = [
+            tensor.reshape(1, batch_size * sequence_length, num_heads, tensor.shape[-1]).contiguous()
+            for tensor in tensors
+        ]
+        state_pool = state.clone()
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * sequence_length,
+            sequence_length,
+            dtype=torch.int32,
+            device=receptance.device,
+        )
+        state_indices = torch.arange(batch_size, dtype=torch.int32, device=receptance.device)
+
+    try:
+        result = chunk_rwkv7(
+            *call_tensors,
+            initial_state=state_pool,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            mode="fp32io16",
+        )
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise RuntimeError(f"FLA public chunk_rwkv7 execution failed: {error}") from error
+    if get_last_provider() != "flash_rwkv":
+        raise RuntimeError("FLA public chunk_rwkv7 did not select FlashRWKV; fallback is disabled.")
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError("FLA public chunk_rwkv7 must return (output, final_state).")
+    output, final_state = result
+    if not isinstance(output, torch.Tensor) or output.shape != call_tensors[3].shape:
+        raise RuntimeError("FLA public chunk_rwkv7 returned an output with an incompatible shape.")
+    if not isinstance(final_state, torch.Tensor) or final_state.shape != state.shape:
+        raise RuntimeError("FLA public chunk_rwkv7 returned an incompatible final state.")
+    if state_indices is not None and final_state is not state_pool:
+        raise RuntimeError("FLA packed FlashRWKV must update the supplied state pool in place.")
     return (output.reshape(batch_size, sequence_length, hidden_size), final_state), "flash_rwkv"
 
 
@@ -210,7 +289,15 @@ class Rwkv7TimeMix(nn.Module):
         )
         accelerated = None
         if self.config.wkv_backend != "reference":
-            accelerated, self.last_wkv_backend = _rwkv7_flash(*wkv_inputs)
+            try:
+                accelerated, self.last_wkv_backend = _rwkv7_flash(
+                    *wkv_inputs,
+                    explicit=self.config.wkv_backend == "flash_rwkv",
+                )
+            except RuntimeError as error:
+                if self.config.wkv_backend == "flash_rwkv":
+                    raise RuntimeError(f"Explicit FlashRWKV request failed closed: {error}") from error
+                raise
         if accelerated is None:
             if self.config.wkv_backend == "flash_rwkv":
                 raise RuntimeError(f"Explicit FlashRWKV request failed closed: {self.last_wkv_backend}")
