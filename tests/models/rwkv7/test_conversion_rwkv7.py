@@ -1,10 +1,11 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import json
+
 import pytest
 import torch
 
-from transformers import AutoModelForCausalLM
 from transformers.models.rwkv7.configuration_rwkv7 import Rwkv7Config
 from transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf import (
     convert_rwkv7_checkpoint_to_hf_format,
@@ -22,6 +23,7 @@ def _config() -> Rwkv7Config:
         intermediate_size=32,
         num_hidden_layers=2,
         head_size=4,
+        wkv_backend="reference",
     )
 
 
@@ -47,14 +49,36 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path) -> None:
     output_dir = tmp_path / "artifact"
     torch.save(_legacy_state_dict(source), checkpoint)
 
-    convert_rwkv7_checkpoint_to_hf_format(str(checkpoint), str(output_dir))
-    converted = AutoModelForCausalLM.from_pretrained(output_dir).eval()
+    result = convert_rwkv7_checkpoint_to_hf_format(
+        str(checkpoint),
+        str(output_dir),
+        source_revision="source-revision-for-test",
+        validation_input_ids=[1, 2, 3],
+        validation_max_new_tokens=2,
+    )
+    converted = Rwkv7ForCausalLM.from_pretrained(output_dir).eval()
 
     assert isinstance(converted, Rwkv7ForCausalLM)
     assert converted.config.context_length == 32
+    assert converted.config.wkv_backend == "auto"
+    converted.config.wkv_backend = "reference"
     for name, tensor in source.state_dict().items():
         torch.testing.assert_close(converted.state_dict()[name], tensor)
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)
+    assert result["validation"]["architecture"] == "Rwkv7ForCausalLM"
+    assert result["validation"]["strict_load"]
+    assert result["validation"]["generated_ids"] == [[1, 2, 3, 2, 2]]
+    assert "rwkv7_validation.json" in result["validation"]["artifact_files"]
+    assert result["conversion"]["source_revision"] == "source-revision-for-test"
+    assert len(result["conversion"]["checkpoint_sha256"]) == 64
+    assert {
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "rwkv7_conversion.json",
+        "rwkv7_validation.json",
+    }.issubset(path.name for path in output_dir.iterdir())
+    assert json.loads((output_dir / "rwkv7_validation.json").read_text())["strict_load"]
 
 
 def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
@@ -70,8 +94,10 @@ def test_converter_can_fuse_embedding_layer_norm(tmp_path) -> None:
         str(checkpoint),
         str(output_dir),
         fuse_embedding_layer_norm=True,
+        validation_max_new_tokens=2,
     )
-    converted = AutoModelForCausalLM.from_pretrained(output_dir).eval()
+    converted = Rwkv7ForCausalLM.from_pretrained(output_dir).eval()
+    converted.config.wkv_backend = "reference"
 
     assert converted.config.embedding_layer_norm_fused
     torch.testing.assert_close(converted(input_ids).logits, expected_logits)

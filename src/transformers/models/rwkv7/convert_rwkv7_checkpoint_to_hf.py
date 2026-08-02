@@ -4,12 +4,18 @@
 
 import argparse
 import copy
+import hashlib
+import json
 import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import torch
 from torch.nn import functional as F
 
+from ..auto.tokenization_auto import AutoTokenizer
 from .configuration_rwkv7 import Rwkv7Config
 from .modeling_rwkv7 import Rwkv7ForCausalLM
 
@@ -19,6 +25,86 @@ _SUPPORTED_DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
 }
+
+_VALIDATION_MARKER = "RWKV7_ARTIFACT_VALIDATION="
+_VALIDATION_SCRIPT = f"""
+import json
+import sys
+
+import torch
+
+from transformers import AutoModelForCausalLM
+
+
+artifact_dir, encoded_input_ids, encoded_max_new_tokens = sys.argv[1:]
+model, loading_info = AutoModelForCausalLM.from_pretrained(artifact_dir, output_loading_info=True)
+load_errors = {{
+    name: loading_info.get(name, [])
+    for name in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+    if loading_info.get(name)
+}}
+if load_errors:
+    raise RuntimeError(f"RWKV-7 artifact did not strict-load: {{load_errors}}")
+model.eval()
+input_ids = torch.tensor([json.loads(encoded_input_ids)], dtype=torch.long)
+generation_kwargs = {{
+    "max_new_tokens": int(encoded_max_new_tokens),
+    "do_sample": False,
+    "use_cache": True,
+}}
+first = model.generate(input_ids, **generation_kwargs)
+second = model.generate(input_ids, **generation_kwargs)
+if not torch.equal(first, second):
+    raise RuntimeError("RWKV-7 artifact generation is not deterministic.")
+observed_backends = sorted({{block.att.last_wkv_backend for block in model.model.blocks}})
+result = {{
+    "architecture": type(model).__name__,
+    "generated_ids": first.tolist(),
+    "input_ids": input_ids.tolist(),
+    "max_new_tokens": generation_kwargs["max_new_tokens"],
+    "observed_wkv_backends": observed_backends,
+    "strict_load": True,
+}}
+print("{_VALIDATION_MARKER}" + json.dumps(result, sort_keys=True))
+"""
+
+
+def _sha256(path: str | os.PathLike) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_rwkv7_artifact_in_subprocess(
+    artifact_dir: str | os.PathLike,
+    *,
+    input_ids: list[int] | tuple[int, ...] = (1, 2, 3),
+    max_new_tokens: int = 4,
+) -> dict:
+    """Strict-load and deterministically generate from an artifact in a fresh Python process."""
+    if not input_ids:
+        raise ValueError("Artifact validation requires at least one input token id.")
+    if max_new_tokens < 1:
+        raise ValueError("Artifact validation requires `max_new_tokens` to be positive.")
+    command = [
+        sys.executable,
+        "-c",
+        _VALIDATION_SCRIPT,
+        os.fspath(artifact_dir),
+        json.dumps(list(input_ids)),
+        str(max_new_tokens),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        details = error.stderr.strip() or error.stdout.strip()
+        raise RuntimeError(f"RWKV-7 artifact validation failed in a fresh process: {details}") from error
+    marker_lines = [line for line in completed.stdout.splitlines() if line.startswith(_VALIDATION_MARKER)]
+    if len(marker_lines) != 1:
+        raise RuntimeError("RWKV-7 artifact validation process did not emit exactly one result payload.")
+    return json.loads(marker_lines[0].removeprefix(_VALIDATION_MARKER))
 
 
 def _projection_ranks(hidden_size: int) -> tuple[int, int, int]:
@@ -177,7 +263,12 @@ def convert_rwkv7_checkpoint_to_hf_format(
     fuse_embedding_layer_norm: bool = False,
     dtype: str | None = None,
     safe_serialization: bool = True,
-) -> None:
+    max_shard_size: str = "5GB",
+    tokenizer_name_or_path: str | None = None,
+    source_revision: str | None = None,
+    validation_input_ids: list[int] | tuple[int, ...] = (1, 2, 3),
+    validation_max_new_tokens: int = 4,
+) -> dict:
     """Convert one local legacy raw ``.pth`` checkpoint and save a strict-loadable artifact."""
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
@@ -199,7 +290,48 @@ def convert_rwkv7_checkpoint_to_hf_format(
     if dtype is not None:
         model.to(_SUPPORTED_DTYPES[dtype])
     config.architectures = ["Rwkv7ForCausalLM"]
-    model.save_pretrained(output_dir, safe_serialization=safe_serialization)
+    model.save_pretrained(
+        output_dir,
+        safe_serialization=safe_serialization,
+        max_shard_size=max_shard_size,
+    )
+    model.generation_config.save_pretrained(output_dir)
+    if tokenizer_name_or_path is not None:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
+        if len(tokenizer) != config.vocab_size:
+            raise ValueError(
+                f"Tokenizer vocabulary size {len(tokenizer)} does not match model vocabulary size {config.vocab_size}."
+            )
+        tokenizer.save_pretrained(output_dir)
+
+    output_path = Path(output_dir)
+    conversion = {
+        "checkpoint_file": os.path.basename(checkpoint_path),
+        "checkpoint_sha256": _sha256(checkpoint_path),
+        "dtype": dtype or "preserved",
+        "embedding_layer_norm_fused": fuse_embedding_layer_norm,
+        "max_shard_size": max_shard_size,
+        "safe_serialization": safe_serialization,
+        "source_revision": source_revision,
+        "tokenizer_source": tokenizer_name_or_path,
+    }
+    (output_path / "rwkv7_conversion.json").write_text(
+        json.dumps(conversion, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    validation = validate_rwkv7_artifact_in_subprocess(
+        output_path,
+        input_ids=validation_input_ids,
+        max_new_tokens=validation_max_new_tokens,
+    )
+    validation["artifact_files"] = sorted(
+        [path.name for path in output_path.iterdir() if path.is_file()] + ["rwkv7_validation.json"]
+    )
+    (output_path / "rwkv7_validation.json").write_text(
+        json.dumps(validation, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"conversion": conversion, "validation": validation}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -211,13 +343,24 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--fuse_embedding_layer_norm", action="store_true")
     parser.add_argument("--no_safe_serialization", action="store_true")
+    parser.add_argument("--max_shard_size", default="5GB")
+    parser.add_argument("--tokenizer_name_or_path")
+    parser.add_argument("--source_revision")
+    parser.add_argument("--validation_input_ids", default="1,2,3")
+    parser.add_argument("--validation_max_new_tokens", type=int, default=4)
     args = parser.parse_args(argv)
+    validation_input_ids = [int(token_id) for token_id in args.validation_input_ids.split(",") if token_id]
     convert_rwkv7_checkpoint_to_hf_format(
         args.checkpoint_path,
         args.output_dir,
         fuse_embedding_layer_norm=args.fuse_embedding_layer_norm,
         dtype=args.dtype,
         safe_serialization=not args.no_safe_serialization,
+        max_shard_size=args.max_shard_size,
+        tokenizer_name_or_path=args.tokenizer_name_or_path,
+        source_revision=args.source_revision,
+        validation_input_ids=validation_input_ids,
+        validation_max_new_tokens=args.validation_max_new_tokens,
     )
 
 
