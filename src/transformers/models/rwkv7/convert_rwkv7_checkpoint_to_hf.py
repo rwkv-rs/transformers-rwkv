@@ -292,6 +292,10 @@ def convert_rwkv7_checkpoint_to_hf_format(
     tokenizer_name_or_path: str | None = None,
     source_revision: str | None = None,
     wkv_backend: str = "auto",
+    publication_ready: bool = False,
+    model_card_path: str | None = None,
+    license_path: str | None = None,
+    hub_repo_id: str | None = None,
     validation_input_ids: list[int] | tuple[int, ...] = (1, 2, 3),
     validation_max_new_tokens: int = 4,
 ) -> dict:
@@ -302,6 +306,10 @@ def convert_rwkv7_checkpoint_to_hf_format(
         raise ValueError(f"Unsupported dtype `{dtype}`. Choose from {sorted(_SUPPORTED_DTYPES)} or preserve it.")
     if wkv_backend not in {"auto", "reference", "flash_rwkv"}:
         raise ValueError("`wkv_backend` must be `auto`, `reference`, or `flash_rwkv`.")
+    if publication_ready and (tokenizer_name_or_path is None or model_card_path is None or license_path is None):
+        raise ValueError(
+            "Publication-ready conversion requires tokenizer_name_or_path, model_card_path, and license_path."
+        )
 
     raw_state_dict = _validate_tensor_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
     config = infer_rwkv7_config(
@@ -364,7 +372,17 @@ def convert_rwkv7_checkpoint_to_hf_format(
         json.dumps(validation, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    return {"conversion": conversion, "validation": validation}
+    publication = None
+    if publication_ready:
+        from .prepare_rwkv7_hf_upload import prepare_rwkv7_hf_upload
+
+        publication = prepare_rwkv7_hf_upload(
+            output_path,
+            model_card_path=model_card_path,
+            license_path=license_path,
+            hub_repo_id=hub_repo_id,
+        )
+    return {"conversion": conversion, "publication": publication, "validation": validation}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -380,11 +398,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--tokenizer_name_or_path")
     parser.add_argument("--source_revision")
     parser.add_argument("--wkv_backend", choices=("auto", "reference", "flash_rwkv"), default="auto")
+    parser.add_argument("--publication_ready", action="store_true")
+    parser.add_argument("--model_card_path")
+    parser.add_argument("--license_path")
+    parser.add_argument("--hub_repo_id")
     parser.add_argument("--validation_input_ids", default="1,2,3")
     parser.add_argument("--validation_max_new_tokens", type=int, default=4)
     args = parser.parse_args(argv)
     validation_input_ids = [int(token_id) for token_id in args.validation_input_ids.split(",") if token_id]
-    convert_rwkv7_checkpoint_to_hf_format(
+    result = convert_rwkv7_checkpoint_to_hf_format(
         args.checkpoint_path,
         args.output_dir,
         fuse_embedding_layer_norm=args.fuse_embedding_layer_norm,
@@ -394,9 +416,14 @@ def main(argv: list[str] | None = None) -> None:
         tokenizer_name_or_path=args.tokenizer_name_or_path,
         source_revision=args.source_revision,
         wkv_backend=args.wkv_backend,
+        publication_ready=args.publication_ready,
+        model_card_path=args.model_card_path,
+        license_path=args.license_path,
+        hub_repo_id=args.hub_repo_id,
         validation_input_ids=validation_input_ids,
         validation_max_new_tokens=args.validation_max_new_tokens,
     )
+    print(f"RWKV7_CONVERSION={json.dumps(result, sort_keys=True)}")
 
 
 if __name__ == "__main__":
