@@ -425,9 +425,7 @@ def _rwkv7_flash(
             decay_logits = decay_logits + decay_bias.view(1, 1, -1)
             decay_bias = None
     tensors = [
-        tensor.to(dtype=recurrent_input_dtype)
-        .view(batch_size, sequence_length, num_heads, head_size)
-        .contiguous()
+        tensor.to(dtype=recurrent_input_dtype).view(batch_size, sequence_length, num_heads, head_size).contiguous()
         for tensor in (receptance, decay_logits, key, value, a, b)
     ]
     if state_indices is not None:
