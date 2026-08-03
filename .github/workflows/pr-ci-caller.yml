@@ -86,7 +86,7 @@ jobs:
       - name: Install canonical RWKV7 runtime in a fresh environment
         run: |
           uv venv "$RUNNER_TEMP/rwkv7-gpu-venv" --python 3.12 --clear
-          uv pip install --python "$RUNNER_TEMP/rwkv7-gpu-venv/bin/python" -e '.[torch,rwkv7]' pytest
+          uv pip install --python "$RUNNER_TEMP/rwkv7-gpu-venv/bin/python" -e '.[torch,rwkv7]' pytest pytest-xdist
 
       - name: Run real RWKV7 operator contracts
         run: |
