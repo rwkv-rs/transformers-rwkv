@@ -69,6 +69,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--input-ids",
+        help="Optional comma-separated fixed token ids; its length must equal prompt_tokens + decode_tokens.",
+    )
+    parser.add_argument(
         "--local-files-only",
         action="store_true",
         help="Pass local_files_only=True to the standard AutoConfig/AutoModel loaders.",
@@ -86,6 +90,21 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--warmup must be non-negative")
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires CUDA because latency is measured with CUDA events")
+
+
+def _parse_fixed_input_ids(encoded: str, *, expected_length: int, vocab_size: int) -> list[int]:
+    try:
+        input_ids = [int(value) for value in encoded.split(",") if value.strip()]
+    except ValueError as error:
+        raise ValueError("--input-ids must be a comma-separated list of integers") from error
+    if len(input_ids) != expected_length:
+        raise ValueError(
+            f"--input-ids contains {len(input_ids)} ids; expected {expected_length} "
+            "from --prompt-tokens + --decode-tokens"
+        )
+    if min(input_ids) < 0 or max(input_ids) >= vocab_size:
+        raise ValueError(f"--input-ids must be in [0, {vocab_size})")
+    return input_ids
 
 
 def _quantile(samples: list[float], fraction: float) -> float:
@@ -530,13 +549,23 @@ def main(argv: list[str] | None = None) -> int:
     ).to(device)
     model.eval()
 
-    generator = torch.Generator().manual_seed(args.seed)
-    full_input_ids = torch.randint(
-        low=0,
-        high=config.vocab_size,
-        size=(args.batch_size, args.prompt_tokens + args.decode_tokens),
-        generator=generator,
-    ).to(device)
+    if args.input_ids is None:
+        generator = torch.Generator().manual_seed(args.seed)
+        full_input_ids = torch.randint(
+            low=0,
+            high=config.vocab_size,
+            size=(args.batch_size, args.prompt_tokens + args.decode_tokens),
+            generator=generator,
+        ).to(device)
+        input_ids_source = "seeded-random"
+    else:
+        fixed_input_ids = _parse_fixed_input_ids(
+            args.input_ids,
+            expected_length=args.prompt_tokens + args.decode_tokens,
+            vocab_size=config.vocab_size,
+        )
+        full_input_ids = torch.tensor([fixed_input_ids] * args.batch_size, dtype=torch.long, device=device)
+        input_ids_source = "fixed-cli"
     prompt_input_ids = full_input_ids[:, : args.prompt_tokens]
     decode_input_ids = full_input_ids[:, args.prompt_tokens : args.prompt_tokens + 1]
 
@@ -608,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
             "hidden_size": config.hidden_size,
             "num_hidden_layers": config.num_hidden_layers,
             "head_size": config.head_size,
+            "input_ids": full_input_ids.cpu().tolist(),
+            "input_ids_source": input_ids_source,
         },
         "correctness_gate": correctness,
         "measurements": {"prefill": prefill, "decode": decode},

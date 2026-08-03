@@ -1,0 +1,175 @@
+name: RWKV7 real 1.5B fixed-token contract
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: rwkv7-real-checkpoint-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  real-checkpoint:
+    name: RWKV7 real checkpoint on PRO6000
+    runs-on: [self-hosted, rwkv-sha-pro6000x8]
+    timeout-minutes: 240
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_HOME: /usr/local/cuda
+      CUDA_PATH: /usr/local/cuda
+      LD_LIBRARY_PATH: /usr/local/cuda/lib64
+      WKV_MODE: fp32io16
+      CHECKPOINT: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1h-1.5b-20260710-ctx10240.pth
+      CHECKPOINT_SHA256: 737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c
+      ARTIFACT_ROOT: /home/caizus/Weights/RWKV/rwkv7/hf-artifacts
+      ARTIFACT_DIR: /home/caizus/Weights/RWKV/rwkv7/hf-artifacts/rwkv7-g1h-1.5b-20260710-ctx10240-${{ github.sha }}
+      RESULT_DIR: ${{ github.workspace }}/artifacts/rwkv7-real/${{ github.sha }}
+      SOURCE_REVISION: bd552d5e6aaaad88196629f7eb8dc8e24a644484
+      FIXED_INPUT_IDS: 1,7,11,3,5,9,13,17
+      UV_LINK_MODE: copy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare stable artifact and result paths
+        run: |
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          mkdir -p "$RESULT_DIR"
+          test -f "$CHECKPOINT"
+
+      - name: Preflight checkpoint and PRO6000 runner
+        run: |
+          nvidia-smi
+          test "$(nvidia-smi --id=0 --query-gpu=name --format=csv,noheader)" = \
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+          test "$(sha256sum "$CHECKPOINT" | awk '{print $1}')" = "$CHECKPOINT_SHA256"
+          uv --version
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install canonical RWKV7 runtime
+        run: |
+          uv venv "$RUNNER_TEMP/rwkv7-real-venv" --python 3.12 --clear
+          uv pip install --python "$RUNNER_TEMP/rwkv7-real-venv/bin/python" \
+            -e '.[torch,rwkv7]' pytest
+
+      - name: Convert the raw checkpoint to a standard HF artifact
+        run: |
+          if [[ -f "$ARTIFACT_DIR/rwkv7_conversion.json" ]]; then
+            "$RUNNER_TEMP/rwkv7-real-venv/bin/python" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          conversion = json.loads((Path(os.environ["ARTIFACT_DIR"]) / "rwkv7_conversion.json").read_text())
+          assert conversion["checkpoint_sha256"] == os.environ["CHECKPOINT_SHA256"]
+          assert conversion["source_revision"] == os.environ["SOURCE_REVISION"]
+          assert conversion["tokenizer_files"] == {}
+          print(json.dumps(conversion, indent=2, sort_keys=True))
+          PY
+          else
+            test ! -e "$ARTIFACT_DIR"
+            "$RUNNER_TEMP/rwkv7-real-venv/bin/python" -m \
+              transformers.models.rwkv7.convert_rwkv7_checkpoint_to_hf \
+              --checkpoint_path "$CHECKPOINT" \
+              --output_dir "$ARTIFACT_DIR" \
+              --dtype bfloat16 \
+              --source_revision "$SOURCE_REVISION" \
+              --validation_device cuda \
+              --validation_input_ids 1,7,11,3 \
+              --validation_max_new_tokens 3
+          fi
+
+      - name: Run fresh-process inference, oracle, and three-step training contract
+        run: |
+          "$RUNNER_TEMP/rwkv7-real-venv/bin/python" \
+            examples/pytorch/rwkv7/run_rwkv7_fixed_token_validation.py \
+            --artifact "$ARTIFACT_DIR" \
+            --checkpoint "$CHECKPOINT" \
+            --output "$RESULT_DIR/fixed-token-validation.json" \
+            --input-ids "$FIXED_INPUT_IDS" \
+            --dtype bfloat16 \
+            --optimizer-steps 3
+
+      - name: Measure the same fixed workload with CUDA events
+        run: |
+          "$RUNNER_TEMP/rwkv7-real-venv/bin/python" benchmark/rwkv7/standalone.py \
+            --model "$ARTIFACT_DIR" \
+            --output "$RESULT_DIR/standalone-benchmark.json" \
+            --dtype bfloat16 \
+            --batch-size 1 \
+            --prompt-tokens 4 \
+            --decode-tokens 4 \
+            --warmup 3 \
+            --iterations 20 \
+            --input-ids "$FIXED_INPUT_IDS" \
+            --local-files-only
+
+      - name: Write task4 manifest
+        if: always()
+        run: |
+          "$RUNNER_TEMP/rwkv7-real-venv/bin/python" - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          result_dir = Path(os.environ["RESULT_DIR"])
+          artifact_dir = Path(os.environ["ARTIFACT_DIR"])
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          files = {}
+          for path in sorted(artifact_dir.iterdir()):
+              if path.is_file() and path.suffix in {".json"}:
+                  files[path.name] = {"sha256": sha256(path), "size_bytes": path.stat().st_size}
+          manifest = {
+              "artifact": str(artifact_dir),
+              "artifact_metadata_files": files,
+              "branch": os.environ["GITHUB_REF_NAME"],
+              "checkpoint": {
+                  "path": os.environ["CHECKPOINT"],
+                  "sha256": os.environ["CHECKPOINT_SHA256"],
+              },
+              "commit": os.environ["GITHUB_SHA"],
+              "dependencies": {
+                  "fla": "606752b7dff79eb326eeebf2d046102027da5306",
+                  "flash_rwkv": "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb",
+                  "rwkv_lm_reference": os.environ["SOURCE_REVISION"],
+                  "albatross_reference": "ee3308f6922e59f2166c7fac3c5a192340a2b48e",
+              },
+              "gpu": subprocess.run(
+                  ["nvidia-smi", "--id=0", "--query-gpu=name", "--format=csv,noheader"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip(),
+              "input_ids": [int(value) for value in os.environ["FIXED_INPUT_IDS"].split(",")],
+              "precision": {"dtype": "bfloat16", "gemm_accumulation": "model default", "wkv_mode": "fp32io16"},
+              "runner": os.environ.get("RUNNER_NAME"),
+              "status": "passed" if all(
+                  (result_dir / name).is_file()
+                  for name in ("fixed-token-validation.json", "standalone-benchmark.json")
+              ) else "incomplete",
+              "results": str(result_dir),
+              "workflow_run": os.environ["GITHUB_RUN_ID"],
+          }
+          (result_dir / "task4-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+
+      - name: Upload task4 JSON evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rwkv7-real-checkpoint-${{ github.sha }}
+          path: |
+            ${{ github.workspace }}/artifacts/rwkv7-real/${{ github.sha }}/*.json
+            ${{ env.ARTIFACT_DIR }}/config.json
+            ${{ env.ARTIFACT_DIR }}/rwkv7_conversion.json
+            ${{ env.ARTIFACT_DIR }}/rwkv7_validation.json
+          if-no-files-found: error
