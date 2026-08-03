@@ -285,13 +285,9 @@ def _continuation_trace_diagnostics(
     )
     first_failure = None
     maximum = dict.fromkeys((*fields, "final_state"), 0.0)
-    for layer_index, (full_layer, staged_layer) in enumerate(
-        zip(full_trace, staged_trace, strict=True)
-    ):
+    for layer_index, (full_layer, staged_layer) in enumerate(zip(full_trace, staged_trace, strict=True)):
         if len(full_layer) != 1:
-            raise RuntimeError(
-                f"RWKV-7 continuation diagnostics expected one full trace call at layer={layer_index}"
-            )
+            raise RuntimeError(f"RWKV-7 continuation diagnostics expected one full trace call at layer={layer_index}")
         full_entry = full_layer[0]
         for call_index, staged_entry in enumerate(staged_layer):
             token_index = split + call_index
@@ -490,9 +486,7 @@ def _gradient_contract(*, device: torch.device, head_size: int) -> dict[str, Any
     (product_output * upstream_output).sum().add_((product_final_state * upstream_state).sum()).backward()
     (oracle_output * upstream_output).sum().add_((oracle_final_state * upstream_state).sum()).backward()
     gradient_records = {}
-    for name, product, oracle in zip(
-        ("dr", "dz", "dk", "dv", "da", "db"), product_inputs, oracle_inputs, strict=True
-    ):
+    for name, product, oracle in zip(("dr", "dz", "dk", "dv", "da", "db"), product_inputs, oracle_inputs, strict=True):
         error = _rrmse(product.grad, oracle.grad)
         gradient_records[name] = {
             "max_abs": (product.grad.float() - oracle.grad.float()).abs().max().item(),
@@ -507,14 +501,15 @@ def _gradient_contract(*, device: torch.device, head_size: int) -> dict[str, Any
     state_forward_error = _rrmse(product_final_state, oracle_final_state)
     maximum_gradient_error = max(record["rrmse"] for record in gradient_records.values())
     if maximum_gradient_error > 2e-5:
-        first_failure = next(
-            name for name, record in gradient_records.items() if record["rrmse"] > 2e-5
-        )
+        first_failure = next(name for name, record in gradient_records.items() if record["rrmse"] > 2e-5)
         raise RuntimeError(
             "RWKV-7 fp32io16 gradient mismatch: "
             f"tensor={first_failure}, rrmse={gradient_records[first_failure]['rrmse']}"
         )
-    if contract.get_last_provider() != "flash_rwkv" or contract.get_last_kernel() != "pretrain_recurrent_fp32io16_forward":
+    if (
+        contract.get_last_provider() != "flash_rwkv"
+        or contract.get_last_kernel() != "pretrain_recurrent_fp32io16_forward"
+    ):
         raise RuntimeError(
             "RWKV-7 gradient contract selected invalid runtime evidence: "
             f"provider={contract.get_last_provider()!r}, kernel={contract.get_last_kernel()!r}"
