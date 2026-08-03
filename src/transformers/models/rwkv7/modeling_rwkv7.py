@@ -331,6 +331,11 @@ def _load_fla_rwkv7_contract():
     missing = sorted(_FLA_RWKV7_REQUIRED_PARAMETERS - parameters.keys())
     if missing:
         raise RuntimeError(f"The installed FLA recurrent_rwkv7 API lacks required stateful parameters: {missing}.")
+    if "log_decay" in parameters:
+        raise RuntimeError(
+            "The installed FLA recurrent_rwkv7 API still exposes the obsolete log_decay product boundary; "
+            "RWKV-7 requires raw decay_logits fused by the native operator."
+        )
     return _FlaRwkv7Contract(
         recurrent_rwkv7=recurrent_rwkv7,
         flash_rwkv=flash_rwkv,
