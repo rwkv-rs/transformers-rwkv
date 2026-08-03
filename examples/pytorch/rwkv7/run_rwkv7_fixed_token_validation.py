@@ -544,8 +544,8 @@ def _training_contract(
             raise RuntimeError("RWKV-7 training call did not return recurrent state")
         # A deterministic all-ones upstream dout keeps this check independent
         # of a tokenizer and includes both the output and final-state paths.
-        loss = output.logits.float().mean() * 1e-6
-        loss = loss + sum(component.float().mean() for component in output.state) * 1e-6
+        loss = output.logits.float().sum() * 1e-6
+        loss = loss + sum(component.float().sum() for component in output.state) * 1e-6
         loss.backward()
         grad_norm, gradients_finite = _finite_grad_norm(model)
         before = model.model.blocks[0].att.w0.detach().clone()
