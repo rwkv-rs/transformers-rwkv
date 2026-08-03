@@ -160,7 +160,7 @@ def test_rwkv7_real_provider_inference_and_training() -> None:
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"flash_rwkv"}
 
     model.bfloat16().train()
-    with torch.enable_grad():
+    with torch.inference_mode(False), torch.enable_grad():
         training_output = model(input_ids=input_ids, labels=input_ids, use_cache=False)
         assert training_output.loss is not None and torch.isfinite(training_output.loss)
         assert training_output.logits.dtype == torch.bfloat16
