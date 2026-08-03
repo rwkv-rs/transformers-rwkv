@@ -66,6 +66,7 @@ def test_rwkv7_public_recurrent_uses_raw_decay_logits_contract() -> None:
     assert "decay_logits" in parameters
     assert "decay_bias" in parameters
     assert "elapsed_t" in parameters
+    assert "validated_metadata" in parameters
     assert "log_decay" not in parameters
 
 
@@ -100,7 +101,7 @@ def test_rwkv7_real_recurrent_matches_independent_nonzero_state_oracle_and_gradi
 
     contract = modeling_rwkv7._load_fla_rwkv7_contract()
     assert contract.get_last_provider() == "flash_rwkv"
-    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_from_decay_logits"
+    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_forward"
     assert _rrmse(product_output, oracle_output) <= 0.007
     assert _rrmse(product_final_state, oracle_final_state) <= 0.008
     for product, oracle in zip([*product_inputs, product_state], [*oracle_inputs, oracle_state], strict=True):
@@ -164,7 +165,7 @@ def test_rwkv7_real_provider_inference_and_training() -> None:
     assert training_output.logits.dtype == torch.bfloat16
     training_output.loss.backward()
     assert contract.get_last_provider() == "flash_rwkv"
-    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_from_decay_logits"
+    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_forward"
     gradient = model.model.blocks[0].att.receptance.weight.grad
     assert gradient is not None and torch.isfinite(gradient).all()
     decay_bias_gradient = model.model.blocks[0].att.w0.grad
@@ -213,7 +214,7 @@ def test_rwkv7_real_provider_packed_noncontiguous_state_pool() -> None:
     contract = modeling_rwkv7._load_fla_rwkv7_contract()
     assert final_state is state_pool
     assert contract.get_last_provider() == "flash_rwkv"
-    assert contract.get_last_kernel() == "rwkv7_recurrent_stateful_from_decay_logits"
+    assert contract.get_last_kernel() == "rwkv7_recurrent_stateful"
     assert torch.isfinite(output).all()
     assert _rrmse(output, torch.cat(expected_outputs, dim=1)) <= 0.002
     assert _rrmse(state_pool[[4, 1]], expected_state_pool[[4, 1]]) <= 0.002

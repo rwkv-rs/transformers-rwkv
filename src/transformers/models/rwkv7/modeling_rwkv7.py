@@ -32,6 +32,7 @@ _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
         "cu_seqlens",
         "state_indices",
         "mode",
+        "validated_metadata",
     }
 )
 _FLA_RWKV7_FUSED_INFERENCE_OPERATORS = frozenset(
@@ -70,6 +71,7 @@ RWKV7_FLASH_RWKV_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
 @dataclass(frozen=True)
 class _FlaRwkv7Contract:
     recurrent_rwkv7: object
+    prepare_recurrent_metadata: object
     flash_rwkv: object
     can_use_flash_rwkv_inference: object
     get_last_provider: object
@@ -317,17 +319,24 @@ def _load_fla_rwkv7_contract():
     rwkv7 = importlib.import_module("fla.ops.rwkv7")
     inference = importlib.import_module("fla.ops.rwkv7.inference")
     recurrent_rwkv7 = getattr(rwkv7, "recurrent_rwkv7", None)
+    prepare_recurrent_metadata = getattr(rwkv7, "prepare_rwkv7_recurrent_metadata", None)
     flash_rwkv = getattr(rwkv7, "flash_rwkv", None)
     can_use_flash_rwkv_inference = getattr(inference, "can_use_flash_rwkv_inference", None)
     get_last_provider = getattr(rwkv7, "get_last_rwkv7_provider", None)
     get_last_kernel = getattr(rwkv7, "get_last_rwkv7_kernel", None)
     if not all(
         callable(function)
-        for function in (recurrent_rwkv7, can_use_flash_rwkv_inference, get_last_provider, get_last_kernel)
+        for function in (
+            recurrent_rwkv7,
+            prepare_recurrent_metadata,
+            can_use_flash_rwkv_inference,
+            get_last_provider,
+            get_last_kernel,
+        )
     ):
         raise RuntimeError(
-            "The installed FLA RWKV-7 API must publicly expose recurrent_rwkv7, fused inference eligibility, "
-            "and provider/kernel telemetry."
+            "The installed FLA RWKV-7 API must publicly expose recurrent_rwkv7, "
+            "prepare_rwkv7_recurrent_metadata, fused inference eligibility, and provider/kernel telemetry."
         )
     missing_operators = sorted(
         operator
@@ -360,6 +369,7 @@ def _load_fla_rwkv7_contract():
         )
     return _FlaRwkv7Contract(
         recurrent_rwkv7=recurrent_rwkv7,
+        prepare_recurrent_metadata=prepare_recurrent_metadata,
         flash_rwkv=flash_rwkv,
         can_use_flash_rwkv_inference=can_use_flash_rwkv_inference,
         get_last_provider=get_last_provider,
@@ -390,6 +400,7 @@ def _rwkv7_flash(
     decay_bias=None,
     cu_seqlens=None,
     state_indices=None,
+    validated_metadata=None,
     contract=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run raw RWKV decay logits through FLA's public native-fused recurrent contract."""
@@ -417,16 +428,17 @@ def _rwkv7_flash(
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             mode="fp32io16",
+            validated_metadata=validated_metadata,
         )
     except (RuntimeError, TypeError, ValueError) as error:
         raise RuntimeError(f"FLA public recurrent_rwkv7 execution failed: {error}") from error
     requires_grad = any(tensor.requires_grad for tensor in (*tensors, state))
     expected_kernel = (
-        "rwkv7_recurrent_stateful_from_decay_logits"
+        "rwkv7_recurrent_stateful"
         if state_indices is not None
-        else "pretrain_recurrent_fp32io16_from_decay_logits"
+        else "pretrain_recurrent_fp32io16_forward"
         if requires_grad
-        else "rwkv7_recurrent_from_decay_logits"
+        else "rwkv7_recurrent"
     )
     _require_flash_rwkv_telemetry(contract, expected_kernel)
     if not isinstance(result, tuple) or len(result) != 2:

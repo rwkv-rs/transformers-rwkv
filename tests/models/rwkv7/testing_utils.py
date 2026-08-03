@@ -38,12 +38,14 @@ def recurrent_rwkv7(
     cu_seqlens,
     state_indices,
     mode,
+    validated_metadata=None,
 ):
     """CPU oracle for the public recurrent FLA call shape; this is not a FlashRWKV operator E2E helper."""
     global _last_rwkv7_kernel
     assert output_final_state is True
     assert mode == "fp32io16"
     assert elapsed_t is None
+    assert validated_metadata is None
     if decay_bias is not None:
         decay_logits = decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
     legacy_log_rate = -torch.nn.functional.softplus(-decay_logits) - 0.5
@@ -51,13 +53,13 @@ def recurrent_rwkv7(
     tensors = (r, log_decay, k, v, a, b)
     if state_indices is None:
         _last_rwkv7_kernel = (
-            "pretrain_recurrent_fp32io16_from_decay_logits"
+            "pretrain_recurrent_fp32io16_forward"
             if any(tensor.requires_grad for tensor in (*tensors, initial_state))
-            else "rwkv7_recurrent_from_decay_logits"
+            else "rwkv7_recurrent"
         )
         return _run_sequence(tensors, initial_state)
 
-    _last_rwkv7_kernel = "rwkv7_recurrent_stateful_from_decay_logits"
+    _last_rwkv7_kernel = "rwkv7_recurrent_stateful"
     outputs = []
     for sequence_index in range(state_indices.numel()):
         start = int(cu_seqlens[sequence_index])
@@ -74,6 +76,10 @@ def recurrent_rwkv7(
 
 # Explicit chunk/reference comparisons may keep using this test-only oracle name.
 chunk_rwkv7 = recurrent_rwkv7
+
+
+def prepare_rwkv7_recurrent_metadata(cu_seqlens, state_indices, *, total_tokens, state_pool_size):
+    return (cu_seqlens, state_indices, total_tokens, state_pool_size)
 
 
 def get_last_rwkv7_provider():
