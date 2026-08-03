@@ -520,7 +520,13 @@ class Rwkv7TimeMix(nn.Module):
         key = self.key(inputs["k"])
         value = self.value(inputs["v"])
         decay_delta = self.w2(torch.tanh(self.w1(inputs["w"])))
-        if torch.is_grad_enabled():
+        # A model in training mode must keep the producer-side bias in the raw
+        # decay-logit tensor even when an outer runner temporarily disables
+        # autograd (for example while probing a training graph).  The
+        # accelerated inference surface accepts ``decay_bias`` and is
+        # forward-only; selecting it solely from the ambient grad flag can
+        # therefore send a training-mode call to the wrong FLA family.
+        if self.training or torch.is_grad_enabled():
             decay_logits = self.w0 + decay_delta
             decay_bias = None
         else:
