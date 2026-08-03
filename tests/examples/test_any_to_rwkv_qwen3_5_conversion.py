@@ -31,7 +31,7 @@ def public_recurrent_contract(monkeypatch):
 
     def recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
@@ -43,8 +43,10 @@ def public_recurrent_contract(monkeypatch):
         state_indices,
         mode,
     ):
-        calls.append((r.shape, initial_state.shape, output_final_state, cu_seqlens, state_indices, mode))
-        output = (r + w + k + v + a + b) / 6
+        calls.append(
+            (r.shape, decay_logits.shape, initial_state.shape, output_final_state, cu_seqlens, state_indices, mode)
+        )
+        output = (r + decay_logits + k + v + a + b) / 6
         final_state = initial_state + torch.einsum("bthk,bthv->bhkv", k.float(), v.float())
         return output, final_state
 
@@ -91,7 +93,8 @@ def test_any_to_rwkv_example_composes_and_round_trips_source_components(tmp_path
     assert converted.layers[0].moe.gate.weight.grad is not None
     assert converted.layers[0].recurrent_mixer.r.weight.grad is not None
     assert [call[0][-1] for call in public_recurrent_contract] == [128, 256]
-    assert all(call[2:] == (True, None, None, "fp32io16") for call in public_recurrent_contract)
+    assert all(call[0] == call[1] for call in public_recurrent_contract)
+    assert all(call[3:] == (True, None, None, "fp32io16") for call in public_recurrent_contract)
 
     converted.eval()
     expected_logits = converted(input_ids).logits.detach()

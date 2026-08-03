@@ -249,7 +249,7 @@ def test_rwkv7_cache_default_depends_on_training_mode(synthetic_fla_public_contr
 
 def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:
     receptance = torch.tensor([[[0.2, -0.4], [0.3, 0.1]]])
-    raw_decay = torch.tensor([[[0.5, -0.2], [0.1, 0.7]]])
+    log_decay = torch.tensor([[[-0.5, -0.2], [-0.1, -0.7]]])
     key = torch.tensor([[[0.6, -0.3], [0.2, 0.8]]])
     value = torch.tensor([[[0.4, -0.5], [0.7, 0.9]]])
     a = torch.tensor([[[-0.2, 0.9], [0.5, -0.1]]])
@@ -258,7 +258,7 @@ def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:
 
     output, final_state = rwkv7_reference(
         receptance,
-        raw_decay,
+        log_decay,
         key,
         value,
         a,
@@ -268,7 +268,6 @@ def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:
     )
     state = initial_state
     expected_outputs = []
-    log_decay = -torch.nn.functional.softplus(-raw_decay) - 0.5
     for token in range(2):
         previous_state = state
         a_state = torch.einsum("bhk,bhkv->bhv", a[:, token : token + 1], previous_state)
@@ -282,6 +281,61 @@ def test_rwkv7_reference_matches_explicit_dplr_oracle() -> None:
 
     torch.testing.assert_close(output, expected_output)
     torch.testing.assert_close(final_state, state)
+
+
+def test_rwkv7_decay_logit_semantics_match_primary_source_forward_and_gradient() -> None:
+    raw_decay = torch.tensor([-40.0, -1.0, 0.0, 1.0, 40.0], requires_grad=True)
+    expected_raw_decay = raw_decay.detach().clone().requires_grad_()
+
+    actual = -torch.exp(torch.tensor(-0.5)) * torch.sigmoid(raw_decay)
+    legacy_log_rate = -torch.nn.functional.softplus(-expected_raw_decay) - 0.5
+    expected = -legacy_log_rate.exp()
+    weights = torch.tensor([0.5, -0.75, 1.0, 1.25, -1.5])
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(raw_decay.grad, expected_raw_decay.grad, rtol=1e-6, atol=1e-6)
+    assert not torch.isclose(actual[2].exp(), torch.exp(torch.tensor(-0.5)) * torch.sigmoid(torch.tensor(0.0)))
+
+
+@pytest.mark.parametrize("nonzero_initial_state", [False, True], ids=("zero-state", "nonzero-state"))
+def test_rwkv7_product_decay_and_recurrence_match_independent_oracle_with_gradients(
+    nonzero_initial_state,
+) -> None:
+    torch.manual_seed(20260803)
+    product_inputs = [(torch.randn(1, 3, 4) * 0.2).requires_grad_() for _ in range(6)]
+    product_state = (
+        torch.randn(1, 1, 4, 4) * 0.1 if nonzero_initial_state else torch.zeros(1, 1, 4, 4)
+    ).requires_grad_()
+    oracle_inputs = [tensor.detach().clone().requires_grad_() for tensor in product_inputs]
+    oracle_state = product_state.detach().clone().requires_grad_()
+
+    product_output, product_final_state = modeling_rwkv7._rwkv7_flash(
+        *product_inputs,
+        product_state,
+        4,
+        contract=_cpu_public_contract(),
+    )
+    oracle_log_decay = -torch.exp(torch.tensor(-0.5)) * torch.sigmoid(oracle_inputs[1])
+    oracle_output, oracle_final_state = rwkv7_reference(
+        oracle_inputs[0],
+        oracle_log_decay,
+        *oracle_inputs[2:],
+        oracle_state,
+        head_size=4,
+    )
+    output_gradient = torch.randn_like(product_output)
+    state_gradient = torch.randn_like(product_final_state)
+    product_loss = (product_output * output_gradient).sum() + (product_final_state * state_gradient).sum()
+    oracle_loss = (oracle_output * output_gradient).sum() + (oracle_final_state * state_gradient).sum()
+    product_loss.backward()
+    oracle_loss.backward()
+
+    torch.testing.assert_close(product_output, oracle_output, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(product_final_state, oracle_final_state, rtol=1e-6, atol=1e-6)
+    for product, oracle in zip([*product_inputs, product_state], [*oracle_inputs, oracle_state], strict=True):
+        torch.testing.assert_close(product.grad, oracle.grad, rtol=1e-6, atol=1e-6)
 
 
 def test_rwkv7_reference_uses_fp32_state_with_half_io_and_gradients() -> None:
@@ -782,7 +836,7 @@ import inspect
 from fla.ops.rwkv7 import flash_rwkv, get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
-required = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+required = {"decay_logits", "initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
 assert required <= inspect.signature(recurrent_rwkv7).parameters.keys()
 assert callable(get_last_rwkv7_provider)
 assert callable(get_last_rwkv7_kernel)
@@ -802,13 +856,20 @@ for operator in {
 @pytest.mark.parametrize("training", [False, True])
 def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monkeypatch, training) -> None:
     """Validate the HF call contract on CPU; this does not execute the real FLA or FlashRWKV operator."""
-    required_parameters = {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+    required_parameters = {
+        "decay_logits",
+        "initial_state",
+        "output_final_state",
+        "cu_seqlens",
+        "state_indices",
+        "mode",
+    }
     calls = []
     telemetry = {}
 
     def public_recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
@@ -820,13 +881,13 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
         state_indices,
         mode,
     ):
-        calls.append((r, w, k, v, a, b, initial_state, output_final_state, cu_seqlens, state_indices, mode))
+        calls.append((r, decay_logits, k, v, a, b, initial_state, output_final_state, cu_seqlens, state_indices, mode))
         telemetry["kernel"] = (
-            "pretrain_recurrent_fp32io16_forward"
-            if any(tensor.requires_grad for tensor in (r, w, k, v, a, b, initial_state))
-            else "rwkv7"
+            "pretrain_recurrent_fp32io16_from_decay_logits"
+            if any(tensor.requires_grad for tensor in (r, decay_logits, k, v, a, b, initial_state))
+            else "rwkv7_recurrent_from_decay_logits"
         )
-        output = (r + w + k + v + a + b) / 6
+        output = (r + decay_logits + k + v + a + b) / 6
         if state_indices is not None:
             initial_state.add_(1)
             final_state = initial_state
@@ -860,12 +921,13 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
 
     assert len(calls) == 2
     for call in calls:
-        r, w, k, v, a, b, initial_state, output_final_state, cu_seqlens, state_indices, mode = call
-        assert all(tensor.shape == r.shape for tensor in (w, k, v, a, b))
+        r, decay_logits, k, v, a, b, initial_state, output_final_state, cu_seqlens, state_indices, mode = call
+        assert all(tensor.shape == r.shape for tensor in (decay_logits, k, v, a, b))
         assert initial_state.shape == (2, 1, 64, 64)
         assert output_final_state is True
         assert mode == "fp32io16"
         assert r.shape == (2, 3, 1, 64)
+        torch.testing.assert_close(decay_logits, torch.zeros_like(decay_logits))
         assert cu_seqlens is None
         assert state_indices is None
     assert {block.att.last_wkv_backend for block in model.model.blocks} == {"flash_rwkv"}
@@ -925,7 +987,7 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
 
     def public_recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
@@ -939,9 +1001,9 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
     ):
         assert output_final_state is True
         assert cu_seqlens is None and state_indices is None and mode == "fp32io16"
-        output = (r + w + k + v + a + b) / 6
+        output = (r + decay_logits + k + v + a + b) / 6
         final_state = initial_state + torch.einsum("bthk,bthv->bhkv", k.float(), v.float())
-        return record("rwkv7", (output, final_state))
+        return record("rwkv7_recurrent_from_decay_logits", (output, final_state))
 
     def get_last_provider():
         telemetry_checks.append(("provider", telemetry.get("provider")))
@@ -968,13 +1030,13 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
     assert calls == [
         "infer_tmix_mix6_fp16",
         "infer_tmix_kk_a_gate_fp16",
-        "rwkv7",
+        "rwkv7_recurrent_from_decay_logits",
         "infer_tmix_lnx_rkvres_xg_fp16",
         "infer_cmix_mix_fp16",
         "infer_tmix_mix6_fp16",
         "infer_tmix_vres_gate_fp16",
         "infer_tmix_kk_a_gate_fp16",
-        "rwkv7",
+        "rwkv7_recurrent_from_decay_logits",
         "infer_tmix_lnx_rkvres_xg_fp16",
         "infer_cmix_mix_fp16",
     ]
@@ -987,7 +1049,7 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
 
     def public_recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
@@ -1000,7 +1062,7 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
         mode,
     ):
         calls.append((initial_state, output_final_state, cu_seqlens, state_indices, mode))
-        telemetry["kernel"] = "rwkv7_recurrent_stateful"
+        telemetry["kernel"] = "rwkv7_recurrent_stateful_from_decay_logits"
         for state_index in state_indices.tolist():
             initial_state[state_index].add_(1)
         return torch.zeros_like(v), initial_state
@@ -1046,7 +1108,7 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
 def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> None:
     def public_recurrent_rwkv7(
         r,
-        w,
+        decay_logits,
         k,
         v,
         a,
@@ -1066,7 +1128,7 @@ def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> Non
         lambda: _cpu_public_contract(
             public_recurrent_rwkv7,
             provider=lambda: "fla",
-            kernel=lambda: "rwkv7",
+            kernel=lambda: "rwkv7_recurrent_from_decay_logits",
         ),
     )
     model = Rwkv7ForCausalLM(_tiny_flash_config()).eval()
