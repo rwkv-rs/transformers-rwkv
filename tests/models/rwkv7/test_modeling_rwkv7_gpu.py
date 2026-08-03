@@ -64,6 +64,8 @@ def test_rwkv7_public_recurrent_uses_raw_decay_logits_contract() -> None:
     parameters = inspect.signature(contract.recurrent_rwkv7).parameters
 
     assert "decay_logits" in parameters
+    assert "decay_bias" in parameters
+    assert "elapsed_t" in parameters
     assert "log_decay" not in parameters
 
 
@@ -165,6 +167,8 @@ def test_rwkv7_real_provider_inference_and_training() -> None:
     assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_from_decay_logits"
     gradient = model.model.blocks[0].att.receptance.weight.grad
     assert gradient is not None and torch.isfinite(gradient).all()
+    decay_bias_gradient = model.model.blocks[0].att.w0.grad
+    assert decay_bias_gradient is not None and torch.isfinite(decay_bias_gradient).all()
 
 
 @require_torch_gpu

@@ -37,12 +37,15 @@ def public_recurrent_contract(monkeypatch):
         a,
         b,
         *,
+        decay_bias=None,
+        elapsed_t=None,
         initial_state,
         output_final_state,
         cu_seqlens,
         state_indices,
         mode,
     ):
+        assert decay_bias is None and elapsed_t is None
         calls.append(
             (r.shape, decay_logits.shape, initial_state.shape, output_final_state, cu_seqlens, state_indices, mode)
         )

@@ -23,7 +23,16 @@ from .configuration_rwkv7 import Rwkv7Config
 
 
 _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
-    {"decay_logits", "initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+    {
+        "decay_logits",
+        "decay_bias",
+        "elapsed_t",
+        "initial_state",
+        "output_final_state",
+        "cu_seqlens",
+        "state_indices",
+        "mode",
+    }
 )
 _FLA_RWKV7_FUSED_INFERENCE_OPERATORS = frozenset(
     {
@@ -351,6 +360,7 @@ def _rwkv7_flash(
     state,
     head_size,
     *,
+    decay_bias=None,
     cu_seqlens=None,
     state_indices=None,
     contract=None,
@@ -373,6 +383,8 @@ def _rwkv7_flash(
     try:
         result = contract.recurrent_rwkv7(
             *tensors,
+            decay_bias=decay_bias,
+            elapsed_t=None,
             initial_state=state,
             output_final_state=True,
             cu_seqlens=cu_seqlens,
@@ -468,7 +480,13 @@ class Rwkv7TimeMix(nn.Module):
         receptance = self.receptance(inputs["r"])
         key = self.key(inputs["k"])
         value = self.value(inputs["v"])
-        decay_logits = self.w0 + self.w2(torch.tanh(self.w1(inputs["w"])))
+        decay_delta = self.w2(torch.tanh(self.w1(inputs["w"])))
+        if torch.is_grad_enabled():
+            decay_logits = self.w0 + decay_delta
+            decay_bias = None
+        else:
+            decay_logits = decay_delta
+            decay_bias = self.w0.view(self.config.num_attention_heads, self.config.head_size)
         if self.layer_id == 0:
             v_first = value
         else:
@@ -525,7 +543,7 @@ class Rwkv7TimeMix(nn.Module):
             self.config.head_size,
         )
         try:
-            output, wkv_state = _rwkv7_flash(*wkv_inputs, contract=contract)
+            output, wkv_state = _rwkv7_flash(*wkv_inputs, decay_bias=decay_bias, contract=contract)
         except RuntimeError as error:
             raise RuntimeError(f"RWKV-7 FlashRWKV execution failed closed: {error}") from error
         self.last_wkv_backend = "flash_rwkv"
