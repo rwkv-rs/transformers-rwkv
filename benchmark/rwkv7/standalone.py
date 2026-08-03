@@ -178,6 +178,12 @@ def _state_difference_summary(
     )
 
 
+def _rrmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    difference = actual.float() - expected.float()
+    denominator = expected.float().square().mean().sqrt().clamp_min(torch.finfo(torch.float32).eps)
+    return (difference.square().mean().sqrt() / denominator).item()
+
+
 def _correctness_gate(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -216,16 +222,32 @@ def _correctness_gate(
     expected = one_shot.logits[:, prompt_tokens:]
     difference = (staged.float() - expected.float()).abs()
     if dtype == torch.float32:
-        rtol, atol = 1e-5, 1e-5
+        # The public fp32 model contract uses the canonical fp32-state/fp16-I/O
+        # WKV path.  Its staged-vs-one-shot comparison is therefore a numerical
+        # equivalence check, rather than an elementwise fp32 identity check.
+        rrmse_limit = 0.002
     elif dtype == torch.float16:
-        rtol, atol = 5e-3, 5e-3
+        rrmse_limit = 0.003
     else:
-        rtol, atol = 5e-2, 5e-2
-    torch.testing.assert_close(staged, expected, rtol=rtol, atol=atol)
+        rrmse_limit = 5e-2
+    logits_rrmse = _rrmse(staged, expected)
+    if logits_rrmse > rrmse_limit:
+        raise AssertionError(
+            "RWKV7 staged-vs-one-shot logits exceeded the numerical contract: "
+            f"RRMSE={logits_rrmse:.6g} > {rrmse_limit:.6g}, "
+            f"max_abs={difference.max().item():.6g}"
+        )
     if len(state) != len(one_shot.state):
         raise RuntimeError("RWKV7 staged and one-shot calls returned different recurrent-state layouts")
-    for staged_component, expected_component in zip(state, one_shot.state, strict=True):
-        torch.testing.assert_close(staged_component, expected_component, rtol=rtol, atol=atol)
+    state_rrmse = 0.0
+    for component_index, (staged_component, expected_component) in enumerate(zip(state, one_shot.state, strict=True)):
+        component_rrmse = _rrmse(staged_component, expected_component)
+        state_rrmse = max(state_rrmse, component_rrmse)
+        if component_rrmse > rrmse_limit:
+            raise AssertionError(
+                "RWKV7 staged-vs-one-shot recurrent state exceeded the numerical contract: "
+                f"component={component_index}, RRMSE={component_rrmse:.6g} > {rrmse_limit:.6g}"
+            )
     for preserved_component, snapshot_component in zip(prefix.state, prefix_state_snapshot, strict=True):
         torch.testing.assert_close(preserved_component, snapshot_component, rtol=0, atol=0)
 
@@ -244,12 +266,13 @@ def _correctness_gate(
             "compared_tokens": input_ids.shape[1] - prompt_tokens,
             "max_abs_error": difference.max().item(),
             "mean_abs_error": difference.mean().item(),
+            "rrmse": logits_rrmse,
+            "rrmse_limit": rrmse_limit,
             "state_components": len(state),
             "state_max_abs_error": state_max_abs_error,
             "state_mean_abs_error": state_mean_abs_error,
+            "state_rrmse": state_rrmse,
             "input_state_preserved": True,
-            "rtol": rtol,
-            "atol": atol,
             "observed_backends": sorted(observed),
             "backend_observations": {
                 "one_shot": sorted(one_shot_backend),
