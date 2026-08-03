@@ -77,7 +77,7 @@ def main():
         codeowners_lines = f.readlines()
 
     g = Github(os.environ['GITHUB_TOKEN'])
-    repo = g.get_repo("huggingface/transformers")
+    repo = g.get_repo(os.environ["GITHUB_REPOSITORY"])
     with open(os.environ['GITHUB_EVENT_PATH']) as f:
         event = json.load(f)
 
