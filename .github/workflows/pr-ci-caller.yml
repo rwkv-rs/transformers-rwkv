@@ -61,6 +61,8 @@ jobs:
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_decay_logit_semantics_match_primary_source_forward_and_gradient \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_product_decay_and_recurrence_match_independent_oracle_with_gradients \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_signature_is_importable_in_fresh_process \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_rejects_ambiguous_log_decay_signature \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_contract_rejects_legacy_decay_exports \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity \

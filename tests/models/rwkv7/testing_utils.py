@@ -1,8 +1,6 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
-import math
-
 import torch
 
 
@@ -91,14 +89,7 @@ def _unavailable_fused_operator(*args, **kwargs):
     raise RuntimeError("Synthetic CPU contract does not execute FlashRWKV fused operators.")
 
 
-def decay_logits_to_log_decay(decay_logits):
-    global _last_rwkv7_kernel
-    _last_rwkv7_kernel = "decay_logits_to_log_decay"
-    return -math.exp(-0.5) * torch.sigmoid(decay_logits)
-
-
 class _FlashRwkvPublicApi:
-    decay_logits_to_log_decay = staticmethod(decay_logits_to_log_decay)
     infer_cmix_mix_fp16 = staticmethod(_unavailable_fused_operator)
     infer_tmix_kk_a_gate_fp16 = staticmethod(_unavailable_fused_operator)
     infer_tmix_lnx_rkvres_xg_fp16 = staticmethod(_unavailable_fused_operator)
