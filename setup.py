@@ -187,7 +187,7 @@ extras["quality"] = deps_list(
 )
 extras["docs"] = deps_list("hf-doc-builder")
 extras["kernels"] = deps_list("kernels")
-extras["rwkv7"] = deps_list("flash-linear-attention[flash-rwkv]")
+extras["rwkv7"] = deps_list("flash-linear-attention[flash-rwkv]") + ["torch==2.11.0"]
 extras["sentencepiece"] = deps_list("sentencepiece", "protobuf")
 extras["tiktoken"] = deps_list("tiktoken", "blobfile")
 extras["mistral-common"] = deps_list("mistral-common[image]")
