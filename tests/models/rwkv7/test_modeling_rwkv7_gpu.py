@@ -4,6 +4,7 @@
 import json
 import subprocess
 import sys
+from importlib import metadata as importlib_metadata
 
 import torch
 
@@ -15,6 +16,7 @@ from transformers.testing_utils import require_torch_gpu
 
 FLA_REVISION = "8173df6ab27adb1c160a59d84b4ee02b6c6d8926"
 FLASH_RWKV_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
+TORCH_VERSION = "2.11.0"
 
 
 def _gpu_config() -> Rwkv7Config:
@@ -32,17 +34,20 @@ def _gpu_config() -> Rwkv7Config:
 def test_rwkv7_canonical_runtime_provenance_in_fresh_process() -> None:
     code = f"""
 import json
+from importlib import metadata as importlib_metadata
 from transformers.models.rwkv7.modeling_rwkv7 import validate_rwkv7_runtime_provenance
 
 provenance = validate_rwkv7_runtime_provenance()
 assert provenance["revision"] == {FLA_REVISION!r}
 assert provenance["flash_rwkv_revision"] == {FLASH_RWKV_REVISION!r}
+assert importlib_metadata.version("torch") == {TORCH_VERSION!r}
 print(json.dumps(provenance, sort_keys=True))
 """
     result = subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
     provenance = json.loads(result.stdout)
     assert provenance["revision"] == FLA_REVISION
     assert provenance["flash_rwkv_revision"] == FLASH_RWKV_REVISION
+    assert importlib_metadata.version("torch") == TORCH_VERSION
 
 
 @require_torch_gpu
