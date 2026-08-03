@@ -159,6 +159,32 @@ def test_convert_raw_checkpoint_strict_auto_load_round_trip(tmp_path, synthetic_
     assert json.loads((output_dir / "rwkv7_validation.json").read_text())["strict_load"]
 
 
+def test_convert_raw_checkpoint_without_tokenizer_keeps_fixed_token_validation(
+    tmp_path, synthetic_fla_public_contract
+) -> None:
+    source = Rwkv7ForCausalLM(_config()).eval()
+    checkpoint = tmp_path / "rwkv7-g1i-ctx32.pth"
+    output_dir = tmp_path / "fixed-token-artifact"
+    torch.save(_legacy_state_dict(source), checkpoint)
+
+    result = convert_rwkv7_checkpoint_to_hf_format(
+        str(checkpoint),
+        str(output_dir),
+        source_revision="d" * 40,
+        validation_device="cpu",
+        validation_input_ids=[1, 2, 3],
+        validation_max_new_tokens=2,
+    )
+
+    assert result["conversion"]["tokenizer_files"] == {}
+    assert result["conversion"]["tokenizer_source"] is None
+    assert result["validation"]["tokenizer_available"] is False
+    assert result["validation"]["tokenizer_class"] is None
+    assert result["validation"]["strict_load"] is True
+    assert not (output_dir / "tokenizer.json").exists()
+    assert not (output_dir / "tokenizer_config.json").exists()
+
+
 def test_converter_can_fuse_embedding_layer_norm(tmp_path, synthetic_fla_public_contract) -> None:
     torch.manual_seed(0)
     source = Rwkv7ForCausalLM(_config()).eval()
