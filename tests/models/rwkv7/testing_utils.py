@@ -33,6 +33,8 @@ def recurrent_rwkv7(
     a,
     b,
     *,
+    decay_bias=None,
+    elapsed_t=None,
     initial_state,
     output_final_state,
     cu_seqlens,
@@ -43,6 +45,9 @@ def recurrent_rwkv7(
     global _last_rwkv7_kernel
     assert output_final_state is True
     assert mode == "fp32io16"
+    assert elapsed_t is None
+    if decay_bias is not None:
+        decay_logits = decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
     legacy_log_rate = -torch.nn.functional.softplus(-decay_logits) - 0.5
     log_decay = -legacy_log_rate.exp()
     tensors = (r, log_decay, k, v, a, b)
