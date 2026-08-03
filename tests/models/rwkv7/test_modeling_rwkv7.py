@@ -27,7 +27,12 @@ from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_N
 from transformers.utils import SAFE_WEIGHTS_NAME
 
 from ...causal_lm_tester import CausalLMModelTest, CausalLMModelTester
-from .testing_utils import get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
+from .testing_utils import (
+    get_last_rwkv7_kernel,
+    get_last_rwkv7_provider,
+    prepare_rwkv7_recurrent_metadata,
+    recurrent_rwkv7,
+)
 
 
 class Rwkv7ModelTester(CausalLMModelTester):
@@ -65,6 +70,7 @@ class Rwkv7ModelTest(CausalLMModelTest, unittest.TestCase):
             "_load_fla_rwkv7_contract",
             return_value=modeling_rwkv7._FlaRwkv7Contract(
                 recurrent_rwkv7=recurrent_rwkv7,
+                prepare_recurrent_metadata=prepare_rwkv7_recurrent_metadata,
                 flash_rwkv=None,
                 can_use_flash_rwkv_inference=lambda *args, **kwargs: False,
                 get_last_provider=get_last_rwkv7_provider,
@@ -105,6 +111,7 @@ def _cpu_public_contract(
 ):
     return modeling_rwkv7._FlaRwkv7Contract(
         recurrent_rwkv7=recurrent,
+        prepare_recurrent_metadata=prepare_rwkv7_recurrent_metadata,
         flash_rwkv=None,
         can_use_flash_rwkv_inference=lambda *args, **kwargs: False,
         get_last_provider=provider,
@@ -810,6 +817,7 @@ def test_rwkv7_public_contract_requires_fused_inference_surface(monkeypatch, req
 
     class PublicRwkv7Module:
         recurrent_rwkv7 = staticmethod(recurrent_rwkv7)
+        prepare_rwkv7_recurrent_metadata = staticmethod(prepare_rwkv7_recurrent_metadata)
         flash_rwkv = IncompleteFlashRwkv()
         get_last_rwkv7_provider = staticmethod(get_last_rwkv7_provider)
         get_last_rwkv7_kernel = staticmethod(get_last_rwkv7_kernel)
@@ -834,7 +842,13 @@ def test_rwkv7_public_recurrent_signature_is_importable_in_fresh_process(synthet
     code = """
 import inspect
 import fla.ops.rwkv7 as public_rwkv7
-from fla.ops.rwkv7 import flash_rwkv, get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
+from fla.ops.rwkv7 import (
+    flash_rwkv,
+    get_last_rwkv7_kernel,
+    get_last_rwkv7_provider,
+    prepare_rwkv7_recurrent_metadata,
+    recurrent_rwkv7,
+)
 from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
 required = {
@@ -846,6 +860,7 @@ required = {
     "cu_seqlens",
     "state_indices",
     "mode",
+    "validated_metadata",
 }
 assert required <= inspect.signature(recurrent_rwkv7).parameters.keys()
 assert "log_decay" not in inspect.signature(recurrent_rwkv7).parameters
@@ -857,6 +872,7 @@ for public_module in (public_rwkv7, flash_rwkv):
     }
 assert callable(get_last_rwkv7_provider)
 assert callable(get_last_rwkv7_kernel)
+assert callable(prepare_rwkv7_recurrent_metadata)
 assert callable(can_use_flash_rwkv_inference)
 for operator in {
     "infer_cmix_mix_fp16",
@@ -887,6 +903,7 @@ def test_rwkv7_public_recurrent_rejects_ambiguous_log_decay_signature(monkeypatc
         cu_seqlens=None,
         state_indices=None,
         mode="fp32io16",
+        validated_metadata=None,
     ):
         raise AssertionError("an ambiguous decay contract must not execute")
 
@@ -898,6 +915,7 @@ def test_rwkv7_public_recurrent_rejects_ambiguous_log_decay_signature(monkeypatc
 
     class PublicRwkv7Module:
         recurrent_rwkv7 = staticmethod(ambiguous_recurrent_rwkv7)
+        prepare_rwkv7_recurrent_metadata = staticmethod(prepare_rwkv7_recurrent_metadata)
         flash_rwkv = FlashRwkv()
         get_last_rwkv7_provider = staticmethod(get_last_rwkv7_provider)
         get_last_rwkv7_kernel = staticmethod(get_last_rwkv7_kernel)
@@ -934,6 +952,7 @@ def test_rwkv7_public_contract_rejects_legacy_decay_exports(monkeypatch, request
 
     class PublicRwkv7Module:
         recurrent_rwkv7 = staticmethod(recurrent_rwkv7)
+        prepare_rwkv7_recurrent_metadata = staticmethod(prepare_rwkv7_recurrent_metadata)
         flash_rwkv = FlashRwkv()
         get_last_rwkv7_provider = staticmethod(get_last_rwkv7_provider)
         get_last_rwkv7_kernel = staticmethod(get_last_rwkv7_kernel)
@@ -969,6 +988,7 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
         "cu_seqlens",
         "state_indices",
         "mode",
+        "validated_metadata",
     }
     calls = []
     telemetry = {}
@@ -988,7 +1008,9 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
         cu_seqlens,
         state_indices,
         mode,
+        validated_metadata,
     ):
+        assert validated_metadata is None
         calls.append(
             (
                 r,
@@ -1007,9 +1029,9 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
             )
         )
         telemetry["kernel"] = (
-            "pretrain_recurrent_fp32io16_from_decay_logits"
+            "pretrain_recurrent_fp32io16_forward"
             if any(tensor.requires_grad for tensor in (r, decay_logits, k, v, a, b, initial_state))
-            else "rwkv7_recurrent_from_decay_logits"
+            else "rwkv7_recurrent"
         )
         effective_decay_logits = (
             decay_logits if decay_bias is None else decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
@@ -1153,16 +1175,18 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
         cu_seqlens,
         state_indices,
         mode,
+        validated_metadata,
     ):
         assert output_final_state is True
         assert cu_seqlens is None and state_indices is None and mode == "fp32io16"
         assert elapsed_t is None
+        assert validated_metadata is None
         effective_decay_logits = (
             decay_logits if decay_bias is None else decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
         )
         output = (r + effective_decay_logits + k + v + a + b) / 6
         final_state = initial_state + torch.einsum("bthk,bthv->bhkv", k.float(), v.float())
-        return record("rwkv7_recurrent_from_decay_logits", (output, final_state))
+        return record("rwkv7_recurrent", (output, final_state))
 
     def get_last_provider():
         telemetry_checks.append(("provider", telemetry.get("provider")))
@@ -1174,6 +1198,7 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
 
     contract = modeling_rwkv7._FlaRwkv7Contract(
         recurrent_rwkv7=public_recurrent_rwkv7,
+        prepare_recurrent_metadata=prepare_rwkv7_recurrent_metadata,
         flash_rwkv=PublicFlashRwkv,
         can_use_flash_rwkv_inference=lambda *args, **kwargs: True,
         get_last_provider=get_last_provider,
@@ -1189,13 +1214,13 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
     assert calls == [
         "infer_tmix_mix6_fp16",
         "infer_tmix_kk_a_gate_fp16",
-        "rwkv7_recurrent_from_decay_logits",
+        "rwkv7_recurrent",
         "infer_tmix_lnx_rkvres_xg_fp16",
         "infer_cmix_mix_fp16",
         "infer_tmix_mix6_fp16",
         "infer_tmix_vres_gate_fp16",
         "infer_tmix_kk_a_gate_fp16",
-        "rwkv7_recurrent_from_decay_logits",
+        "rwkv7_recurrent",
         "infer_tmix_lnx_rkvres_xg_fp16",
         "infer_cmix_mix_fp16",
     ]
@@ -1221,23 +1246,21 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
         cu_seqlens,
         state_indices,
         mode,
+        validated_metadata,
     ):
         assert decay_bias is None and elapsed_t is None
-        calls.append((initial_state, output_final_state, cu_seqlens, state_indices, mode))
-        telemetry["kernel"] = "rwkv7_recurrent_stateful_from_decay_logits"
+        calls.append((initial_state, output_final_state, cu_seqlens, state_indices, mode, validated_metadata))
+        telemetry["kernel"] = "rwkv7_recurrent_stateful"
         for state_index in state_indices.tolist():
             initial_state[state_index].add_(1)
         return torch.zeros_like(v), initial_state
 
-    monkeypatch.setattr(
-        modeling_rwkv7,
-        "_load_fla_rwkv7_contract",
-        lambda: _cpu_public_contract(
-            public_recurrent_rwkv7,
-            provider=lambda: "flash_rwkv",
-            kernel=lambda: telemetry.get("kernel"),
-        ),
+    contract = _cpu_public_contract(
+        public_recurrent_rwkv7,
+        provider=lambda: "flash_rwkv",
+        kernel=lambda: telemetry.get("kernel"),
     )
+    monkeypatch.setattr(modeling_rwkv7, "_load_fla_rwkv7_contract", lambda: contract)
     inputs = [torch.randn(1, 5, 64) for _ in range(6)]
     state_pool = torch.zeros(4, 1, 64, 64)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
@@ -1258,13 +1281,72 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
     torch.testing.assert_close(state_pool[[3, 1]], torch.ones_like(state_pool[[3, 1]]))
     torch.testing.assert_close(state_pool[[0, 2]], torch.zeros_like(state_pool[[0, 2]]))
     assert len(calls) == 1
-    observed_state, output_final_state, observed_cu_seqlens, observed_state_indices, mode = calls[0]
+    observed_state, output_final_state, observed_cu_seqlens, observed_state_indices, mode, observed_ticket = calls[0]
     assert observed_state is state_pool
     assert output_final_state is True
     assert observed_cu_seqlens is cu_seqlens
     assert observed_state_indices.tolist() == state_indices.tolist()
     assert observed_state_indices.is_contiguous()
     assert mode == "fp32io16"
+    assert observed_ticket is None
+
+
+def test_rwkv7_public_recurrent_passes_prevalidated_metadata_ticket_by_identity(monkeypatch) -> None:
+    observed = {}
+
+    def public_recurrent_rwkv7(
+        r,
+        decay_logits,
+        k,
+        v,
+        a,
+        b,
+        *,
+        decay_bias,
+        elapsed_t,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        state_indices,
+        mode,
+        validated_metadata,
+    ):
+        del r, decay_logits, k, a, b, decay_bias, elapsed_t, output_final_state, mode
+        observed["ticket"] = validated_metadata
+        observed["cu_seqlens"] = cu_seqlens
+        observed["state_indices"] = state_indices
+        return torch.zeros_like(v), initial_state
+
+    contract = _cpu_public_contract(
+        public_recurrent_rwkv7,
+        provider=lambda: "flash_rwkv",
+        kernel=lambda: "rwkv7_recurrent_stateful",
+    )
+    monkeypatch.setattr(modeling_rwkv7, "_load_fla_rwkv7_contract", lambda: contract)
+    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    state_pool = torch.zeros(4, 1, 64, 64)
+    ticket = contract.prepare_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=5,
+        state_pool_size=4,
+    )
+
+    output, final_state = modeling_rwkv7._rwkv7_flash(
+        *(torch.randn(1, 5, 64) for _ in range(6)),
+        state_pool,
+        64,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        validated_metadata=ticket,
+    )
+
+    assert output.shape == (1, 5, 64)
+    assert final_state is state_pool
+    assert observed["ticket"] is ticket
+    assert observed["cu_seqlens"] is cu_seqlens
+    assert observed["state_indices"] is state_indices
 
 
 def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> None:
@@ -1283,8 +1365,9 @@ def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> Non
         cu_seqlens,
         state_indices,
         mode,
+        validated_metadata,
     ):
-        assert elapsed_t is None
+        assert elapsed_t is None and validated_metadata is None
         return torch.zeros_like(v), initial_state
 
     monkeypatch.setattr(
@@ -1293,7 +1376,7 @@ def test_rwkv7_public_fla_contract_rejects_provider_fallback(monkeypatch) -> Non
         lambda: _cpu_public_contract(
             public_recurrent_rwkv7,
             provider=lambda: "fla",
-            kernel=lambda: "rwkv7_recurrent_from_decay_logits",
+            kernel=lambda: "rwkv7_recurrent",
         ),
     )
     model = Rwkv7ForCausalLM(_tiny_flash_config()).eval()

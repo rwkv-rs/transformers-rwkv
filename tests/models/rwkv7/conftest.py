@@ -76,6 +76,7 @@ def synthetic_fla_public_contract(tmp_path, monkeypatch):
         "_load_fla_rwkv7_contract",
         lambda: modeling_rwkv7._FlaRwkv7Contract(
             recurrent_rwkv7=testing_utils.recurrent_rwkv7,
+            prepare_recurrent_metadata=testing_utils.prepare_rwkv7_recurrent_metadata,
             flash_rwkv=None,
             can_use_flash_rwkv_inference=lambda *args, **kwargs: False,
             get_last_provider=testing_utils.get_last_rwkv7_provider,
