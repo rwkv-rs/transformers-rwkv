@@ -135,6 +135,15 @@ jobs:
             ${{ runner.temp }}/rwkv7-gpu-provenance.json
           if-no-files-found: error
 
+  rwkv7-real-checkpoint:
+    name: RWKV7 real 1.5B fixed-token contract
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'codex/rwkv7-decay-kernel-alignment' &&
+      contains(github.event.pull_request.body, '<!-- run-rwkv7-real-checkpoint -->')
+    uses: ./.github/workflows/rwkv7-real-checkpoint.yml
+
   pr-ci:
     uses: ./.github/workflows/pr-ci_dynamic_caller_example.yml
     with:

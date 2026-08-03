@@ -2,6 +2,7 @@ name: RWKV7 real 1.5B fixed-token contract
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: rwkv7-real-checkpoint-${{ github.ref }}
@@ -24,13 +25,16 @@ jobs:
       CHECKPOINT: /home/caizus/Weights/RWKV/rwkv7/pth/rwkv7-g1h-1.5b-20260710-ctx10240.pth
       CHECKPOINT_SHA256: 737079d81865801fd85e5459488d89a36d5304a524e890244eb83d44f531c89c
       ARTIFACT_ROOT: /home/caizus/Weights/RWKV/rwkv7/hf-artifacts
-      ARTIFACT_DIR: /home/caizus/Weights/RWKV/rwkv7/hf-artifacts/rwkv7-g1h-1.5b-20260710-ctx10240-${{ github.sha }}
-      RESULT_DIR: ${{ github.workspace }}/artifacts/rwkv7-real/${{ github.sha }}
+      ARTIFACT_DIR: /home/caizus/Weights/RWKV/rwkv7/hf-artifacts/rwkv7-g1h-1.5b-20260710-ctx10240-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      RESULT_DIR: ${{ github.workspace }}/artifacts/rwkv7-real/${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       SOURCE_REVISION: bd552d5e6aaaad88196629f7eb8dc8e24a644484
       FIXED_INPUT_IDS: 1,7,11,3,5,9,13,17
       UV_LINK_MODE: copy
+      SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
 
       - name: Prepare stable artifact and result paths
         run: |
@@ -136,7 +140,7 @@ jobs:
                   "path": os.environ["CHECKPOINT"],
                   "sha256": os.environ["CHECKPOINT_SHA256"],
               },
-              "commit": os.environ["GITHUB_SHA"],
+              "commit": os.environ["SOURCE_SHA"],
               "dependencies": {
                   "fla": "606752b7dff79eb326eeebf2d046102027da5306",
                   "flash_rwkv": "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb",
@@ -166,9 +170,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rwkv7-real-checkpoint-${{ github.sha }}
+          name: rwkv7-real-checkpoint-${{ env.SOURCE_SHA }}
           path: |
-            ${{ github.workspace }}/artifacts/rwkv7-real/${{ github.sha }}/*.json
+            ${{ env.RESULT_DIR }}/*.json
             ${{ env.ARTIFACT_DIR }}/config.json
             ${{ env.ARTIFACT_DIR }}/rwkv7_conversion.json
             ${{ env.ARTIFACT_DIR }}/rwkv7_validation.json
