@@ -43,6 +43,18 @@ _FLA_RWKV7_FUSED_INFERENCE_OPERATORS = frozenset(
         "infer_tmix_vres_gate_fp16",
     }
 )
+
+
+def _legacy_public_decay_symbols(module: object) -> list[str]:
+    """Return obsolete public decay-boundary names exposed by a runtime module."""
+
+    return sorted(
+        name
+        for name in dir(module)
+        if not name.startswith("_") and ("log_decay" in name or name == "decay_logits_to_log_decay")
+    )
+
+
 RWKV7_FLA_DISTRIBUTION = "flash-linear-attention"
 RWKV7_FLA_EXTRA = "flash-rwkv"
 RWKV7_FLA_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
@@ -324,6 +336,16 @@ def _load_fla_rwkv7_contract():
     )
     if missing_operators:
         raise RuntimeError(f"The installed FLA FlashRWKV API lacks public inference operators: {missing_operators}.")
+    legacy_decay_symbols = {
+        "fla.ops.rwkv7": _legacy_public_decay_symbols(rwkv7),
+        "fla.ops.rwkv7.flash_rwkv": _legacy_public_decay_symbols(flash_rwkv),
+    }
+    legacy_decay_symbols = {scope: names for scope, names in legacy_decay_symbols.items() if names}
+    if legacy_decay_symbols:
+        raise RuntimeError(
+            "The installed FLA RWKV-7 runtime exposes obsolete public log-decay APIs; "
+            f"all product operators must fuse raw decay_logits: {legacy_decay_symbols}."
+        )
     try:
         parameters = inspect.signature(recurrent_rwkv7).parameters
     except (TypeError, ValueError) as error:

@@ -833,6 +833,7 @@ def test_rwkv7_public_contract_requires_fused_inference_surface(monkeypatch, req
 def test_rwkv7_public_recurrent_signature_is_importable_in_fresh_process(synthetic_fla_public_contract) -> None:
     code = """
 import inspect
+import fla.ops.rwkv7 as public_rwkv7
 from fla.ops.rwkv7 import flash_rwkv, get_last_rwkv7_kernel, get_last_rwkv7_provider, recurrent_rwkv7
 from fla.ops.rwkv7.inference import can_use_flash_rwkv_inference
 
@@ -848,6 +849,12 @@ required = {
 }
 assert required <= inspect.signature(recurrent_rwkv7).parameters.keys()
 assert "log_decay" not in inspect.signature(recurrent_rwkv7).parameters
+for public_module in (public_rwkv7, flash_rwkv):
+    assert not {
+        name
+        for name in dir(public_module)
+        if not name.startswith("_") and ("log_decay" in name or name == "decay_logits_to_log_decay")
+    }
 assert callable(get_last_rwkv7_provider)
 assert callable(get_last_rwkv7_kernel)
 assert callable(can_use_flash_rwkv_inference)
@@ -908,6 +915,45 @@ def test_rwkv7_public_recurrent_rejects_ambiguous_log_decay_signature(monkeypatc
     request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
 
     with pytest.raises(RuntimeError, match="obsolete log_decay product boundary"):
+        modeling_rwkv7._load_fla_rwkv7_contract()
+
+
+@pytest.mark.parametrize(
+    ("scope", "symbol"),
+    [
+        ("rwkv7", "recurrent_rwkv7_from_log_decay"),
+        ("flash_rwkv", "decay_logits_to_log_decay"),
+    ],
+)
+def test_rwkv7_public_contract_rejects_legacy_decay_exports(monkeypatch, request, scope, symbol) -> None:
+    class FlashRwkv:
+        pass
+
+    for operator in modeling_rwkv7._FLA_RWKV7_FUSED_INFERENCE_OPERATORS:
+        setattr(FlashRwkv, operator, staticmethod(lambda *args, **kwargs: None))
+
+    class PublicRwkv7Module:
+        recurrent_rwkv7 = staticmethod(recurrent_rwkv7)
+        flash_rwkv = FlashRwkv()
+        get_last_rwkv7_provider = staticmethod(get_last_rwkv7_provider)
+        get_last_rwkv7_kernel = staticmethod(get_last_rwkv7_kernel)
+
+    target = PublicRwkv7Module if scope == "rwkv7" else PublicRwkv7Module.flash_rwkv
+    setattr(target, symbol, staticmethod(lambda *args, **kwargs: None))
+
+    class PublicInferenceModule:
+        can_use_flash_rwkv_inference = staticmethod(lambda *args, **kwargs: False)
+
+    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib,
+        "import_module",
+        lambda name: PublicInferenceModule() if name.endswith(".inference") else PublicRwkv7Module(),
+    )
+    modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
+    request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
+
+    with pytest.raises(RuntimeError, match="obsolete public log-decay APIs"):
         modeling_rwkv7._load_fla_rwkv7_contract()
 
 
