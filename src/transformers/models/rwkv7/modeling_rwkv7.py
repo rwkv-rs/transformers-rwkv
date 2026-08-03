@@ -411,8 +411,23 @@ def _rwkv7_flash(
 
     batch_size, sequence_length, hidden_size = receptance.shape
     num_heads = hidden_size // head_size
+    output_dtype = receptance.dtype
+    recurrent_input_dtype = output_dtype
+    if output_dtype == torch.float32 and receptance.is_cuda:
+        # FlashRWKV's fp32io16 contract accepts FP16/BF16 token tensors and
+        # keeps the recurrent state in FP32.  Keep the surrounding HF model
+        # in FP32 so shape-dependent low-precision GEMM reductions cannot
+        # change a staged decode, then make the explicit I/O16 conversion at
+        # this single native boundary.  Combining the inference bias before
+        # the cast also preserves the producer's raw-decay-logit value.
+        recurrent_input_dtype = torch.float16
+        if decay_bias is not None:
+            decay_logits = decay_logits + decay_bias.view(1, 1, -1)
+            decay_bias = None
     tensors = [
-        tensor.view(batch_size, sequence_length, num_heads, head_size).contiguous()
+        tensor.to(dtype=recurrent_input_dtype)
+        .view(batch_size, sequence_length, num_heads, head_size)
+        .contiguous()
         for tensor in (receptance, decay_logits, key, value, a, b)
     ]
     if state_indices is not None:
@@ -450,7 +465,7 @@ def _rwkv7_flash(
         raise RuntimeError("FLA public recurrent_rwkv7 returned an incompatible final state.")
     if state_indices is not None and final_state is not state:
         raise RuntimeError("FLA packed recurrent RWKV-7 must update the supplied state pool in place.")
-    return output.reshape(batch_size, sequence_length, hidden_size), final_state
+    return output.reshape(batch_size, sequence_length, hidden_size).to(output_dtype), final_state
 
 
 class Rwkv7TimeMix(nn.Module):
@@ -614,7 +629,6 @@ class Rwkv7TimeMix(nn.Module):
             trace_entry["kernel"] = contract.get_last_kernel()
             trace_entry["wkv_output"] = output.detach().clone()
             trace_entry["final_state"] = wkv_state.detach().clone()
-            self._rwkv7_trace.append(trace_entry)
         self.last_wkv_backend = "flash_rwkv"
         if self.config.group_norm_epsilon == 64e-5 and contract.can_use_flash_rwkv_inference(
             output,
@@ -664,7 +678,11 @@ class Rwkv7TimeMix(nn.Module):
                 )
             ).view_as(output)
             output = (output + local) * gate
-        return self.output(output), v_first, final_hidden_state, wkv_state
+        output = self.output(output)
+        if trace_entry is not None:
+            trace_entry["layer_output"] = output.detach().clone()
+            self._rwkv7_trace.append(trace_entry)
+        return output, v_first, final_hidden_state, wkv_state
 
 
 class Rwkv7ChannelMix(nn.Module):

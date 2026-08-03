@@ -28,6 +28,7 @@ from transformers.models.rwkv7.modeling_rwkv7 import (
     RWKV7_FLA_REVISION,
     RWKV7_FLASH_RWKV_REVISION,
     _load_fla_rwkv7_contract,
+    _rwkv7_flash,
     rwkv7_reference,
     validate_rwkv7_runtime_provenance,
 )
@@ -98,6 +99,13 @@ def _tensor_stats(tensor: torch.Tensor) -> dict[str, float]:
         "min": values.min().item(),
         "norm": values.norm().item(),
     }
+
+
+def _token_stats(tensor: torch.Tensor) -> list[dict[str, Any]]:
+    return [
+        {"token": token_index, "stats": _tensor_stats(tensor[:, token_index : token_index + 1])}
+        for token_index in range(tensor.shape[1])
+    ]
 
 
 def _parse_input_ids(encoded: str, vocab_size: int) -> list[int]:
@@ -193,6 +201,23 @@ def _oracle_trace(
                     f"output_rrmse={output_error}, state_rrmse={state_error}, limit={rrmse_limit}"
                 )
             retention = torch.exp(-math.exp(-0.5) * torch.sigmoid(raw_decay_logits.float()))
+            token_records = []
+            for token_index in range(raw_decay_logits.shape[1]):
+                token_slice = slice(token_index, token_index + 1)
+                token_records.append(
+                    {
+                        "D": _tensor_stats(retention[:, token_slice]),
+                        "a": _tensor_stats(entry["a"][:, token_slice]),
+                        "b": _tensor_stats(entry["b"][:, token_slice]),
+                        "k": _tensor_stats(entry["key"][:, token_slice]),
+                        "layer_output": _tensor_stats(entry["layer_output"][:, token_slice]),
+                        "r": _tensor_stats(entry["receptance"][:, token_slice]),
+                        "raw_decay_logits": _tensor_stats(raw_decay_logits[:, token_slice]),
+                        "token": token_index,
+                        "v": _tensor_stats(entry["value"][:, token_slice]),
+                        "wkv_output": _tensor_stats(entry["wkv_output"][:, token_slice]),
+                    }
+                )
             layer_records.append(
                 {
                     "call": call_index,
@@ -203,6 +228,7 @@ def _oracle_trace(
                     "output_stats": _tensor_stats(entry["wkv_output"]),
                     "state_rrmse": state_error,
                     "state_stats": _tensor_stats(entry["final_state"]),
+                    "token_records": token_records,
                     "tokens": int(raw_decay_logits.shape[1]),
                 }
             )
@@ -239,6 +265,66 @@ def _clone_state(state: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     return tuple(component.clone() for component in state)
 
 
+def _continuation_trace_diagnostics(
+    full_trace: list[list[dict[str, Any]]],
+    staged_trace: list[list[dict[str, Any]]],
+    *,
+    split: int,
+    rrmse_limit: float,
+) -> dict[str, Any]:
+    """Find the first layer/token/tensor that breaks staged continuation."""
+    fields = (
+        "receptance",
+        "decay_logits",
+        "key",
+        "value",
+        "a",
+        "b",
+        "wkv_output",
+        "layer_output",
+    )
+    first_failure = None
+    maximum = dict.fromkeys((*fields, "final_state"), 0.0)
+    for layer_index, (full_layer, staged_layer) in enumerate(
+        zip(full_trace, staged_trace, strict=True)
+    ):
+        if len(full_layer) != 1:
+            raise RuntimeError(
+                f"RWKV-7 continuation diagnostics expected one full trace call at layer={layer_index}"
+            )
+        full_entry = full_layer[0]
+        for call_index, staged_entry in enumerate(staged_layer):
+            token_index = split + call_index
+            for field in fields:
+                error = _rrmse(
+                    staged_entry[field],
+                    full_entry[field][:, token_index : token_index + 1],
+                )
+                maximum[field] = max(maximum[field], error)
+                if first_failure is None and error > rrmse_limit:
+                    first_failure = {
+                        "layer": layer_index,
+                        "rrmse": error,
+                        "tensor": field,
+                        "token": token_index,
+                    }
+            if call_index == len(staged_layer) - 1:
+                error = _rrmse(staged_entry["final_state"], full_entry["final_state"])
+                maximum["final_state"] = max(maximum["final_state"], error)
+                if first_failure is None and error > rrmse_limit:
+                    first_failure = {
+                        "layer": layer_index,
+                        "rrmse": error,
+                        "tensor": "final_state",
+                        "token": token_index,
+                    }
+    return {
+        "first_failure": first_failure,
+        "max_rrmse": maximum,
+        "rrmse_limit": rrmse_limit,
+    }
+
+
 def _inference_contract(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -247,7 +333,7 @@ def _inference_contract(
 ) -> dict[str, Any]:
     model.eval()
     full, full_trace = _run_traced(model, input_ids)
-    full_oracle = _oracle_trace(full_trace, head_size=model.config.head_size)
+    full_oracle = _oracle_trace(full_trace, head_size=model.config.head_size, rrmse_limit=0.002)
     if full.state is None:
         raise RuntimeError("RWKV-7 full fixed-token call did not return a recurrent state")
 
@@ -267,13 +353,21 @@ def _inference_contract(
         for layer_index, layer_trace in enumerate(step_trace):
             staged_traces[layer_index].extend(layer_trace)
     staged_logits = torch.cat(staged_outputs, dim=1)
-    staged_oracle = _oracle_trace(staged_traces, head_size=model.config.head_size)
+    staged_oracle = _oracle_trace(staged_traces, head_size=model.config.head_size, rrmse_limit=0.002)
     continuation_rrmse = _rrmse(staged_logits, full.logits[:, split:])
     state_continuation_rrmse = _state_rrmse(state, full.state)
-    if continuation_rrmse > 0.01 or state_continuation_rrmse > 0.01:
+    continuation_diagnostics = _continuation_trace_diagnostics(
+        full_trace,
+        staged_traces,
+        split=split,
+        rrmse_limit=0.002,
+    )
+    if continuation_rrmse > 0.002 or state_continuation_rrmse > 0.002:
         raise RuntimeError(
             "RWKV-7 one-shot/staged continuation mismatch: "
-            f"logits_rrmse={continuation_rrmse}, state_rrmse={state_continuation_rrmse}"
+            f"logits_rrmse={continuation_rrmse}, state_rrmse={state_continuation_rrmse}, "
+            f"first_trace_failure={continuation_diagnostics['first_failure']}, "
+            f"max_trace_rrmse={continuation_diagnostics['max_rrmse']}"
         )
 
     zero_state_changed = any(component.float().abs().max().item() > 0 for component in full.state)
@@ -311,10 +405,13 @@ def _inference_contract(
             "tokens": int(nonzero_input.shape[1]),
         },
         "observed_backends": observed_backends,
+        "one_shot_logits": _token_stats(full.logits),
         "one_shot_oracle": full_oracle,
         "staged_oracle": staged_oracle,
+        "staged_trace_diagnostics": continuation_diagnostics,
         "staged_vs_one_shot_logits_rrmse": continuation_rrmse,
         "staged_vs_one_shot_state_rrmse": state_continuation_rrmse,
+        "staged_logits": _token_stats(staged_logits),
         "zero_initial_state": {
             "oracle": full_oracle,
             "tokens": int(input_ids.shape[1]),
@@ -332,6 +429,107 @@ def _finite_grad_norm(model: torch.nn.Module) -> tuple[float, bool]:
         finite = finite and bool(torch.isfinite(parameter.grad).all())
         squared_norm += parameter.grad.float().square().sum().double()
     return squared_norm.sqrt().item(), finite
+
+
+def _gradient_contract(*, device: torch.device, head_size: int) -> dict[str, Any]:
+    """Compare native fp32io16 gradients with the independent Python recurrence."""
+    torch.manual_seed(20260803)
+    batch_size, sequence_length, num_heads = 1, 3, 2
+    hidden_size = num_heads * head_size
+    product_inputs = [
+        torch.randn(
+            batch_size,
+            sequence_length,
+            hidden_size,
+            device=device,
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        for _ in range(6)
+    ]
+    product_state = torch.randn(
+        batch_size,
+        num_heads,
+        head_size,
+        head_size,
+        device=device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    oracle_inputs = [tensor.detach().clone().requires_grad_() for tensor in product_inputs]
+    oracle_state = product_state.detach().clone().requires_grad_()
+    contract = _load_fla_rwkv7_contract()
+    product_output, product_final_state = _rwkv7_flash(
+        *product_inputs,
+        product_state,
+        head_size,
+        contract=contract,
+    )
+    oracle_log_decay = -math.exp(-0.5) * torch.sigmoid(oracle_inputs[1].float())
+    oracle_output, oracle_final_state = rwkv7_reference(
+        oracle_inputs[0],
+        oracle_log_decay,
+        *oracle_inputs[2:],
+        oracle_state,
+        head_size=head_size,
+    )
+    upstream_output = torch.linspace(
+        -1,
+        1,
+        product_output.numel(),
+        device=device,
+        dtype=product_output.dtype,
+    ).reshape_as(product_output)
+    upstream_state = torch.linspace(
+        -1,
+        1,
+        product_final_state.numel(),
+        device=device,
+        dtype=product_final_state.dtype,
+    ).reshape_as(product_final_state)
+    (product_output * upstream_output).sum().add_((product_final_state * upstream_state).sum()).backward()
+    (oracle_output * upstream_output).sum().add_((oracle_final_state * upstream_state).sum()).backward()
+    gradient_records = {}
+    for name, product, oracle in zip(
+        ("dr", "dz", "dk", "dv", "da", "db"), product_inputs, oracle_inputs, strict=True
+    ):
+        error = _rrmse(product.grad, oracle.grad)
+        gradient_records[name] = {
+            "max_abs": (product.grad.float() - oracle.grad.float()).abs().max().item(),
+            "rrmse": error,
+        }
+    state_error = _rrmse(product_state.grad, oracle_state.grad)
+    gradient_records["dinitial_state"] = {
+        "max_abs": (product_state.grad.float() - oracle_state.grad.float()).abs().max().item(),
+        "rrmse": state_error,
+    }
+    output_error = _rrmse(product_output, oracle_output)
+    state_forward_error = _rrmse(product_final_state, oracle_final_state)
+    maximum_gradient_error = max(record["rrmse"] for record in gradient_records.values())
+    if maximum_gradient_error > 2e-5:
+        first_failure = next(
+            name for name, record in gradient_records.items() if record["rrmse"] > 2e-5
+        )
+        raise RuntimeError(
+            "RWKV-7 fp32io16 gradient mismatch: "
+            f"tensor={first_failure}, rrmse={gradient_records[first_failure]['rrmse']}"
+        )
+    if contract.get_last_provider() != "flash_rwkv" or contract.get_last_kernel() != "pretrain_recurrent_fp32io16_forward":
+        raise RuntimeError(
+            "RWKV-7 gradient contract selected invalid runtime evidence: "
+            f"provider={contract.get_last_provider()!r}, kernel={contract.get_last_kernel()!r}"
+        )
+    return {
+        "forward_output_rrmse": output_error,
+        "forward_state_rrmse": state_forward_error,
+        "gradients": gradient_records,
+        "gradient_rrmse_limit": 2e-5,
+        "head_size": head_size,
+        "kernel": contract.get_last_kernel(),
+        "provider": contract.get_last_provider(),
+        "sequence_length": sequence_length,
+        "upstream_dout": "torch.linspace(-1, 1, output_and_state_numel)",
+    }
 
 
 def _training_contract(
@@ -428,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
     model.to(device)
     input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
     provenance = validate_rwkv7_runtime_provenance()
+    gradient = _gradient_contract(device=device, head_size=model.config.head_size)
     inference = _inference_contract(model, input_tensor, device=device)
     training = _training_contract(
         model,
@@ -449,8 +648,10 @@ def main(argv: list[str] | None = None) -> int:
         "input_ids": input_ids,
         "precision": {
             "dtype": args.dtype,
-            "gemm_accumulation": "model default",
+            "gemm_accumulation": "fp32" if args.dtype == "float32" else "model default",
+            "wkv_input_output": "float16" if args.dtype == "float32" else args.dtype,
             "wkv_mode": "fp32io16",
+            "wkv_state": "float32",
         },
         "references": REFERENCE_REVISIONS,
         "repository": {
@@ -465,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "passed",
         "training": training,
         "inference": inference,
+        "gradient": gradient,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -618,8 +618,12 @@ def main(argv: list[str] | None = None) -> int:
         "artifact": artifact_provenance,
         "runtime": {
             "dtype": args.dtype,
+            "gemm_accumulation": "fp32" if args.dtype == "float32" else "model default",
             "required_provider": _REQUIRED_PROVIDER,
             "observed_backends": sorted(observed),
+            "wkv_input_output": "float16" if args.dtype == "float32" else args.dtype,
+            "wkv_mode": "fp32io16",
+            "wkv_state": "float32",
             "validated_operator_provenance": operator_provenance,
             "provider_packages": {
                 name: provenance

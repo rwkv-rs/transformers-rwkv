@@ -92,7 +92,7 @@ jobs:
             --checkpoint "$CHECKPOINT" \
             --output "$RESULT_DIR/fixed-token-validation.json" \
             --input-ids "$FIXED_INPUT_IDS" \
-            --dtype bfloat16 \
+            --dtype float32 \
             --optimizer-steps 3
 
       - name: Measure the same fixed workload with CUDA events
@@ -100,7 +100,7 @@ jobs:
           "$RUNNER_TEMP/rwkv7-real-venv/bin/python" benchmark/rwkv7/standalone.py \
             --model "$ARTIFACT_DIR" \
             --output "$RESULT_DIR/standalone-benchmark.json" \
-            --dtype bfloat16 \
+            --dtype float32 \
             --batch-size 1 \
             --prompt-tokens 4 \
             --decode-tokens 4 \
@@ -154,7 +154,14 @@ jobs:
                   text=True,
               ).stdout.strip(),
               "input_ids": [int(value) for value in os.environ["FIXED_INPUT_IDS"].split(",")],
-              "precision": {"dtype": "bfloat16", "gemm_accumulation": "model default", "wkv_mode": "fp32io16"},
+              "precision": {
+                  "artifact_storage_dtype": "bfloat16",
+                  "dtype": "float32",
+                  "gemm_accumulation": "fp32",
+                  "wkv_input_output": "float16",
+                  "wkv_mode": "fp32io16",
+                  "wkv_state": "float32",
+              },
               "runner": os.environ.get("RUNNER_NAME"),
               "status": "passed" if all(
                   (result_dir / name).is_file()
