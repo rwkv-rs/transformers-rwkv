@@ -57,6 +57,9 @@ jobs:
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_missing_public_fla_contract_fails_closed \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_contract_does_not_fall_back_to_chunk \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_contract_requires_fused_inference_surface \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_reference_matches_explicit_dplr_oracle \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_decay_logit_semantics_match_primary_source_forward_and_gradient \
+            tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_product_decay_and_recurrence_match_independent_oracle_with_gradients \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_public_recurrent_signature_is_importable_in_fresh_process \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls \
             tests/models/rwkv7/test_modeling_rwkv7.py::test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry \
@@ -71,7 +74,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.head_ref == 'codex/transformers-rwkv-model-core'
+      github.head_ref == 'codex/rwkv7-decay-kernel-alignment'
     runs-on: [self-hosted, rwkv-sha-pro6000x8]
     timeout-minutes: 60
     steps:
