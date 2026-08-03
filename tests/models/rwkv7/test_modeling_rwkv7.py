@@ -847,6 +847,7 @@ required = {
     "mode",
 }
 assert required <= inspect.signature(recurrent_rwkv7).parameters.keys()
+assert "log_decay" not in inspect.signature(recurrent_rwkv7).parameters
 assert callable(get_last_rwkv7_provider)
 assert callable(get_last_rwkv7_kernel)
 assert callable(can_use_flash_rwkv_inference)
@@ -860,6 +861,54 @@ for operator in {
     assert callable(getattr(flash_rwkv, operator))
 """
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_rwkv7_public_recurrent_rejects_ambiguous_log_decay_signature(monkeypatch, request) -> None:
+    def ambiguous_recurrent_rwkv7(
+        r,
+        log_decay,
+        k,
+        v,
+        a,
+        b,
+        *,
+        decay_logits=None,
+        decay_bias=None,
+        elapsed_t=None,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        state_indices=None,
+        mode="fp32io16",
+    ):
+        raise AssertionError("an ambiguous decay contract must not execute")
+
+    class FlashRwkv:
+        pass
+
+    for operator in modeling_rwkv7._FLA_RWKV7_FUSED_INFERENCE_OPERATORS:
+        setattr(FlashRwkv, operator, staticmethod(lambda *args, **kwargs: None))
+
+    class PublicRwkv7Module:
+        recurrent_rwkv7 = staticmethod(ambiguous_recurrent_rwkv7)
+        flash_rwkv = FlashRwkv()
+        get_last_rwkv7_provider = staticmethod(get_last_rwkv7_provider)
+        get_last_rwkv7_kernel = staticmethod(get_last_rwkv7_kernel)
+
+    class PublicInferenceModule:
+        can_use_flash_rwkv_inference = staticmethod(lambda *args, **kwargs: False)
+
+    monkeypatch.setattr(modeling_rwkv7, "validate_rwkv7_runtime_provenance", lambda: {})
+    monkeypatch.setattr(
+        modeling_rwkv7.importlib,
+        "import_module",
+        lambda name: PublicInferenceModule() if name.endswith(".inference") else PublicRwkv7Module(),
+    )
+    modeling_rwkv7._load_fla_rwkv7_contract.cache_clear()
+    request.addfinalizer(modeling_rwkv7._load_fla_rwkv7_contract.cache_clear)
+
+    with pytest.raises(RuntimeError, match="obsolete log_decay product boundary"):
+        modeling_rwkv7._load_fla_rwkv7_contract()
 
 
 @pytest.mark.parametrize("training", [False, True])
@@ -917,9 +966,7 @@ def test_rwkv7_monkeypatched_public_fla_contract_drives_two_layer_hf_calls(monke
             else "rwkv7_recurrent_from_decay_logits"
         )
         effective_decay_logits = (
-            decay_logits
-            if decay_bias is None
-            else decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
+            decay_logits if decay_bias is None else decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
         )
         output = (r + effective_decay_logits + k + v + a + b) / 6
         if state_indices is not None:
@@ -1065,9 +1112,7 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
         assert cu_seqlens is None and state_indices is None and mode == "fp32io16"
         assert elapsed_t is None
         effective_decay_logits = (
-            decay_logits
-            if decay_bias is None
-            else decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
+            decay_logits if decay_bias is None else decay_logits + decay_bias.view(1, 1, *decay_bias.shape)
         )
         output = (r + effective_decay_logits + k + v + a + b) / 6
         final_state = initial_state + torch.einsum("bthk,bthv->bhkv", k.float(), v.float())
