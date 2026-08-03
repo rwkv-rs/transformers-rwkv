@@ -459,6 +459,7 @@ class Rwkv7TimeMix(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.last_wkv_backend = "uninitialized"
+        self._rwkv7_trace = None
         hidden_size = config.hidden_size
 
         for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"):
@@ -587,10 +588,30 @@ class Rwkv7TimeMix(nn.Module):
             wkv_state,
             self.config.head_size,
         )
+        trace_entry = None
+        if self._rwkv7_trace is not None:
+            raw_decay_logits = decay_logits
+            if decay_bias is not None:
+                raw_decay_logits = raw_decay_logits + decay_bias.view(1, 1, -1)
+            trace_entry = {
+                "initial_state": wkv_state.detach().clone(),
+                "receptance": receptance.detach().clone(),
+                "decay_logits": raw_decay_logits.detach().clone(),
+                "key": key.detach().clone(),
+                "value": value.detach().clone(),
+                "a": recurrent_a.detach().clone(),
+                "b": recurrent_b.detach().clone(),
+            }
         try:
             output, wkv_state = _rwkv7_flash(*wkv_inputs, decay_bias=decay_bias, contract=contract)
         except RuntimeError as error:
             raise RuntimeError(f"RWKV-7 FlashRWKV execution failed closed: {error}") from error
+        if trace_entry is not None:
+            trace_entry["provider"] = contract.get_last_provider()
+            trace_entry["kernel"] = contract.get_last_kernel()
+            trace_entry["wkv_output"] = output.detach().clone()
+            trace_entry["final_state"] = wkv_state.detach().clone()
+            self._rwkv7_trace.append(trace_entry)
         self.last_wkv_backend = "flash_rwkv"
         if self.config.group_norm_epsilon == 64e-5 and contract.can_use_flash_rwkv_inference(
             output,
