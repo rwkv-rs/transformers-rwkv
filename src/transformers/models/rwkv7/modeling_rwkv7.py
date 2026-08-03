@@ -59,13 +59,13 @@ def _legacy_public_decay_symbols(module: object) -> list[str]:
 RWKV7_FLA_DISTRIBUTION = "flash-linear-attention"
 RWKV7_FLA_EXTRA = "flash-rwkv"
 RWKV7_FLA_REPOSITORY = "https://github.com/rwkv-rs/fla-rwkv.git"
-RWKV7_FLA_REVISION = "8173df6ab27adb1c160a59d84b4ee02b6c6d8926"
+RWKV7_FLA_REVISION = "606752b7dff79eb326eeebf2d046102027da5306"
 RWKV7_FLA_REQUIREMENT = (
     f"{RWKV7_FLA_DISTRIBUTION}[{RWKV7_FLA_EXTRA}] @ git+{RWKV7_FLA_REPOSITORY}@{RWKV7_FLA_REVISION}"
 )
 RWKV7_FLASH_RWKV_DISTRIBUTION = "flash-rwkv"
 RWKV7_FLASH_RWKV_REPOSITORY = "https://github.com/rwkv-rs/FlashRWKV.git"
-RWKV7_FLASH_RWKV_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
+RWKV7_FLASH_RWKV_REVISION = "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb"
 
 
 @dataclass(frozen=True)

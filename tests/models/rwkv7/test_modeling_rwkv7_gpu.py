@@ -16,8 +16,8 @@ from transformers.models.rwkv7.modeling_rwkv7 import Rwkv7ForCausalLM
 from transformers.testing_utils import require_torch_gpu
 
 
-FLA_REVISION = "8173df6ab27adb1c160a59d84b4ee02b6c6d8926"
-FLASH_RWKV_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
+FLA_REVISION = "606752b7dff79eb326eeebf2d046102027da5306"
+FLASH_RWKV_REVISION = "8b3d08a9a9430df23fb9da9b35fb0aa625faa1fb"
 TORCH_VERSION = "2.11.0"
 
 
