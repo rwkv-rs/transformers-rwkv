@@ -45,14 +45,21 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 artifact_dir, encoded_input_ids, encoded_max_new_tokens, encoded_device, encoded_dtype = sys.argv[1:]
 artifact_path = Path(artifact_dir)
 config_payload = json.loads((artifact_path / "config.json").read_text(encoding="utf-8"))
-tokenizer_payload = json.loads((artifact_path / "tokenizer_config.json").read_text(encoding="utf-8"))
 conversion = json.loads((artifact_path / "rwkv7_conversion.json").read_text(encoding="utf-8"))
+tokenizer_files = conversion.get("tokenizer_files", {})
+if not isinstance(tokenizer_files, dict):
+    raise RuntimeError("RWKV-7 conversion tokenizer_files must be a JSON object.")
+tokenizer_payload = {}
+if tokenizer_files:
+    tokenizer_payload = json.loads((artifact_path / "tokenizer_config.json").read_text(encoding="utf-8"))
 if config_payload.get("auto_map") or tokenizer_payload.get("auto_map"):
     raise RuntimeError("RWKV-7 artifact must load without auto_map or remote code.")
 
 dtype = None if encoded_dtype == "auto" else getattr(torch, encoded_dtype)
 config = AutoConfig.from_pretrained(artifact_dir)
-tokenizer = AutoTokenizer.from_pretrained(artifact_dir, local_files_only=True, use_fast=True)
+tokenizer = None
+if tokenizer_files:
+    tokenizer = AutoTokenizer.from_pretrained(artifact_dir, local_files_only=True, use_fast=True)
 normalized_config = dict(config_payload)
 normalized_config.pop("_name_or_path", None)
 normalized_config.pop("transformers_version", None)
@@ -62,7 +69,7 @@ identity_payload = {
     "checkpoint_sha256": conversion["checkpoint_sha256"],
     "config": conversion["config"],
     "source_revision": conversion["source_revision"],
-    "tokenizer_files": conversion["tokenizer_files"],
+    "tokenizer_files": tokenizer_files,
 }
 expected_identity = hashlib.sha256(
     json.dumps(identity_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -83,19 +90,27 @@ if load_errors:
     raise RuntimeError(f"RWKV-7 artifact did not strict-load: {load_errors}")
 if type(config).__name__ != "Rwkv7Config" or type(model).__name__ != "Rwkv7ForCausalLM":
     raise RuntimeError("RWKV-7 artifact did not resolve to native Rwkv7 AutoClasses.")
-if not tokenizer.is_fast or not (artifact_path / "tokenizer.json").is_file():
+if tokenizer is not None and (not tokenizer.is_fast or not (artifact_path / "tokenizer.json").is_file()):
     raise RuntimeError("RWKV-7 artifact must contain a standard fast tokenizer.json.")
-special_ids = {name: getattr(tokenizer, f"{name}_token_id") for name in ("bos", "eos", "pad")}
+if tokenizer is not None:
+    special_ids = {name: getattr(tokenizer, f"{name}_token_id") for name in ("bos", "eos", "pad")}
+else:
+    special_ids = {
+        "bos": config.bos_token_id,
+        "eos": config.eos_token_id,
+        "pad": config.pad_token_id,
+    }
 if set(special_ids.values()) != {0}:
     raise RuntimeError(f"RWKV-7 BOS/EOS/PAD must all use token 0, got {special_ids}.")
 if {config.bos_token_id, config.eos_token_id, config.pad_token_id} != {0}:
     raise RuntimeError("RWKV-7 config must preserve BOS/EOS/PAD token 0 semantics.")
-probe = "RWKV-7 tokenizer BOS probe"
-if tokenizer.encode(probe, add_special_tokens=True) != tokenizer.encode(probe, add_special_tokens=False):
-    raise RuntimeError("RWKV-7 tokenizer must not insert a BOS token before prompt tokens.")
-if tokenizer.model_max_length != config.context_length:
-    raise RuntimeError("RWKV-7 tokenizer and model context lengths differ.")
-for name, expected_digest in conversion["tokenizer_files"].items():
+if tokenizer is not None:
+    probe = "RWKV-7 tokenizer BOS probe"
+    if tokenizer.encode(probe, add_special_tokens=True) != tokenizer.encode(probe, add_special_tokens=False):
+        raise RuntimeError("RWKV-7 tokenizer must not insert a BOS token before prompt tokens.")
+    if tokenizer.model_max_length != config.context_length:
+        raise RuntimeError("RWKV-7 tokenizer and model context lengths differ.")
+for name, expected_digest in tokenizer_files.items():
     digest = hashlib.sha256((artifact_path / name).read_bytes()).hexdigest()
     if digest != expected_digest:
         raise RuntimeError(f"RWKV-7 tokenizer artifact digest changed for {name}.")
@@ -105,6 +120,8 @@ model.to(device).eval()
 input_ids = torch.tensor([json.loads(encoded_input_ids)], dtype=torch.long, device=device)
 if input_ids.shape[1] < 2 or input_ids.shape[1] > config.context_length:
     raise RuntimeError("RWKV-7 validation input must contain 2..context_length tokens.")
+if input_ids.min().item() < 0 or input_ids.max().item() >= config.vocab_size:
+    raise RuntimeError("RWKV-7 validation input contains a token id outside the model vocabulary.")
 generation_kwargs = {
     "max_new_tokens": int(encoded_max_new_tokens),
     "do_sample": False,
@@ -143,7 +160,8 @@ result = {
     "recurrent_continuation": True,
     "strict_load": True,
     "token_zero_semantics": special_ids,
-    "tokenizer_class": type(tokenizer).__name__,
+    "tokenizer_class": type(tokenizer).__name__ if tokenizer is not None else None,
+    "tokenizer_available": tokenizer is not None,
 }
 print("RWKV7_ARTIFACT_VALIDATION=" + json.dumps(result, sort_keys=True))
 """
@@ -481,11 +499,13 @@ def convert_rwkv7_checkpoint_to_hf_format(
     config.eos_token_id = 0
     config.pad_token_id = 0
     config.architectures = ["Rwkv7ForCausalLM"]
-    tokenizer = _load_standard_fast_tokenizer(
-        tokenizer_name_or_path,
-        vocab_size=config.vocab_size,
-        context_length=config.context_length,
-    )
+    tokenizer = None
+    if tokenizer_name_or_path is not None:
+        tokenizer = _load_standard_fast_tokenizer(
+            tokenizer_name_or_path,
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+        )
     converted = convert_state_dict(raw_state_dict, config, fuse_embedding_layer_norm)
     model = Rwkv7ForCausalLM(config)
     try:
@@ -496,8 +516,12 @@ def convert_rwkv7_checkpoint_to_hf_format(
         model.to(_SUPPORTED_DTYPES[dtype])
     checkpoint_sha256 = _sha256(checkpoint_path)
     with tempfile.TemporaryDirectory(prefix="rwkv7-tokenizer-") as tokenizer_stage:
-        tokenizer.save_pretrained(tokenizer_stage)
-        tokenizer_files = _tokenizer_file_digests(tokenizer_stage)
+        tokenizer_files = {}
+        tokenizer_source = None
+        if tokenizer is not None:
+            tokenizer.save_pretrained(tokenizer_stage)
+            tokenizer_files = _tokenizer_file_digests(tokenizer_stage)
+            tokenizer_source = Path(tokenizer_name_or_path).name
         model.save_pretrained(
             output_dir,
             safe_serialization=True,
@@ -505,9 +529,10 @@ def convert_rwkv7_checkpoint_to_hf_format(
         )
         model.generation_config.save_pretrained(output_dir)
         output_path = Path(output_dir)
-        for tokenizer_file in Path(tokenizer_stage).iterdir():
-            if tokenizer_file.is_file():
-                shutil.copyfile(tokenizer_file, output_path / tokenizer_file.name)
+        if tokenizer is not None:
+            for tokenizer_file in Path(tokenizer_stage).iterdir():
+                if tokenizer_file.is_file():
+                    shutil.copyfile(tokenizer_file, output_path / tokenizer_file.name)
         config_payload = json.loads((output_path / "config.json").read_text(encoding="utf-8"))
         normalized_config = _normalized_config(config_payload)
         identity_payload = {
@@ -527,7 +552,7 @@ def convert_rwkv7_checkpoint_to_hf_format(
             "safe_serialization": True,
             "source_revision": source_revision,
             "tokenizer_files": tokenizer_files,
-            "tokenizer_source": Path(tokenizer_name_or_path).name,
+            "tokenizer_source": tokenizer_source,
             "wkv_provider": "flash_rwkv",
         }
 
@@ -571,7 +596,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--fuse_embedding_layer_norm", action="store_true")
     parser.add_argument("--max_shard_size", default="5GB")
-    parser.add_argument("--tokenizer_name_or_path", required=True)
+    parser.add_argument(
+        "--tokenizer_name_or_path",
+        help="Optional local fast tokenizer; required only for --publication_ready.",
+    )
     parser.add_argument("--source_revision", required=True)
     parser.add_argument("--validation_device", default="cuda")
     parser.add_argument("--publication_ready", action="store_true")
