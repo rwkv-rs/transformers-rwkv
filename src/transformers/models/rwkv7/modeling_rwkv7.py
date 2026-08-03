@@ -369,6 +369,8 @@ def _rwkv7_flash(
         for tensor in (receptance, raw_decay, key, value, a, b)
     ]
     tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
+    if state_indices is not None:
+        state_indices = state_indices.contiguous()
 
     try:
         result = contract.recurrent_rwkv7(
@@ -473,27 +475,31 @@ class Rwkv7TimeMix(nn.Module):
             v_first = value
         else:
             value_delta = self.v2(self.v1(inputs["v"]))
-            if contract.can_use_flash_rwkv_inference(value, v_first, self.v0, value_delta):
-                value = contract.flash_rwkv.infer_tmix_vres_gate_fp16(value, v_first, self.v0, value_delta)
+            value_gate_bias = self.v0.reshape(-1)
+            if contract.can_use_flash_rwkv_inference(value, v_first, value_gate_bias, value_delta):
+                value = contract.flash_rwkv.infer_tmix_vres_gate_fp16(value, v_first, value_gate_bias, value_delta)
                 _require_flash_rwkv_telemetry(contract, "infer_tmix_vres_gate_fp16")
             else:
                 value = value + (v_first - value) * torch.sigmoid(self.v0 + value_delta)
         learning_rate_delta = self.a2(self.a1(inputs["a"]))
         gate = self.g2(torch.sigmoid(self.g1(inputs["g"])))
+        key_scale = self.k_k.reshape(-1)
+        gate_bias = self.a0.reshape(-1)
+        key_gate_scale = self.k_a.reshape(-1)
         if contract.can_use_flash_rwkv_inference(
             key,
-            self.k_k,
-            self.a0,
+            key_scale,
+            gate_bias,
             learning_rate_delta,
-            self.k_a,
+            key_gate_scale,
             head_dim=self.config.head_size,
         ):
             key, recurrent_a, recurrent_b = contract.flash_rwkv.infer_tmix_kk_a_gate_fp16(
                 key,
-                self.k_k,
-                self.a0,
+                key_scale,
+                gate_bias,
                 learning_rate_delta,
-                self.k_a,
+                key_gate_scale,
             )
             _require_flash_rwkv_telemetry(contract, "infer_tmix_kk_a_gate_fp16")
         else:

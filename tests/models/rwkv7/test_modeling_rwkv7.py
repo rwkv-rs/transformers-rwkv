@@ -890,12 +890,14 @@ def test_rwkv7_eligible_inference_uses_public_fused_tmix_and_cmix_with_telemetry
 
         @staticmethod
         def infer_tmix_vres_gate_fp16(value, first_value, gate_bias, gate_delta):
-            del first_value, gate_bias, gate_delta
+            assert gate_bias.shape == (value.shape[-1],)
+            del first_value, gate_delta
             return record("infer_tmix_vres_gate_fp16", value)
 
         @staticmethod
         def infer_tmix_kk_a_gate_fp16(key, key_scale, gate_bias, gate_delta, key_gate_scale):
-            del key_scale, gate_bias, gate_delta, key_gate_scale
+            assert key_scale.shape == gate_bias.shape == key_gate_scale.shape == (key.shape[-1],)
+            del gate_delta
             return record(
                 "infer_tmix_kk_a_gate_fp16",
                 (key, -torch.ones_like(key), torch.full_like(key, 0.25)),
@@ -1015,7 +1017,9 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
     inputs = [torch.randn(1, 5, 64) for _ in range(6)]
     state_pool = torch.zeros(4, 1, 64, 64)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
-    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    state_indices_storage = torch.tensor([3, -1, 1, -1], dtype=torch.int32)
+    state_indices = state_indices_storage[::2]
+    assert not state_indices.is_contiguous()
 
     output, final_state = modeling_rwkv7._rwkv7_flash(
         *inputs,
@@ -1034,7 +1038,8 @@ def test_rwkv7_public_recurrent_packed_state_pool_is_updated_by_identity(monkeyp
     assert observed_state is state_pool
     assert output_final_state is True
     assert observed_cu_seqlens is cu_seqlens
-    assert observed_state_indices is state_indices
+    assert observed_state_indices.tolist() == state_indices.tolist()
+    assert observed_state_indices.is_contiguous()
     assert mode == "fp32io16"
 
 
