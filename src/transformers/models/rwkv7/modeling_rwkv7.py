@@ -532,7 +532,10 @@ class Rwkv7TimeMix(nn.Module):
             decay_bias = None
         else:
             decay_logits = decay_delta
-            decay_bias = self.w0.view(self.config.num_attention_heads, self.config.head_size)
+            # A parameter view keeps ``requires_grad=True`` even inside an
+            # outer no-grad context.  The FlashRWKV inference family is
+            # forward-only, so make that contract explicit at the boundary.
+            decay_bias = self.w0.detach().view(self.config.num_attention_heads, self.config.head_size)
         if self.layer_id == 0:
             v_first = value
         else:
