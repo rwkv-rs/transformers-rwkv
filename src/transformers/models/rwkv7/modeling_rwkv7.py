@@ -23,7 +23,7 @@ from .configuration_rwkv7 import Rwkv7Config
 
 
 _FLA_RWKV7_REQUIRED_PARAMETERS = frozenset(
-    {"initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
+    {"decay_logits", "initial_state", "output_final_state", "cu_seqlens", "state_indices", "mode"}
 )
 _FLA_RWKV7_FUSED_INFERENCE_OPERATORS = frozenset(
     {
@@ -107,7 +107,7 @@ def _token_shift(
 
 def rwkv7_reference(
     receptance: torch.Tensor,
-    raw_decay: torch.Tensor,
+    log_decay: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     a: torch.Tensor,
@@ -121,10 +121,9 @@ def rwkv7_reference(
     output_dtype = value.dtype
     tensors = [
         tensor.view(batch_size, sequence_length, num_heads, head_size).float()
-        for tensor in (receptance, raw_decay, key, value, a, b)
+        for tensor in (receptance, log_decay, key, value, a, b)
     ]
-    receptance, raw_decay, key, value, a, b = tensors
-    log_decay = -F.softplus(-raw_decay) - 0.5
+    receptance, log_decay, key, value, a, b = tensors
     outputs = []
     current_state = state.float()
     for token_index in range(sequence_length):
@@ -344,7 +343,7 @@ def _require_flash_rwkv_telemetry(contract, expected_kernel):
 
 def _rwkv7_flash(
     receptance,
-    raw_decay,
+    decay_logits,
     key,
     value,
     a,
@@ -356,7 +355,7 @@ def _rwkv7_flash(
     state_indices=None,
     contract=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run FlashRWKV exclusively through FLA's public recurrent contract."""
+    """Run raw RWKV decay logits through FLA's public native-fused recurrent contract."""
     try:
         contract = _load_fla_rwkv7_contract() if contract is None else contract
     except (ImportError, RuntimeError) as error:
@@ -366,9 +365,8 @@ def _rwkv7_flash(
     num_heads = hidden_size // head_size
     tensors = [
         tensor.view(batch_size, sequence_length, num_heads, head_size).contiguous()
-        for tensor in (receptance, raw_decay, key, value, a, b)
+        for tensor in (receptance, decay_logits, key, value, a, b)
     ]
-    tensors[1] = (-F.softplus(-tensors[1]) - 0.5).contiguous()
     if state_indices is not None:
         state_indices = state_indices.contiguous()
 
@@ -385,11 +383,11 @@ def _rwkv7_flash(
         raise RuntimeError(f"FLA public recurrent_rwkv7 execution failed: {error}") from error
     requires_grad = any(tensor.requires_grad for tensor in (*tensors, state))
     expected_kernel = (
-        "rwkv7_recurrent_stateful"
+        "rwkv7_recurrent_stateful_from_decay_logits"
         if state_indices is not None
-        else "pretrain_recurrent_fp32io16_forward"
+        else "pretrain_recurrent_fp32io16_from_decay_logits"
         if requires_grad
-        else "rwkv7"
+        else "rwkv7_recurrent_from_decay_logits"
     )
     _require_flash_rwkv_telemetry(contract, expected_kernel)
     if not isinstance(result, tuple) or len(result) != 2:
@@ -470,7 +468,7 @@ class Rwkv7TimeMix(nn.Module):
         receptance = self.receptance(inputs["r"])
         key = self.key(inputs["k"])
         value = self.value(inputs["v"])
-        raw_decay = self.w0 + self.w2(torch.tanh(self.w1(inputs["w"])))
+        decay_logits = self.w0 + self.w2(torch.tanh(self.w1(inputs["w"])))
         if self.layer_id == 0:
             v_first = value
         else:
@@ -518,7 +516,7 @@ class Rwkv7TimeMix(nn.Module):
             recurrent_b = normalized_key * learning_rate
         wkv_inputs = (
             receptance,
-            raw_decay,
+            decay_logits,
             key,
             value,
             recurrent_a,

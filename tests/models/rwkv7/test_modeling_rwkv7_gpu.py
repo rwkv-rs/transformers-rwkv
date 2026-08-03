@@ -1,7 +1,9 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import inspect
 import json
+import math
 import subprocess
 import sys
 from importlib import metadata as importlib_metadata
@@ -17,6 +19,12 @@ from transformers.testing_utils import require_torch_gpu
 FLA_REVISION = "8173df6ab27adb1c160a59d84b4ee02b6c6d8926"
 FLASH_RWKV_REVISION = "5410491f0d6cff6058e5bd21cbab900b5b54f220"
 TORCH_VERSION = "2.11.0"
+
+
+def _rrmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    difference = actual.float() - expected.float()
+    denominator = expected.float().square().mean().sqrt().clamp_min(torch.finfo(torch.float32).eps)
+    return (difference.square().mean().sqrt() / denominator).item()
 
 
 def _gpu_config() -> Rwkv7Config:
@@ -48,6 +56,53 @@ print(json.dumps(provenance, sort_keys=True))
     assert provenance["revision"] == FLA_REVISION
     assert provenance["flash_rwkv_revision"] == FLASH_RWKV_REVISION
     assert importlib_metadata.version("torch") == TORCH_VERSION
+
+
+@require_torch_gpu
+def test_rwkv7_public_recurrent_uses_raw_decay_logits_contract() -> None:
+    contract = modeling_rwkv7._load_fla_rwkv7_contract()
+    parameters = inspect.signature(contract.recurrent_rwkv7).parameters
+
+    assert "decay_logits" in parameters
+    assert "log_decay" not in parameters
+
+
+@require_torch_gpu
+def test_rwkv7_real_recurrent_matches_independent_nonzero_state_oracle_and_gradients() -> None:
+    torch.manual_seed(20260803)
+    product_inputs = [
+        (torch.randn(1, 3, 64, device="cuda", dtype=torch.float16) * 0.05).requires_grad_() for _ in range(6)
+    ]
+    product_state = (torch.randn(1, 1, 64, 64, device="cuda") * 0.02).requires_grad_()
+    oracle_inputs = [tensor.detach().clone().requires_grad_() for tensor in product_inputs]
+    oracle_state = product_state.detach().clone().requires_grad_()
+
+    product_output, product_final_state = modeling_rwkv7._rwkv7_flash(
+        *product_inputs,
+        product_state,
+        64,
+    )
+    oracle_log_decay = -math.exp(-0.5) * torch.sigmoid(oracle_inputs[1])
+    oracle_output, oracle_final_state = modeling_rwkv7.rwkv7_reference(
+        oracle_inputs[0],
+        oracle_log_decay,
+        *oracle_inputs[2:],
+        oracle_state,
+        head_size=64,
+    )
+    output_gradient = torch.randn_like(product_output)
+    state_gradient = torch.randn_like(product_final_state)
+    ((product_output * output_gradient).sum() + (product_final_state * state_gradient).sum()).backward()
+    ((oracle_output * output_gradient).sum() + (oracle_final_state * state_gradient).sum()).backward()
+    torch.cuda.synchronize()
+
+    contract = modeling_rwkv7._load_fla_rwkv7_contract()
+    assert contract.get_last_provider() == "flash_rwkv"
+    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_from_decay_logits"
+    assert _rrmse(product_output, oracle_output) <= 0.007
+    assert _rrmse(product_final_state, oracle_final_state) <= 0.008
+    for product, oracle in zip([*product_inputs, product_state], [*oracle_inputs, oracle_state], strict=True):
+        assert _rrmse(product.grad, oracle.grad) <= 0.008
 
 
 @require_torch_gpu
@@ -107,7 +162,7 @@ def test_rwkv7_real_provider_inference_and_training() -> None:
     assert training_output.logits.dtype == torch.bfloat16
     training_output.loss.backward()
     assert contract.get_last_provider() == "flash_rwkv"
-    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_forward"
+    assert contract.get_last_kernel() == "pretrain_recurrent_fp32io16_from_decay_logits"
     gradient = model.model.blocks[0].att.receptance.weight.grad
     assert gradient is not None and torch.isfinite(gradient).all()
 
@@ -117,11 +172,29 @@ def test_rwkv7_real_provider_packed_noncontiguous_state_pool() -> None:
     torch.manual_seed(20260803)
     inputs = tuple((torch.randn(1, 3, 64, device="cuda", dtype=torch.float16) * 0.02).contiguous() for _ in range(6))
     state_pool = torch.zeros(6, 1, 64, 64, device="cuda", dtype=torch.float32)
-    untouched_before = state_pool[[0, 2, 3, 5]].clone()
+    state_pool_before = state_pool.clone()
+    untouched_before = state_pool_before[[0, 2, 3, 5]].clone()
     cu_seqlens = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
     state_indices_storage = torch.tensor([4, -1, 1, -1], device="cuda", dtype=torch.int32)
     state_indices = state_indices_storage[::2]
     assert not state_indices.is_contiguous()
+
+    expected_outputs = []
+    expected_state_pool = state_pool_before.clone()
+    for sequence_index, state_index in enumerate(state_indices.tolist()):
+        start = int(cu_seqlens[sequence_index])
+        end = int(cu_seqlens[sequence_index + 1])
+        sequence_inputs = [tensor[:, start:end] for tensor in inputs]
+        log_decay = -math.exp(-0.5) * torch.sigmoid(sequence_inputs[1])
+        expected_output, expected_state = modeling_rwkv7.rwkv7_reference(
+            sequence_inputs[0],
+            log_decay,
+            *sequence_inputs[2:],
+            expected_state_pool[state_index : state_index + 1],
+            head_size=64,
+        )
+        expected_outputs.append(expected_output)
+        expected_state_pool[state_index].copy_(expected_state[0])
 
     with torch.no_grad():
         output, final_state = modeling_rwkv7._rwkv7_flash(
@@ -136,7 +209,9 @@ def test_rwkv7_real_provider_packed_noncontiguous_state_pool() -> None:
     contract = modeling_rwkv7._load_fla_rwkv7_contract()
     assert final_state is state_pool
     assert contract.get_last_provider() == "flash_rwkv"
-    assert contract.get_last_kernel() == "rwkv7_recurrent_stateful"
+    assert contract.get_last_kernel() == "rwkv7_recurrent_stateful_from_decay_logits"
     assert torch.isfinite(output).all()
+    assert _rrmse(output, torch.cat(expected_outputs, dim=1)) <= 0.002
+    assert _rrmse(state_pool[[4, 1]], expected_state_pool[[4, 1]]) <= 0.002
     assert not torch.equal(state_pool[[4, 1]], torch.zeros_like(state_pool[[4, 1]]))
     torch.testing.assert_close(state_pool[[0, 2, 3, 5]], untouched_before, rtol=0, atol=0)

@@ -1,6 +1,8 @@
 # Copyright 2026 The HuggingFace Inc. team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import math
+
 import torch
 
 
@@ -25,7 +27,7 @@ def _run_sequence(tensors, state):
 
 def recurrent_rwkv7(
     r,
-    w,
+    decay_logits,
     k,
     v,
     a,
@@ -41,16 +43,18 @@ def recurrent_rwkv7(
     global _last_rwkv7_kernel
     assert output_final_state is True
     assert mode == "fp32io16"
-    tensors = (r, w, k, v, a, b)
+    legacy_log_rate = -torch.nn.functional.softplus(-decay_logits) - 0.5
+    log_decay = -legacy_log_rate.exp()
+    tensors = (r, log_decay, k, v, a, b)
     if state_indices is None:
         _last_rwkv7_kernel = (
-            "pretrain_recurrent_fp32io16_forward"
+            "pretrain_recurrent_fp32io16_from_decay_logits"
             if any(tensor.requires_grad for tensor in (*tensors, initial_state))
-            else "rwkv7"
+            else "rwkv7_recurrent_from_decay_logits"
         )
         return _run_sequence(tensors, initial_state)
 
-    _last_rwkv7_kernel = "rwkv7_recurrent_stateful"
+    _last_rwkv7_kernel = "rwkv7_recurrent_stateful_from_decay_logits"
     outputs = []
     for sequence_index in range(state_indices.numel()):
         start = int(cu_seqlens[sequence_index])
@@ -82,7 +86,14 @@ def _unavailable_fused_operator(*args, **kwargs):
     raise RuntimeError("Synthetic CPU contract does not execute FlashRWKV fused operators.")
 
 
+def decay_logits_to_log_decay(decay_logits):
+    global _last_rwkv7_kernel
+    _last_rwkv7_kernel = "decay_logits_to_log_decay"
+    return -math.exp(-0.5) * torch.sigmoid(decay_logits)
+
+
 class _FlashRwkvPublicApi:
+    decay_logits_to_log_decay = staticmethod(decay_logits_to_log_decay)
     infer_cmix_mix_fp16 = staticmethod(_unavailable_fused_operator)
     infer_tmix_kk_a_gate_fp16 = staticmethod(_unavailable_fused_operator)
     infer_tmix_lnx_rkvres_xg_fp16 = staticmethod(_unavailable_fused_operator)
