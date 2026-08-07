@@ -38,8 +38,8 @@ if importlib.util.find_spec("torch") is not None:
     from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix
 
 
-FLASH_RWKV_AVAILABLE = importlib.util.find_spec("flash_rwkv") is not None
-require_flash_rwkv = unittest.skipUnless(FLASH_RWKV_AVAILABLE, "test requires the FlashRWKV public package")
+FLASH_RWKV2_AVAILABLE = importlib.util.find_spec("flashrwkv2") is not None
+require_flash_rwkv2 = unittest.skipUnless(FLASH_RWKV2_AVAILABLE, "test requires the FlashRWKV2 public package")
 
 
 def tiny_config(**kwargs):
@@ -438,8 +438,8 @@ class Rwkv7ConversionTest(unittest.TestCase):
 
 @require_torch
 @require_torch_gpu
-@require_flash_rwkv
-class Rwkv7FlashRwkvTest(unittest.TestCase):
+@require_flash_rwkv2
+class Rwkv7FlashRwkv2Test(unittest.TestCase):
     def test_inference_preparation_offloads_only_canonical_ffn_down_layout(self):
         model = RwkvForCausalLM(tiny_config(hidden_size=1024, intermediate_size=4096)).cuda().eval()
         expected = model.model.blocks[0].ffn.value.weight.detach().cpu().half().clone()

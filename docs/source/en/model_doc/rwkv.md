@@ -20,7 +20,7 @@ implementation replaces the former RWKV-4 model behind the existing `rwkv` model
 compatible and are rejected explicitly.
 
 The Transformers implementation owns configuration, model composition, recurrent caching, generation and
-serialization. All product computation is delegated to the public [FlashRWKV](https://github.com/rwkv-rs/FlashRWKV)
+serialization. All product computation is delegated to the public [FlashRWKV2](https://github.com/rwkv-rs/FlashRWKV2)
 operator API. Training follows `RWKV-LM/RWKV-v7/train_temp`; inference follows Albatross. There is no CPU, PyTorch or
 FLA product fallback.
 
@@ -33,6 +33,13 @@ The current canonical contract uses:
 - equal-length batches for the initial inference integration.
 
 ## Usage
+
+Install this checkout with its RWKV extra. This installs the published `FlashRWKV2==0.1.0a2` source distribution;
+the pinned native `tokenizers-rwkv` dependency is installed automatically:
+
+```bash
+TORCH_CUDA_ARCH_LIST=12.0 uv pip install --pre -e ".[rwkv]"
+```
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -74,8 +81,6 @@ decoding when it should not be shown to the user.
 Canonical BlinkDL `.pth` checkpoints can be converted with:
 
 ```bash
-uv pip install \
-    "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python"
 ./.venv/bin/python temp/convert_rwkv7_checkpoint.py \
     rwkv7-g1h-7.2b-20260710-ctx10240.pth \
     rwkv7-g1h-7.2b-hf \

@@ -28,7 +28,7 @@ class RwkvConfig(PreTrainedConfig):
     context_length (`int`, *optional*, defaults to 4096):
         Maximum sequence length used during pretraining. Recurrent inference can continue beyond this length.
     head_size (`int`, *optional*, defaults to 64):
-        Width of each RWKV-7 recurrent head. The canonical FlashRWKV training and inference paths use 64.
+        Width of each RWKV-7 recurrent head. The canonical FlashRWKV2 training and inference paths use 64.
     group_norm_epsilon (`float`, *optional*, defaults to 0.00064):
         Epsilon used by the head-wise normalization in TimeMix.
     embedding_layer_norm_fused (`bool`, *optional*, defaults to `False`):
@@ -103,14 +103,14 @@ class RwkvConfig(PreTrainedConfig):
         super().__post_init__(**kwargs)
 
     def validate_architecture(self):
-        """Validate the canonical RWKV-7/FlashRWKV architecture contract."""
+        """Validate the canonical RWKV-7/FlashRWKV2 architecture contract."""
         if self.architecture_version != "rwkv7":
             raise ValueError(f"`architecture_version` must be 'rwkv7', got {self.architecture_version!r}.")
         if self.hidden_size <= 0 or self.num_hidden_layers <= 0 or self.intermediate_size <= 0:
             raise ValueError("RWKV-7 hidden, layer, and intermediate dimensions must be positive.")
         if self.head_size != 64:
             raise ValueError(
-                f"This integration requires the canonical FlashRWKV `head_size=64`, got {self.head_size}."
+                f"This integration requires the canonical FlashRWKV2 `head_size=64`, got {self.head_size}."
             )
         if self.hidden_size % self.head_size:
             raise ValueError(

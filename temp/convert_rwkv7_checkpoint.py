@@ -142,9 +142,8 @@ def build_tokenizer(vocab_json: Path, chat_template: Path, model_max_length: int
     if from_file is None:
         raise ImportError(
             "RWKV tokenizer conversion requires `tokenizers.models.RwkvTrie.from_file()`; the installed tokenizers "
-            'package does not provide it. Install the pinned RWKV tokenizer with `uv pip install "tokenizers @ '
-            "git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b"
-            '#subdirectory=bindings/python"`. Python, WordPiece, and raw-vocabulary fallbacks are not supported.'
+            "package does not provide it. Reinstall this Transformers checkout so its pinned tokenizers-rwkv Git "
+            "dependency is applied. Python, WordPiece, and raw-vocabulary fallbacks are not supported."
         )
     backend = Tokenizer(from_file(str(vocab_json)))
     backend.decoder = decoders.ByteLevel()

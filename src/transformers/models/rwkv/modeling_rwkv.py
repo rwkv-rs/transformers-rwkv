@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch RWKV-7 model backed exclusively by FlashRWKV operators."""
+"""PyTorch RWKV-7 model backed exclusively by FlashRWKV2 operators."""
 
 from __future__ import annotations
 
@@ -71,21 +71,23 @@ _INFERENCE_OPERATORS = (
 )
 
 
-def _load_flash_rwkv(mode: str, tensor: torch.Tensor | None = None):
-    """Load the public FlashRWKV surface lazily and fail closed on contract drift."""
+def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
+    """Load the public FlashRWKV2 surface lazily and fail closed on contract drift."""
     required = _TRAINING_OPERATORS if mode == "training" else _INFERENCE_OPERATORS
     try:
-        module = importlib.import_module("flash_rwkv")
+        module = importlib.import_module("flashrwkv2")
     except ImportError as error:
         raise RuntimeError(
-            f"RWKV-7 {mode} requires the `flash-rwkv` distribution and its public root API; import failed: {error}"
+            f"RWKV-7 {mode} requires `FlashRWKV2==0.1.0a2` and its public `flashrwkv2` root API; "
+            f"import failed: {error}"
         ) from error
     missing = [name for name in required if not callable(getattr(module, name, None))]
     if missing:
         version = getattr(module, "__version__", "unknown")
         source = getattr(module, "__file__", "unknown")
         raise RuntimeError(
-            f"RWKV-7 {mode} requires FlashRWKV public operators {missing}; installed version={version}, source={source}."
+            f"RWKV-7 {mode} requires FlashRWKV2 public operators {missing}; "
+            f"installed version={version}, source={source}."
         )
     if tensor is not None and (not tensor.is_cuda or tensor.device.type != "cuda"):
         raise RuntimeError(
@@ -160,7 +162,7 @@ class RwkvCache(Cache):
         self._rwkv_metadata_key = None
         self._rwkv_metadata = None
 
-    def recurrent_metadata(self, flash_rwkv, batch_size: int, sequence_length: int, device: torch.device):
+    def recurrent_metadata(self, flashrwkv2, batch_size: int, sequence_length: int, device: torch.device):
         key = (batch_size, sequence_length, device.type, device.index)
         if self._rwkv_metadata_key != key:
             cu_seqlens = torch.arange(
@@ -171,7 +173,7 @@ class RwkvCache(Cache):
                 device=device,
             )
             state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            ticket = flash_rwkv.prepare_recurrent_metadata(
+            ticket = flashrwkv2.prepare_recurrent_metadata(
                 cu_seqlens,
                 state_indices,
                 total_tokens=batch_size * sequence_length,
@@ -237,7 +239,7 @@ class RwkvLMHead(nn.Linear):
 
 
 class RwkvTimeMix(nn.Module):
-    """Canonical RWKV-7 TimeMix component using FlashRWKV's public training and inference APIs."""
+    """Canonical RWKV-7 TimeMix component using FlashRWKV2's public training and inference APIs."""
 
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
@@ -341,7 +343,7 @@ class RwkvTimeMix(nn.Module):
             init.zeros_(self.ln_x.bias)
 
     def _training_forward(self, hidden_states: torch.Tensor, v_first: torch.Tensor | None):
-        flash = _load_flash_rwkv("training", hidden_states)
+        flash = _load_flash_rwkv2("training", hidden_states)
         if hidden_states.dtype != torch.bfloat16:
             raise RuntimeError(
                 f"RWKV-7 training requires contiguous CUDA bfloat16 [B,T,C], got dtype={hidden_states.dtype}, "
@@ -417,7 +419,7 @@ class RwkvTimeMix(nn.Module):
         layer_norm: nn.LayerNorm | None = None,
         residual: torch.Tensor | None = None,
     ):
-        flash = _load_flash_rwkv("inference", hidden_states)
+        flash = _load_flash_rwkv2("inference", hidden_states)
         if hidden_states.dtype != torch.float16:
             raise RuntimeError(
                 f"RWKV-7 Albatross inference requires float16 hidden states; got dtype={hidden_states.dtype}. "
@@ -646,7 +648,7 @@ class RwkvChannelMix(nn.Module):
         if attention_mask is not None and not torch.all(attention_mask == 1):
             raise ValueError("RWKV-7 ChannelMix currently requires an all-ones mask.")
         if self.training:
-            flash = _load_flash_rwkv("training", hidden_states)
+            flash = _load_flash_rwkv2("training", hidden_states)
             return flash.pretrain_cmix_bf16(
                 hidden_states.contiguous(),
                 self.x_k.reshape(-1).contiguous(),
@@ -655,7 +657,7 @@ class RwkvChannelMix(nn.Module):
             )
         if past_key_values is None:
             raise ValueError("RWKV-7 inference requires an RwkvCache.")
-        flash = _load_flash_rwkv("inference", hidden_states)
+        flash = _load_flash_rwkv2("inference", hidden_states)
         if self._value_runtime is None:
             raise RuntimeError(
                 "RWKV-7 Albatross ChannelMix layout is not prepared; call `model.prepare_for_inference()` "
@@ -701,7 +703,7 @@ class RwkvChannelMix(nn.Module):
         past_key_values: RwkvCache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run Albatross's fused B1T1 residual/LayerNorm/ChannelMix path."""
-        flash = _load_flash_rwkv("inference", hidden_states)
+        flash = _load_flash_rwkv2("inference", hidden_states)
         if self._value_runtime is None:
             raise RuntimeError(
                 "RWKV-7 Albatross ChannelMix layout is not prepared; call `model.prepare_for_inference()` "
@@ -896,7 +898,7 @@ class RwkvModel(RwkvPreTrainedModel):
             if self.config.embedding_layer_norm_fused:
                 hidden_states = inputs_embeds.to(torch.float16)
             else:
-                flash = _load_flash_rwkv("inference", inputs_embeds)
+                flash = _load_flash_rwkv2("inference", inputs_embeds)
                 hidden_states = flash.infer_embedding_ln0_forward_varlen(
                     inputs_embeds.reshape(-1, self.config.hidden_size).contiguous(),
                     self.blocks[0].ln0.weight.contiguous(),
@@ -926,7 +928,7 @@ class RwkvModel(RwkvPreTrainedModel):
         if self.training:
             hidden_states = self.ln_out(hidden_states)
         else:
-            flash = _load_flash_rwkv("inference", hidden_states)
+            flash = _load_flash_rwkv2("inference", hidden_states)
             batch_size, sequence_length, channels = hidden_states.shape
             hidden_states = flash.infer_tmix_layer_norm_forward_varlen(
                 hidden_states.reshape(-1, channels).contiguous(),
@@ -1027,7 +1029,7 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
         if self.training:
             logits = self.head(selected_hidden_states)
         else:
-            flash = _load_flash_rwkv("inference", hidden_states)
+            flash = _load_flash_rwkv2("inference", hidden_states)
             batch_size, sequence_length, channels = hidden_states.shape
             if isinstance(logits_to_keep, int) and logits_to_keep == 1:
                 logits = flash.infer_head_linear_last_forward_varlen(
