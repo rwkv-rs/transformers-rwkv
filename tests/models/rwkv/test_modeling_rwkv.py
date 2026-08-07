@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import importlib.util
 import math
 import os
@@ -19,13 +20,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
-    PreTrainedTokenizerFast,
     RwkvConfig,
 )
 from transformers.testing_utils import require_torch, require_torch_gpu
@@ -33,7 +34,6 @@ from transformers.testing_utils import require_torch, require_torch_gpu
 
 if importlib.util.find_spec("torch") is not None:
     import torch
-    from tokenizers import Tokenizer, decoders, models
 
     from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix
 
@@ -57,26 +57,6 @@ def tiny_config(**kwargs):
     }
     values.update(kwargs)
     return RwkvConfig(**values)
-
-
-def make_test_tokenizer(path: Path, vocab_size: int) -> Path:
-    special_token = "<|endoftext|>"
-    probes = ("RWKV-7 tokenizer", " hello\n", "你好，世界！", "é e\u0301 😀🧑\u200d🚀", "a\x00b\t\r\n")
-    vocabulary = {special_token: 0, **{text: index + 1 for index, text in enumerate(probes)}}
-    vocabulary.update({f"<unused-{index}>": index for index in range(len(vocabulary), vocab_size)})
-    backend = Tokenizer(models.WordLevel(vocabulary, unk_token=special_token))
-    backend.decoder = decoders.Fuse()
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=backend,
-        bos_token=special_token,
-        eos_token=special_token,
-        pad_token=special_token,
-        unk_token=special_token,
-        clean_up_tokenization_spaces=False,
-    )
-    tokenizer.chat_template = "{{ bos_token }}{{ messages[0]['content'] }}"
-    tokenizer.save_pretrained(path)
-    return path
 
 
 def train_temp_tmix_init(module, config, layer_idx: int) -> None:
@@ -148,7 +128,7 @@ class Rwkv7ConfigurationTest(unittest.TestCase):
         self.assertEqual(config.wkv_state_dtype, "float32")
         self.assertEqual(config.number_of_conv_states, 2)
         self.assertEqual(config.bos_token_id, config.eos_token_id)
-        self.assertEqual(config.eos_token_id, config.pad_token_id)
+        self.assertIsNone(config.pad_token_id)
 
     def test_train_temp_low_rank_formulas(self):
         expected = {
@@ -275,7 +255,80 @@ class Rwkv7ConversionTest(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def test_minimal_conversion_and_fresh_process(self):
+    def test_default_vocab_json_uses_pinned_hub_artifact(self):
+        converter = self._converter_module()
+        with tempfile.TemporaryDirectory() as directory:
+            vocab_json = Path(directory) / converter.RWKV_VOCAB_FILENAME
+            vocab_json.write_bytes(b"published vocabulary")
+            digest = hashlib.sha256(vocab_json.read_bytes()).hexdigest()
+            with (
+                mock.patch.object(converter, "RWKV_VOCAB_SHA256", digest),
+                mock.patch.object(converter, "hf_hub_download", return_value=str(vocab_json)) as download,
+            ):
+                self.assertEqual(converter.resolve_vocab_json(None), vocab_json)
+        download.assert_called_once_with(
+            repo_id="rwkv-rs/rwkv7-g1-st",
+            filename="rwkv_vocab_v20230424.json",
+            revision="fd122cc7244c28db19beceb398aa033c35576b71",
+        )
+
+    def test_local_vocab_json_is_verified_without_hub_download(self):
+        converter = self._converter_module()
+        with tempfile.TemporaryDirectory() as directory:
+            vocab_json = Path(directory) / "local.json"
+            vocab_json.write_bytes(b"published vocabulary")
+            digest = hashlib.sha256(vocab_json.read_bytes()).hexdigest()
+            with (
+                mock.patch.object(converter, "RWKV_VOCAB_SHA256", digest),
+                mock.patch.object(converter, "hf_hub_download") as download,
+            ):
+                self.assertEqual(converter.resolve_vocab_json(vocab_json), vocab_json)
+                download.assert_not_called()
+
+    def test_vocab_json_hash_mismatch_fails_closed(self):
+        converter = self._converter_module()
+        with tempfile.TemporaryDirectory() as directory:
+            vocab_json = Path(directory) / "wrong.json"
+            vocab_json.write_bytes(b"wrong vocabulary")
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                converter.resolve_vocab_json(vocab_json)
+
+    def test_build_tokenizer_delegates_json_loading_to_rwkv_trie(self):
+        converter = self._converter_module()
+        calls = []
+
+        class FakeRwkvTrie:
+            @staticmethod
+            def from_file(path):
+                calls.append(path)
+                return converter.models.WordLevel({"<|endoftext|>": 0, "a": 1}, unk_token="<|endoftext|>")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vocab_json = root / "vocab.json"
+            vocab_json.write_text("{}", encoding="utf-8")
+            chat_template = root / "chat_template.jinja"
+            chat_template.write_text("{{ messages }}", encoding="utf-8")
+            with mock.patch.object(converter.models, "RwkvTrie", FakeRwkvTrie, create=True):
+                tokenizer = converter.build_tokenizer(vocab_json, chat_template, model_max_length=128)
+        self.assertEqual(calls, [str(vocab_json)])
+        self.assertEqual(tokenizer.model_max_length, 128)
+
+    def test_build_tokenizer_requires_rwkv_trie_from_file(self):
+        converter = self._converter_module()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(converter.models, "RwkvTrie", object(), create=True),
+        ):
+            root = Path(directory)
+            vocab_json = root / "vocab.json"
+            vocab_json.write_text("{}", encoding="utf-8")
+            chat_template = root / "chat_template.jinja"
+            chat_template.write_text("{{ messages }}", encoding="utf-8")
+            with self.assertRaisesRegex(ImportError, "RwkvTrie.from_file"):
+                converter.build_tokenizer(vocab_json, chat_template, model_max_length=128)
+
+    def test_minimal_conversion_and_fresh_model_process(self):
         converter = self._converter_module()
         model = RwkvForCausalLM(tiny_config())
         source = {
@@ -286,26 +339,19 @@ class Rwkv7ConversionTest(unittest.TestCase):
             root = Path(directory)
             checkpoint = root / "rwkv7.pth"
             output = root / "converted"
-            tokenizer = make_test_tokenizer(root / "tokenizer", model.config.vocab_size)
             torch.save(source, checkpoint)
-            converter.convert_checkpoint(
-                checkpoint,
-                output,
-                context_length=16,
-                max_shard_size="20MB",
-                tokenizer_source=str(tokenizer),
-                tokenizer_revision=None,
-            )
+            original_save_tokenizer = converter.save_tokenizer
+            converter.save_tokenizer = lambda *args, **kwargs: None
+            try:
+                converter.convert_checkpoint(checkpoint, output, context_length=16, max_shard_size="20MB")
+            finally:
+                converter.save_tokenizer = original_save_tokenizer
             loaded = AutoModelForCausalLM.from_pretrained(output)
             self.assertIsInstance(loaded, RwkvForCausalLM)
             self.assertEqual(set(loaded.state_dict()), set(model.state_dict()))
             self.assertTrue(
                 all(torch.equal(value, loaded.state_dict()[key]) for key, value in model.state_dict().items())
             )
-            loaded_tokenizer = AutoTokenizer.from_pretrained(output, trust_remote_code=False, use_fast=True)
-            self.assertTrue(loaded_tokenizer.is_fast)
-            self.assertEqual(len(loaded_tokenizer), model.config.vocab_size)
-            self.assertTrue((output / "chat_template.jinja").is_file())
             command = [
                 str(Path(__file__).parents[3] / ".venv" / "bin" / "python"),
                 "-c",
@@ -315,8 +361,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
                     "assert type(AutoConfig.from_pretrained(p,trust_remote_code=False)).__name__=='RwkvConfig'; "
                     "assert type(AutoModel.from_pretrained(p,trust_remote_code=False)).__name__=='RwkvModel'; "
                     "assert type(AutoModelForCausalLM.from_pretrained(p,trust_remote_code=False)).__name__"
-                    "=='RwkvForCausalLM'; "
-                    "assert AutoTokenizer.from_pretrained(p,trust_remote_code=False,use_fast=True).is_fast"
+                    "=='RwkvForCausalLM'"
                 ),
             ]
             subprocess.run(command, check=True)
@@ -355,21 +400,28 @@ class Rwkv7ConversionTest(unittest.TestCase):
     def test_official_standard_tokenizer_contract(self):
         source = os.environ.get("RWKV7_TOKENIZER_PATH")
         if not source:
-            self.skipTest("set RWKV7_TOKENIZER_PATH to the standard RWKV World tokenizer artifact")
+            self.skipTest("set RWKV7_TOKENIZER_PATH to rwkv_vocab_v20230424.json")
         converter = self._converter_module()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            converter.save_tokenizer(source, None, output, vocab_size=65536)
+            converter.save_tokenizer(
+                Path(source),
+                Path(__file__).parents[3] / "temp" / "rwkv_chat_template.jinja",
+                output,
+                model_vocab_size=65536,
+                model_max_length=4096,
+            )
             tokenizer = AutoTokenizer.from_pretrained(output, trust_remote_code=False, use_fast=True)
             self.assertTrue(tokenizer.is_fast)
-            self.assertEqual(len(tokenizer), 65536)
-            self.assertEqual(
-                {tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id, tokenizer.unk_token_id},
-                {0},
-            )
+            self.assertEqual(len(tokenizer), 65530)
+            self.assertEqual((tokenizer.bos_token_id, tokenizer.eos_token_id), (0, 0))
+            self.assertIsNone(tokenizer.pad_token_id)
+            self.assertIsNone(tokenizer.unk_token_id)
             self.assertNotIn("auto_map", tokenizer.init_kwargs)
-            rendered = tokenizer.apply_chat_template([{"role": "user", "content": "hello"}], tokenize=False)
-            self.assertIn("hello", rendered)
+            rendered = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "hello"}], tokenize=False, add_generation_prompt=True
+            )
+            self.assertEqual(rendered, "User✿hello✿\nBot✿<think")
 
     def test_converter_rejects_mixed_orig_mod_prefix(self):
         converter = self._converter_module()

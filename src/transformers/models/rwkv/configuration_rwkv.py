@@ -62,7 +62,7 @@ class RwkvConfig(PreTrainedConfig):
     group_norm_epsilon: float = 64e-5
     bos_token_id: int | None = 0
     eos_token_id: int | list[int] | None = 0
-    pad_token_id: int | None = 0
+    pad_token_id: int | None = None
     tie_word_embeddings: bool = False
     use_cache: bool = True
     embedding_layer_norm_fused: bool = False

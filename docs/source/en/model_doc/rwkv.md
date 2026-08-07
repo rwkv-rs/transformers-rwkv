@@ -46,9 +46,36 @@ inputs = tokenizer("RWKV-7", return_tensors="pt").to(model.device)
 outputs = model.generate(**inputs, max_new_tokens=32)
 ```
 
+For chat generation, render the prompt and resolve its matching stop string from the same messages and tools. Pass the
+tokenizer to `generate()` because Transformers uses it to match stop strings across token boundaries:
+
+```python
+messages = [{"role": "user", "content": "Explain recurrent state briefly."}]
+inputs = tokenizer.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    return_tensors="pt",
+).to(model.device)
+stop_strings = tokenizer.get_chat_stop_strings(messages)
+outputs = model.generate(
+    **inputs,
+    tokenizer=tokenizer,
+    stop_strings=stop_strings,
+    max_new_tokens=256,
+)
+```
+
+The native `bot` prompt stops at `✿`; the `assistant` prompt stops at `\nUser:`; and function-calling prompts stop at
+`\n### User`. Passing tools, historical tool calls, or tool messages automatically selects the function-calling prompt
+and stop string. One generation batch must use one effective prompt style; split mixed-style conversations before
+generation. Transformers returns the generated stop delimiter in the token sequence, so remove that suffix after
+decoding when it should not be shown to the user.
+
 Canonical BlinkDL `.pth` checkpoints can be converted with:
 
 ```bash
+uv pip install \
+    "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python"
 ./.venv/bin/python temp/convert_rwkv7_checkpoint.py \
     rwkv7-g1h-7.2b-20260710-ctx10240.pth \
     rwkv7-g1h-7.2b-hf \
@@ -56,10 +83,11 @@ Canonical BlinkDL `.pth` checkpoints can be converted with:
 ```
 
 The converter preserves canonical tensor names under the single standard `model.` base-model prefix and writes
-Safetensors without a per-tensor compatibility table. It also writes a standard fast `tokenizer.json`,
-`tokenizer_config.json`, and `chat_template.jinja` from the pinned `RWKV/RWKV7-1.5B-20260805` tokenizer artifact.
-Use `--tokenizer-source` to select an equivalent local standard tokenizer directory and `--tokenizer-revision` to
-pin a different Hub revision.
+Safetensors without a per-tensor compatibility table. It builds a standard fast `tokenizer.json` from the pinned
+`rwkv-rs/rwkv7-g1-st` `rwkv_vocab_v20230424.json` artifact and writes the native RWKV chat template. Pass
+`--rwkv-vocab-json` to use a hash-verified local copy of that JSON artifact or `--chat-template` to select the template
+file. The tokenizer uses the RWKV World byte-level greedy longest-match algorithm. BOS and EOS share token ID 0;
+padding and unknown tokens are intentionally undefined.
 
 For a new model, the four TimeMix low-rank dimensions are derived from `hidden_size` with the exact `train_temp`
 formulas. Converted checkpoints instead record the dimensions found in `w1/a1/v1/g1` and preserve them verbatim;
@@ -67,6 +95,10 @@ loading a checkpoint never recomputes or replaces its serialized low-rank dimens
 also use the final effective parameter initialization from `train_temp`, including SmallInitEmb, the
 vocabulary-dependent orthogonal LM head, layer-scaled GroupNorm weights, and the depth-dependent TimeMix and
 ChannelMix parameters.
+
+## RwkvTokenizerFast
+
+[[autodoc]] RwkvTokenizerFast
 
 ## RwkvConfig
 

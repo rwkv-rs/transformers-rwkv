@@ -6,22 +6,30 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
-import shutil
 from pathlib import Path
 
 import torch
 from accelerate import init_empty_weights
 from huggingface_hub import hf_hub_download, save_torch_state_dict
+from tokenizers import Tokenizer, decoders, models, processors
 
-from transformers import AutoTokenizer, GenerationConfig, RwkvConfig, RwkvForCausalLM
+from transformers import AutoTokenizer, GenerationConfig, RwkvConfig, RwkvForCausalLM, RwkvTokenizerFast
 
 
 LAYER_PATTERN = re.compile(r"^blocks\.(\d+)\.")
-TOKENIZER_SOURCE = "RWKV/RWKV7-1.5B-20260805"
-TOKENIZER_REVISION = "bfb3a69a63e6681f729651c357f13ce0c774ea9c"
+RWKV_VOCAB_REPO = "rwkv-rs/rwkv7-g1-st"
+RWKV_VOCAB_FILENAME = "rwkv_vocab_v20230424.json"
+RWKV_VOCAB_REVISION = "fd122cc7244c28db19beceb398aa033c35576b71"
+RWKV_VOCAB_SHA256 = "0bc72a74aadcd4245878ce07618c77f9c366c485a259d0fa1e4448e50b77cfd7"
+RWKV_TOKENIZER_VOCAB_SIZE = 65530
+RWKV_MODEL_VOCAB_SIZE = 65536
+RWKV_BOS_EOS_TOKEN = "<|endoftext|>"
+RWKV_BOS_EOS_TOKEN_ID = 0
 TOKENIZER_PROBES = ("RWKV-7 tokenizer", " hello\n", "你好，世界！", "é e\u0301 😀🧑\u200d🚀", "a\x00b\t\r\n")
+DEFAULT_CHAT_TEMPLATE = Path(__file__).with_name("rwkv_chat_template.jinja")
 
 
 def _canonical_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
@@ -47,9 +55,7 @@ def _require_shape(state: dict[str, torch.Tensor], key: str, dimensions: int) ->
     return shape
 
 
-def _infer_low_rank_dim(
-    state: dict[str, torch.Tensor], layer_ids: list[int], stem: str, hidden_size: int
-) -> int:
+def _infer_low_rank_dim(state: dict[str, torch.Tensor], layer_ids: list[int], stem: str, hidden_size: int) -> int:
     ranks = set()
     for layer_id in layer_ids:
         prefix = f"blocks.{layer_id}.att.{stem}"
@@ -111,26 +117,75 @@ def convert_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
     return converted
 
 
-def _tokenizer_load_kwargs(tokenizer_source: str, tokenizer_revision: str | None) -> dict:
-    if Path(tokenizer_source).is_dir():
-        return {"local_files_only": True}
-    return {"revision": tokenizer_revision}
+def _verify_vocab_bytes(data: bytes, source: str) -> None:
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != RWKV_VOCAB_SHA256:
+        raise ValueError(f"RWKV vocabulary SHA-256 mismatch for {source}: expected {RWKV_VOCAB_SHA256}, got {digest}.")
 
 
-def _validate_tokenizer(tokenizer, vocab_size: int) -> list[dict[str, object]]:
+def resolve_vocab_json(vocab_json: Path | None) -> Path:
+    if vocab_json is None:
+        vocab_json = Path(
+            hf_hub_download(
+                repo_id=RWKV_VOCAB_REPO,
+                filename=RWKV_VOCAB_FILENAME,
+                revision=RWKV_VOCAB_REVISION,
+            )
+        )
+    _verify_vocab_bytes(vocab_json.read_bytes(), str(vocab_json))
+    return vocab_json
+
+
+def build_tokenizer(vocab_json: Path, chat_template: Path, model_max_length: int) -> RwkvTokenizerFast:
+    rwkv_trie = getattr(models, "RwkvTrie", None)
+    from_file = getattr(rwkv_trie, "from_file", None)
+    if from_file is None:
+        raise ImportError(
+            "RWKV tokenizer conversion requires `tokenizers.models.RwkvTrie.from_file()`; the installed tokenizers "
+            'package does not provide it. Install the pinned RWKV tokenizer with `uv pip install "tokenizers @ '
+            "git+https://github.com/rwkv-rs/tokenizers-rwkv.git@c5d8dde5ff49c70e4656199d5033a84e03c21b2b"
+            '#subdirectory=bindings/python"`. Python, WordPiece, and raw-vocabulary fallbacks are not supported.'
+        )
+    backend = Tokenizer(from_file(str(vocab_json)))
+    backend.decoder = decoders.ByteLevel()
+    backend.post_processor = processors.TemplateProcessing(
+        single=f"{RWKV_BOS_EOS_TOKEN} $A",
+        pair=f"{RWKV_BOS_EOS_TOKEN} $A $B",
+        special_tokens=[(RWKV_BOS_EOS_TOKEN, 0)],
+    )
+    tokenizer = RwkvTokenizerFast(
+        tokenizer_object=backend,
+        bos_token=RWKV_BOS_EOS_TOKEN,
+        eos_token=RWKV_BOS_EOS_TOKEN,
+        model_max_length=model_max_length,
+        clean_up_tokenization_spaces=False,
+    )
+    tokenizer.chat_template = chat_template.read_text(encoding="utf-8")
+    return tokenizer
+
+
+def _validate_tokenizer(tokenizer, model_vocab_size: int) -> list[dict[str, object]]:
     if not tokenizer.is_fast:
         raise ValueError("RWKV-7 conversion requires a standard fast tokenizer.json artifact.")
-    if len(tokenizer) != vocab_size:
-        raise ValueError(f"Tokenizer vocabulary ({len(tokenizer)}) must equal checkpoint vocabulary ({vocab_size}).")
-    special_ids = {
-        name: getattr(tokenizer, f"{name}_token_id") for name in ("bos", "eos", "pad", "unk")
-    }
-    if set(special_ids.values()) != {0}:
-        raise ValueError(f"RWKV World BOS/EOS/PAD/UNK must all use token ID 0, got {special_ids}.")
+    if model_vocab_size != RWKV_MODEL_VOCAB_SIZE:
+        raise ValueError(f"RWKV-7 model vocabulary must be 65536, got {model_vocab_size}.")
+    if tokenizer.vocab_size != RWKV_TOKENIZER_VOCAB_SIZE or len(tokenizer) != RWKV_TOKENIZER_VOCAB_SIZE:
+        raise ValueError(
+            f"RWKV tokenizer must contain IDs 0..65529 exactly, got vocab_size={tokenizer.vocab_size}, "
+            f"len={len(tokenizer)}."
+        )
+    vocabulary_ids = set(tokenizer.get_vocab().values())
+    if vocabulary_ids != set(range(RWKV_TOKENIZER_VOCAB_SIZE)):
+        raise ValueError("RWKV tokenizer vocabulary IDs must cover 0..65529 exactly.")
+    special_ids = {name: getattr(tokenizer, f"{name}_token_id") for name in ("bos", "eos", "pad", "unk")}
+    if special_ids != {"bos": 0, "eos": 0, "pad": None, "unk": None}:
+        raise ValueError(f"RWKV requires BOS/EOS ID 0 and no PAD/UNK token, got {special_ids}.")
     expected = []
-    reserved_ids = set(range(65530, 65536)) if vocab_size == 65536 else set()
+    reserved_ids = set(range(RWKV_TOKENIZER_VOCAB_SIZE, RWKV_MODEL_VOCAB_SIZE))
     for text in TOKENIZER_PROBES:
         token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if RWKV_BOS_EOS_TOKEN_ID in token_ids:
+            raise ValueError(f"RWKV BOS/EOS token ID 0 became reachable for ordinary probe {text!r}.")
         if reserved_ids.intersection(token_ids):
             raise ValueError(f"RWKV World reserved token IDs became reachable for probe {text!r}.")
         decoded = tokenizer.decode(token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
@@ -138,58 +193,53 @@ def _validate_tokenizer(tokenizer, vocab_size: int) -> list[dict[str, object]]:
             raise ValueError(f"RWKV tokenizer failed a byte-preserving round trip for probe {text!r}.")
         expected.append({"text": text, "token_ids": token_ids})
     probe = TOKENIZER_PROBES[0]
-    if tokenizer.encode(probe, add_special_tokens=True) != tokenizer.encode(probe, add_special_tokens=False):
-        raise ValueError("RWKV World tokenizer must not insert a BOS token during ordinary encoding.")
+    payload = tokenizer.encode(probe, add_special_tokens=False)
+    if tokenizer.encode(probe, add_special_tokens=True) != [0, *payload]:
+        raise ValueError("RWKV encoding with special tokens must add exactly one leading BOS/EOS token ID 0.")
+    if not tokenizer.chat_template or tokenizer.chat_template.strip() == "{# RWKV native chat template #}":
+        raise ValueError("RWKV tokenizer requires an executable native chat template, not a placeholder.")
     return expected
 
 
 def save_tokenizer(
-    tokenizer_source: str,
-    tokenizer_revision: str | None,
+    vocab_json: Path | None,
+    chat_template: Path,
     output_dir: Path,
-    vocab_size: int,
+    model_vocab_size: int,
+    model_max_length: int,
 ) -> None:
-    load_kwargs = _tokenizer_load_kwargs(tokenizer_source, tokenizer_revision)
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_source,
-        use_fast=True,
-        trust_remote_code=False,
-        **load_kwargs,
-    )
-    expected = _validate_tokenizer(tokenizer, vocab_size)
+    resolved_vocab = resolve_vocab_json(vocab_json)
+    tokenizer = build_tokenizer(resolved_vocab, chat_template, model_max_length)
+    expected = _validate_tokenizer(tokenizer, model_vocab_size)
     tokenizer.save_pretrained(output_dir)
-
-    chat_template = output_dir / "chat_template.jinja"
-    if not chat_template.is_file():
-        if Path(tokenizer_source).is_dir():
-            source_template = Path(tokenizer_source) / "chat_template.jinja"
-            if not source_template.is_file():
-                source_template = Path(
-                    hf_hub_download(
-                        repo_id=TOKENIZER_SOURCE,
-                        filename="chat_template.jinja",
-                        revision=TOKENIZER_REVISION,
-                    )
-                )
-        else:
-            source_template = Path(
-                hf_hub_download(
-                    repo_id=tokenizer_source,
-                    filename="chat_template.jinja",
-                    revision=tokenizer_revision,
-                )
-            )
-        if not source_template.is_file():
-            raise ValueError(f"Tokenizer source does not provide `chat_template.jinja`: {tokenizer_source}")
-        shutil.copyfile(source_template, chat_template)
 
     tokenizer_json = output_dir / "tokenizer.json"
     tokenizer_config = output_dir / "tokenizer_config.json"
-    if not tokenizer_json.is_file() or not tokenizer_config.is_file():
-        raise ValueError("Tokenizer save must produce both tokenizer.json and tokenizer_config.json.")
+    saved_chat_template = output_dir / "chat_template.jinja"
+    if not tokenizer_json.is_file() or not tokenizer_config.is_file() or not saved_chat_template.is_file():
+        raise ValueError("Tokenizer save must produce tokenizer.json, tokenizer_config.json, and chat_template.jinja.")
     saved_config = json.loads(tokenizer_config.read_text(encoding="utf-8"))
+    saved_config["chat_template"] = tokenizer.chat_template
+    saved_config.pop("pad_token", None)
+    saved_config.pop("unk_token", None)
+    tokenizer_config.write_text(
+        json.dumps(saved_config, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "special_tokens_map.json").write_text(
+        json.dumps(
+            {"bos_token": RWKV_BOS_EOS_TOKEN, "eos_token": RWKV_BOS_EOS_TOKEN},
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     if saved_config.get("auto_map"):
         raise ValueError("RWKV tokenizer artifacts must not require `auto_map` or remote code.")
+    if any(saved_config.get(name) is not None for name in ("pad_token", "unk_token")):
+        raise ValueError("RWKV tokenizer artifacts must not declare PAD or UNK tokens.")
 
     reloaded = AutoTokenizer.from_pretrained(
         output_dir,
@@ -197,7 +247,9 @@ def save_tokenizer(
         use_fast=True,
         trust_remote_code=False,
     )
-    actual = _validate_tokenizer(reloaded, vocab_size)
+    if not isinstance(reloaded, RwkvTokenizerFast):
+        raise ValueError(f"AutoTokenizer must load RwkvTokenizerFast, got {type(reloaded).__name__}.")
+    actual = _validate_tokenizer(reloaded, model_vocab_size)
     if actual != expected:
         raise ValueError("RWKV tokenizer token IDs changed after save_pretrained()/from_pretrained().")
 
@@ -207,8 +259,8 @@ def convert_checkpoint(
     output_dir: Path,
     context_length: int,
     max_shard_size: str,
-    tokenizer_source: str = TOKENIZER_SOURCE,
-    tokenizer_revision: str | None = TOKENIZER_REVISION,
+    vocab_json: Path | None = None,
+    chat_template: Path = DEFAULT_CHAT_TEMPLATE,
 ) -> None:
     source = _canonical_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
     config = infer_config(source, context_length)
@@ -234,7 +286,7 @@ def convert_checkpoint(
     config.architectures = ["RwkvForCausalLM"]
     config.bos_token_id = 0
     config.eos_token_id = 0
-    config.pad_token_id = 0
+    config.pad_token_id = None
     config.save_pretrained(output_dir)
     GenerationConfig.from_model_config(config).save_pretrained(output_dir)
     save_torch_state_dict(
@@ -244,7 +296,7 @@ def convert_checkpoint(
         max_shard_size=max_shard_size,
         safe_serialization=True,
     )
-    save_tokenizer(tokenizer_source, tokenizer_revision, output_dir, config.vocab_size)
+    save_tokenizer(vocab_json, chat_template, output_dir, config.vocab_size, config.context_length)
 
 
 def main() -> None:
@@ -253,8 +305,8 @@ def main() -> None:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--context-length", type=int, required=True)
     parser.add_argument("--max-shard-size", default="5GB")
-    parser.add_argument("--tokenizer-source", default=TOKENIZER_SOURCE)
-    parser.add_argument("--tokenizer-revision", default=TOKENIZER_REVISION)
+    parser.add_argument("--rwkv-vocab-json", type=Path)
+    parser.add_argument("--chat-template", type=Path, default=DEFAULT_CHAT_TEMPLATE)
     args = parser.parse_args()
     if args.context_length <= 0:
         parser.error("--context-length must be positive")
@@ -263,8 +315,8 @@ def main() -> None:
         args.output_dir,
         args.context_length,
         args.max_shard_size,
-        tokenizer_source=args.tokenizer_source,
-        tokenizer_revision=args.tokenizer_revision,
+        vocab_json=args.rwkv_vocab_json,
+        chat_template=args.chat_template,
     )
 
 
