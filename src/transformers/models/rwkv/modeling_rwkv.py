@@ -365,7 +365,7 @@ class RwkvTimeMix(nn.Module):
         )
         receptance = self.receptance(xr)
         decay_delta = torch.tanh(xw @ self.w1) @ self.w2
-        decay = -F.softplus(-(self.w0 + decay_delta)) - 0.5
+        decay_logits = self.w0 + decay_delta
         key = self.key(xk)
         value = self.value(xv)
         if self.layer_idx == 0:
@@ -393,7 +393,7 @@ class RwkvTimeMix(nn.Module):
         )
         output = flash.pretrain_recurrent_bf16(
             receptance.contiguous(),
-            decay.contiguous(),
+            decay_logits.contiguous(),
             key,
             value.contiguous(),
             recurrent_a,
