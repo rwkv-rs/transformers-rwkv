@@ -34,7 +34,7 @@ The current canonical contract uses:
 
 ## Usage
 
-Install this checkout with its RWKV extra. This installs the published `FlashRWKV2==0.1.0a2` source distribution;
+Install this checkout with its RWKV extra. This installs the published `FlashRWKV2==0.1.0a3` source distribution;
 the pinned native `tokenizers-rwkv` dependency is installed automatically:
 
 ```bash

@@ -78,7 +78,7 @@ def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
         module = importlib.import_module("flashrwkv2")
     except ImportError as error:
         raise RuntimeError(
-            f"RWKV-7 {mode} requires `FlashRWKV2==0.1.0a2` and its public `flashrwkv2` root API; "
+            f"RWKV-7 {mode} requires `FlashRWKV2==0.1.0a3` and its public `flashrwkv2` root API; "
             f"import failed: {error}"
         ) from error
     missing = [name for name in required if not callable(getattr(module, name, None))]
