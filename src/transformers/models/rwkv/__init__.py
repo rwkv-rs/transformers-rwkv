@@ -20,6 +20,7 @@ from ...utils.import_utils import define_import_structure
 if TYPE_CHECKING:
     from .configuration_rwkv import *
     from .modeling_rwkv import *
+    from .tokenization_rwkv import *
 else:
     import sys
 

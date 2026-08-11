@@ -18,13 +18,9 @@ import json
 import re
 from typing import Any
 
-from ...tokenization_utils_base import BatchEncoding, TruncationStrategy
-from ...tokenization_utils_tokenizers import PreTrainedTokenizerFast
-from ...utils import PaddingStrategy
+from ...tokenization_utils_tokenizers import TokenizersBackend
 
 
-RWKV_BOS_EOS_TOKEN = "<|endoftext|>"
-RWKV_BOS_EOS_TOKEN_ID = 0
 RWKV_GENERATION_PROMPT_MODES = ("open_think", "fake_think")
 RWKV_PROMPT_STYLES = ("bot", "assistant", "function_calling")
 RWKV_CHAT_STOP_STRINGS = {
@@ -105,7 +101,7 @@ def _resolve_prompt_style(conversation: Any, tools: Any, prompt_style: str) -> s
     return "function_calling" if tools or has_tool_history or prompt_style == "function_calling" else prompt_style
 
 
-class RwkvTokenizerFast(PreTrainedTokenizerFast):
+class RwkvTokenizerFast(TokenizersBackend):
     """Rust-backed greedy byte tokenizer for RWKV World models."""
 
     model_input_names = ["input_ids", "attention_mask"]
@@ -140,156 +136,6 @@ class RwkvTokenizerFast(PreTrainedTokenizerFast):
         effective_style = prompt_styles.pop() if prompt_styles else rwkv_prompt_template
         return [RWKV_CHAT_STOP_STRINGS[effective_style]]
 
-    def encode(
-        self,
-        text,
-        text_pair=None,
-        add_special_tokens=True,
-        padding=False,
-        truncation=None,
-        max_length=None,
-        stride=0,
-        padding_side=None,
-        return_tensors=None,
-        **kwargs,
-    ):
-        model = self.backend_tokenizer.model
-        if (
-            isinstance(text, str)
-            and text_pair is None
-            and not padding
-            and not truncation
-            and max_length is None
-            and not stride
-            and return_tensors is None
-            and not kwargs
-            and hasattr(model, "encode")
-        ):
-            token_ids = model.encode(text)
-            if not add_special_tokens:
-                return token_ids
-            first_non_bos = 0
-            while first_non_bos < len(token_ids) and token_ids[first_non_bos] == RWKV_BOS_EOS_TOKEN_ID:
-                first_non_bos += 1
-            return [RWKV_BOS_EOS_TOKEN_ID, *token_ids[first_non_bos:]]
-        return super().encode(
-            text=text,
-            text_pair=text_pair,
-            add_special_tokens=add_special_tokens,
-            padding=padding,
-            truncation=truncation,
-            max_length=max_length,
-            stride=stride,
-            padding_side=padding_side,
-            return_tensors=return_tensors,
-            **kwargs,
-        )
-
-    def _encode_plus(
-        self,
-        text,
-        text_pair=None,
-        add_special_tokens=True,
-        padding_strategy=PaddingStrategy.DO_NOT_PAD,
-        truncation_strategy=TruncationStrategy.DO_NOT_TRUNCATE,
-        max_length=None,
-        stride=0,
-        is_split_into_words=False,
-        pad_to_multiple_of=None,
-        padding_side=None,
-        return_tensors=None,
-        return_token_type_ids=None,
-        return_attention_mask=None,
-        return_overflowing_tokens=False,
-        return_special_tokens_mask=False,
-        return_offsets_mapping=False,
-        return_length=False,
-        verbose=True,
-        split_special_tokens=None,
-        **kwargs,
-    ):
-        if (
-            add_special_tokens
-            and truncation_strategy != TruncationStrategy.DO_NOT_TRUNCATE
-            and max_length is not None
-            and max_length < 1
-        ):
-            raise ValueError("RWKV sequences require max_length >= 1 to preserve BOS/EOS token ID 0.")
-        use_rwkv_fast_path = (
-            text_pair is None
-            and not is_split_into_words
-            and padding_strategy == PaddingStrategy.DO_NOT_PAD
-            and not stride
-            and not return_overflowing_tokens
-            and not return_special_tokens_mask
-            and not return_offsets_mapping
-            and not split_special_tokens
-            and (
-                isinstance(text, str)
-                or isinstance(text, (list, tuple))
-                and all(isinstance(item, str) for item in text)
-            )
-        )
-        model = self.backend_tokenizer.model
-        if not use_rwkv_fast_path or not hasattr(model, "encode_batch"):
-            return super()._encode_plus(
-                text=text,
-                text_pair=text_pair,
-                add_special_tokens=add_special_tokens,
-                padding_strategy=padding_strategy,
-                truncation_strategy=truncation_strategy,
-                max_length=max_length,
-                stride=stride,
-                is_split_into_words=is_split_into_words,
-                pad_to_multiple_of=pad_to_multiple_of,
-                padding_side=padding_side,
-                return_tensors=return_tensors,
-                return_token_type_ids=return_token_type_ids,
-                return_attention_mask=return_attention_mask,
-                return_overflowing_tokens=return_overflowing_tokens,
-                return_special_tokens_mask=return_special_tokens_mask,
-                return_offsets_mapping=return_offsets_mapping,
-                return_length=return_length,
-                verbose=verbose,
-                split_special_tokens=split_special_tokens,
-                **kwargs,
-            )
-
-        is_batched = not isinstance(text, str)
-        sequences = list(text) if is_batched else [text]
-        input_ids = model.encode_batch(sequences)
-        for index, token_ids in enumerate(input_ids):
-            if add_special_tokens:
-                first_non_bos = 0
-                while first_non_bos < len(token_ids) and token_ids[first_non_bos] == RWKV_BOS_EOS_TOKEN_ID:
-                    first_non_bos += 1
-                token_ids = [RWKV_BOS_EOS_TOKEN_ID, *token_ids[first_non_bos:]]
-            if truncation_strategy != TruncationStrategy.DO_NOT_TRUNCATE and max_length is not None:
-                if self.truncation_side == "left" and add_special_tokens:
-                    tail_length = max_length - 1
-                    token_ids = (
-                        [RWKV_BOS_EOS_TOKEN_ID, *token_ids[-tail_length:]]
-                        if tail_length > 0
-                        else [RWKV_BOS_EOS_TOKEN_ID]
-                    )
-                elif self.truncation_side == "left":
-                    token_ids = token_ids[-max_length:]
-                else:
-                    token_ids = token_ids[:max_length]
-            input_ids[index] = token_ids
-
-        data = {"input_ids": input_ids if is_batched else input_ids[0]}
-        if return_attention_mask is not False:
-            attention_mask = [[1] * len(token_ids) for token_ids in input_ids]
-            data["attention_mask"] = attention_mask if is_batched else attention_mask[0]
-        if return_token_type_ids:
-            token_type_ids = [[0] * len(token_ids) for token_ids in input_ids]
-            data["token_type_ids"] = token_type_ids if is_batched else token_type_ids[0]
-        if return_length:
-            lengths = [len(token_ids) for token_ids in input_ids]
-            data["length"] = lengths if is_batched else lengths[0]
-        return BatchEncoding(data, tensor_type=return_tensors)
-
     def apply_chat_template(
         self,
         conversation,
@@ -308,6 +154,25 @@ class RwkvTokenizerFast(PreTrainedTokenizerFast):
         tokenizer_kwargs=None,
         **kwargs,
     ):
+        native_template = chat_template is None or chat_template == self.chat_template
+        if not native_template:
+            return super().apply_chat_template(
+                conversation,
+                tools=tools,
+                documents=documents,
+                chat_template=chat_template,
+                add_generation_prompt=add_generation_prompt,
+                continue_final_message=continue_final_message,
+                tokenize=tokenize,
+                padding=padding,
+                truncation=truncation,
+                max_length=max_length,
+                return_tensors=return_tensors,
+                return_dict=return_dict,
+                return_assistant_tokens_mask=return_assistant_tokens_mask,
+                tokenizer_kwargs=tokenizer_kwargs,
+                **kwargs,
+            )
         if return_assistant_tokens_mask:
             raise ValueError("RWKV chat templates do not define an assistant token mask.")
         generation_prompt = kwargs.setdefault("rwkv_generation_prompt", "open_think")
@@ -326,28 +191,23 @@ class RwkvTokenizerFast(PreTrainedTokenizerFast):
             normalized = [_normalize_conversation(item) for item in values]
         else:
             normalized = _normalize_conversation(values)
-        rendered = super().apply_chat_template(
+        kwargs["rwkv_add_bos"] = tokenize
+        return super().apply_chat_template(
             normalized,
             tools=tools,
             documents=documents,
             chat_template=chat_template,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=continue_final_message,
-            tokenize=False,
-            **kwargs,
-        )
-        if not tokenize:
-            return rendered
-        encoded = self(
-            rendered,
+            tokenize=tokenize,
             padding=padding,
             truncation=truncation,
             max_length=max_length,
-            add_special_tokens=True,
             return_tensors=return_tensors,
-            **(tokenizer_kwargs or {}),
+            return_dict=return_dict,
+            tokenizer_kwargs=tokenizer_kwargs,
+            **kwargs,
         )
-        return encoded if return_dict else encoded["input_ids"]
 
 
 __all__ = ["RwkvTokenizerFast"]

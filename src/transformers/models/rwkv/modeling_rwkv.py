@@ -22,18 +22,13 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from ... import initialization as init
 from ...cache_utils import Cache, CacheLayerMixin, LinearAttentionLayer
 from ...generation import GenerationMixin
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_utils import PreTrainedModel
-from ...utils import ModelOutput, auto_docstring, logging
+from ...utils import ModelOutput, auto_docstring
 from .configuration_rwkv import RwkvConfig
-
-
-logger = logging.get_logger(__name__)
 
 
 _TRAINING_OPERATORS = (
@@ -95,8 +90,8 @@ def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
         module = importlib.import_module("flashrwkv2")
     except ImportError as error:
         raise RuntimeError(
-            f"RWKV-7 {mode} requires `FlashRWKV2==0.1.0a6` and its public `flashrwkv2` root API; "
-            f"import failed: {error}"
+            f"RWKV-7 {mode} requires the public `flashrwkv2` root API. Install this checkout with its "
+            f"`rwkv` extra; import failed: {error}"
         ) from error
     missing = [name for name in required if not callable(getattr(module, name, None))]
     if missing:
@@ -151,11 +146,10 @@ def _infer_tmix_attention_linear(flashrwkv2, x: torch.Tensor, projection: nn.Mod
 
     if projection.disable_adapters:
         if projection.merged:
-            unmerge = getattr(projection, "unmerge", None)
-            if not callable(unmerge):
-                raise RuntimeError("Disabled merged LoRA projection cannot be unmerged.")
-            unmerge()
-            base_layer = projection.get_base_layer()
+            raise RuntimeError(
+                "RWKV-7 inference does not mutate PEFT adapter state in forward. Unmerge the LoRA projection "
+                "before disabling adapters."
+            )
         return base(x, base_layer.weight.contiguous())
     if projection.merged:
         return base(x, base_layer.weight.contiguous())
@@ -330,16 +324,18 @@ class RwkvTrainingState:
 @dataclass
 class RwkvModelOutput(ModelOutput):
     last_hidden_state: torch.FloatTensor | None = None
-    training_state: RwkvTrainingState | None = None
     past_key_values: RwkvCache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    training_state: RwkvTrainingState | None = None
 
 
 @dataclass
 class RwkvCausalLMOutput(ModelOutput):
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
-    training_state: RwkvTrainingState | None = None
     past_key_values: RwkvCache | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    training_state: RwkvTrainingState | None = None
 
 
 class RwkvDynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
@@ -399,16 +395,16 @@ class RwkvDynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
 class RwkvCache(Cache):
     """Standard Transformers cache containing RWKV-7 shift and FP32 WKV states."""
 
-    def __init__(self, config: RwkvConfig):
+    def __init__(self, config):
         super().__init__(
             layers=[RwkvDynamicCacheLayer(config.number_of_conv_states) for _ in range(config.num_hidden_layers)]
         )
-        self._rwkv_config = config
         self._rwkv_metadata_key = None
         self._rwkv_metadata = None
 
     def recurrent_metadata(self, flashrwkv2, batch_size: int, sequence_length: int, device: torch.device):
-        key = (batch_size, sequence_length, device.type, device.index)
+        stream = torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else None
+        key = (batch_size, sequence_length, device.type, device.index, stream)
         if self._rwkv_metadata_key != key:
             cu_seqlens = torch.arange(
                 0,
@@ -440,6 +436,7 @@ def _cache_states(
     cache: RwkvCache,
     layer_idx: int,
     hidden_states: torch.Tensor,
+    config,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, _, hidden_size = hidden_states.shape
     layer = cache.layers[layer_idx]
@@ -450,7 +447,6 @@ def _cache_states(
             seed = hidden_states.new_zeros(batch_size, hidden_size, 1)
             layer.lazy_initialization(conv_states=seed, state_idx=state_idx, conv_kernel_size=1)
     if not layer.is_recurrent_states_initialized[0]:
-        config = cache._rwkv_config
         state = torch.zeros(
             batch_size,
             config.num_attention_heads,
@@ -525,6 +521,16 @@ class RwkvTimeMix(nn.Module):
         self.register_buffer("_zero_residual", None, persistent=False)
         for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
             self.register_buffer(f"_{name}_original", None, persistent=False)
+        self.register_load_state_dict_post_hook(self._clear_inference_layouts)
+
+    def _clear_inference_layouts(self, *args) -> None:
+        self._zero_residual = None
+        for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
+            setattr(self, f"_{name}_original", None)
+
+    def _apply(self, fn, recurse=True):
+        self._clear_inference_layouts()
+        return super()._apply(fn, recurse=recurse)
 
     def prepare_for_inference(self) -> None:
         """Prepare the original low-rank layouts used by Albatross's shape-specific dispatch table."""
@@ -593,6 +599,56 @@ class RwkvTimeMix(nn.Module):
             init.constant_(self.ln_x.weight, layer_scale**0.7)
             init.zeros_(self.ln_x.bias)
 
+    def _training_projections(self, flash, mixed: tuple[torch.Tensor, ...], v_first: torch.Tensor | None):
+        xr, xw, xk, xv, xa, xg = mixed
+        receptance = self.receptance(xr)
+        decay_logits = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
+        key = self.key(xk)
+        value = self.value(xv)
+        if self.layer_idx == 0:
+            v_first = value
+        else:
+            if v_first is None:
+                raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
+            value = flash.pretrain_tmix_vres_gate_bf16(
+                value.contiguous(),
+                v_first.contiguous(),
+                self.v0.reshape(-1).contiguous(),
+                ((xv @ self.v1) @ self.v2).contiguous(),
+            )
+        learning_rate = flash.pretrain_tmix_a_gate_bf16(
+            self.a0.reshape(-1).contiguous(), ((xa @ self.a1) @ self.a2).contiguous()
+        )
+        gate = (torch.sigmoid(xg @ self.g1) @ self.g2).contiguous()
+        key, recurrent_a, recurrent_b = flash.pretrain_tmix_kk_pre_bf16(
+            key.contiguous(),
+            self.k_k.reshape(-1).contiguous(),
+            learning_rate.contiguous(),
+            self.k_a.reshape(-1).contiguous(),
+        )
+        return receptance, decay_logits, key, value, v_first, gate, recurrent_a, recurrent_b
+
+    def _finish_training_output(
+        self,
+        flash,
+        recurrent_output: torch.Tensor,
+        receptance: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        output = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
+            recurrent_output,
+            receptance.contiguous(),
+            key,
+            value.contiguous(),
+            self.r_k.contiguous(),
+            self.ln_x.weight.contiguous(),
+            self.ln_x.bias.contiguous(),
+            gate,
+        )
+        return self.output(output)
+
     def _training_forward(self, hidden_states: torch.Tensor, v_first: torch.Tensor | None):
         flash = _load_flash_rwkv2("training", hidden_states)
         if hidden_states.dtype != torch.bfloat16:
@@ -605,7 +661,7 @@ class RwkvTimeMix(nn.Module):
                 f"RWKV-7 train_temp requires sequence length divisible by 16, got T={hidden_states.shape[1]}."
             )
         x = hidden_states.contiguous()
-        xr, xw, xk, xv, xa, xg = flash.pretrain_tmix_mix6_bf16(
+        mixed = flash.pretrain_tmix_mix6_bf16(
             x,
             self.x_r.reshape(-1).contiguous(),
             self.x_w.reshape(-1).contiguous(),
@@ -614,33 +670,8 @@ class RwkvTimeMix(nn.Module):
             self.x_a.reshape(-1).contiguous(),
             self.x_g.reshape(-1).contiguous(),
         )
-        receptance = self.receptance(xr)
-        decay_delta = torch.tanh(xw @ self.w1) @ self.w2
-        decay_logits = self.w0 + decay_delta
-        key = self.key(xk)
-        value = self.value(xv)
-        if self.layer_idx == 0:
-            v_first = value
-        else:
-            if v_first is None:
-                raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
-            value_delta = (xv @ self.v1) @ self.v2
-            value = flash.pretrain_tmix_vres_gate_bf16(
-                value.contiguous(),
-                v_first.contiguous(),
-                self.v0.reshape(-1).contiguous(),
-                value_delta.contiguous(),
-            )
-        learning_rate_delta = (xa @ self.a1) @ self.a2
-        learning_rate = flash.pretrain_tmix_a_gate_bf16(
-            self.a0.reshape(-1).contiguous(), learning_rate_delta.contiguous()
-        )
-        gate = (torch.sigmoid(xg @ self.g1) @ self.g2).contiguous()
-        key, recurrent_a, recurrent_b = flash.pretrain_tmix_kk_pre_bf16(
-            key.contiguous(),
-            self.k_k.reshape(-1).contiguous(),
-            learning_rate.contiguous(),
-            self.k_a.reshape(-1).contiguous(),
+        receptance, decay_logits, key, value, v_first, gate, recurrent_a, recurrent_b = self._training_projections(
+            flash, mixed, v_first
         )
         output = flash.pretrain_recurrent_bf16(
             receptance.contiguous(),
@@ -650,17 +681,7 @@ class RwkvTimeMix(nn.Module):
             recurrent_a,
             recurrent_b,
         )
-        output = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
-            output,
-            receptance.contiguous(),
-            key,
-            value.contiguous(),
-            self.r_k.contiguous(),
-            self.ln_x.weight.contiguous(),
-            self.ln_x.bias.contiguous(),
-            gate,
-        )
-        return self.output(output), v_first
+        return self._finish_training_output(flash, output, receptance, key, value, gate), v_first
 
     def _stateful_training_forward(
         self,
@@ -678,7 +699,7 @@ class RwkvTimeMix(nn.Module):
         if sequence_length <= 0:
             raise ValueError("RWKV-7 stateful training requires at least one token per chunk.")
         x = hidden_states.contiguous()
-        xr, xw, xk, xv, xa, xg, next_shift_state = flash.statetune_tmix_mix6_bf16(
+        *mixed, next_shift_state = flash.statetune_tmix_mix6_bf16(
             x,
             shift_state.contiguous(),
             self.x_r.reshape(-1).contiguous(),
@@ -688,35 +709,11 @@ class RwkvTimeMix(nn.Module):
             self.x_a.reshape(-1).contiguous(),
             self.x_g.reshape(-1).contiguous(),
         )
-        receptance = self.receptance(xr)
-        decay_logits = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
-        key = self.key(xk)
-        value = self.value(xv)
-        if self.layer_idx == 0:
-            v_first = value
-        else:
-            if v_first is None:
-                raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
-            value_delta = (xv @ self.v1) @ self.v2
-            value = flash.pretrain_tmix_vres_gate_bf16(
-                value.contiguous(),
-                v_first.contiguous(),
-                self.v0.reshape(-1).contiguous(),
-                value_delta.contiguous(),
-            )
-        learning_rate_delta = (xa @ self.a1) @ self.a2
-        learning_rate = flash.pretrain_tmix_a_gate_bf16(
-            self.a0.reshape(-1).contiguous(), learning_rate_delta.contiguous()
+        receptance, decay_logits, key, value, v_first, gate, recurrent_a, recurrent_b = self._training_projections(
+            flash, mixed, v_first
         )
-        gate = (torch.sigmoid(xg @ self.g1) @ self.g2).contiguous()
         heads = self.config.num_attention_heads
         head_size = self.config.head_size
-        key, recurrent_a, recurrent_b = flash.pretrain_tmix_kk_pre_bf16(
-            key.contiguous(),
-            self.k_k.reshape(-1).contiguous(),
-            learning_rate.contiguous(),
-            self.k_a.reshape(-1).contiguous(),
-        )
 
         packed_shape = (batch_size * sequence_length, heads, head_size)
         starts = torch.arange(
@@ -740,17 +737,15 @@ class RwkvTimeMix(nn.Module):
             recurrent_a.view(packed_shape).contiguous(),
             recurrent_b.view(packed_shape).contiguous(),
         )
-        output = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
+        output = self._finish_training_output(
+            flash,
             recurrent_output.view(batch_size, sequence_length, channels).contiguous(),
-            receptance.contiguous(),
+            receptance,
             key,
-            value.contiguous(),
-            self.r_k.contiguous(),
-            self.ln_x.weight.contiguous(),
-            self.ln_x.bias.contiguous(),
+            value,
             gate,
         )
-        return self.output(output), v_first, next_shift_state, next_wkv_state
+        return output, v_first, next_shift_state, next_wkv_state
 
     def _inference_forward(
         self,
@@ -767,7 +762,7 @@ class RwkvTimeMix(nn.Module):
                 "Call `model.prepare_for_inference()` after loading weights."
             )
         batch_size, sequence_length, channels = hidden_states.shape
-        att_shift, wkv_state, _ = _cache_states(past_key_values, self.layer_idx, hidden_states)
+        att_shift, wkv_state, _ = _cache_states(past_key_values, self.layer_idx, hidden_states, self.config)
         cu_seqlens, state_indices, ticket = past_key_values.recurrent_metadata(
             flash, batch_size, sequence_length, hidden_states.device
         )
@@ -931,7 +926,6 @@ class RwkvTimeMix(nn.Module):
         v_first: torch.Tensor | None = None,
         past_key_values: RwkvCache | None = None,
         attention_mask: torch.Tensor | None = None,
-        use_cache: bool = False,
         training_shift_state: torch.Tensor | None = None,
         training_wkv_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
@@ -963,16 +957,23 @@ class RwkvChannelMix(nn.Module):
         self.key = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.value = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.register_buffer("_value_runtime", None, persistent=False)
+        self.register_load_state_dict_post_hook(self._clear_inference_layout)
+
+    def _clear_inference_layout(self, *args) -> None:
+        self._value_runtime = None
+
+    def _apply(self, fn, recurse=True):
+        self._clear_inference_layout()
+        return super()._apply(fn, recurse=recurse)
 
     def prepare_for_inference(self) -> None:
-        if self._value_runtime is not None and not self.value.weight.is_cuda:
-            return
-        if self.value.weight.dtype != torch.float16 or not self.value.weight.is_cuda:
+        runtime_device = self.key.weight.device
+        if runtime_device.type != "cuda" or self.key.weight.dtype != torch.float16:
             raise RuntimeError(
-                "RWKV-7 Albatross ChannelMix layout requires a CUDA float16 value weight; "
-                f"got dtype={self.value.weight.dtype}, device={self.value.weight.device}."
+                "RWKV-7 Albatross ChannelMix layout requires CUDA float16 runtime weights; "
+                f"got dtype={self.key.weight.dtype}, device={runtime_device}."
             )
-        self._value_runtime = self.value.weight.T.contiguous()
+        self._value_runtime = self.value.weight.to(device=runtime_device, dtype=torch.float16).T.contiguous()
         # Albatross replaces the canonical FFN-down layout during inference. Keep the serializable parameter on CPU
         # instead of retaining a second 4 GiB GPU copy for a 7.2B model; the non-persistent runtime layout is the only
         # one consumed after this explicit inference preparation step.
@@ -1026,7 +1027,7 @@ class RwkvChannelMix(nn.Module):
                 "after loading or modifying weights."
             )
         batch_size, sequence_length, channels = hidden_states.shape
-        _, _, ffn_shift = _cache_states(past_key_values, self.layer_idx, hidden_states)
+        _, _, ffn_shift = _cache_states(past_key_values, self.layer_idx, hidden_states, self.config)
         cu_seqlens, state_indices, ticket = past_key_values.recurrent_metadata(
             flash, batch_size, sequence_length, hidden_states.device
         )
@@ -1075,7 +1076,7 @@ class RwkvChannelMix(nn.Module):
         batch_size, sequence_length, channels = hidden_states.shape
         if sequence_length != 1 or channels != 4096:
             raise ValueError("The fused Albatross ChannelMix residual path requires sequence_length=1 and C=4096.")
-        _, _, ffn_shift = _cache_states(past_key_values, self.layer_idx, hidden_states)
+        _, _, ffn_shift = _cache_states(past_key_values, self.layer_idx, hidden_states, self.config)
         cu_seqlens, state_indices, ticket = past_key_values.recurrent_metadata(
             flash, batch_size, sequence_length, hidden_states.device
         )
@@ -1120,7 +1121,6 @@ class RwkvBlock(nn.Module):
         v_first: torch.Tensor | None,
         past_key_values: RwkvCache | None,
         attention_mask: torch.Tensor | None,
-        use_cache: bool,
         training_state: RwkvTrainingState | None = None,
     ) -> tuple[torch.Tensor, ...]:
         att_result = self.att(
@@ -1128,7 +1128,6 @@ class RwkvBlock(nn.Module):
             v_first=v_first,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            use_cache=use_cache,
             training_shift_state=None if training_state is None else training_state.time_mix_shift[self.layer_idx],
             training_wkv_state=None if training_state is None else training_state.wkv[self.layer_idx],
         )
@@ -1228,9 +1227,7 @@ class RwkvModel(RwkvPreTrainedModel):
         self.emb = value
 
     def _new_cache(self) -> RwkvCache:
-        cache = RwkvCache(self.config)
-        cache._rwkv_config = self.config
-        return cache
+        return RwkvCache(self.config)
 
     def prepare_for_inference(self):
         """Convert weights to Albatross's mixed BF16-embedding/FP16-runtime layout."""
@@ -1251,14 +1248,18 @@ class RwkvModel(RwkvPreTrainedModel):
         training_state: RwkvTrainingState | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         **kwargs: Any,
-    ) -> RwkvModelOutput | BaseModelOutputWithPast | tuple:
+    ) -> RwkvModelOutput | tuple:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of `input_ids` or `inputs_embeds`.")
         if past_key_values is not None and not isinstance(past_key_values, RwkvCache):
             raise TypeError(f"RWKV-7 requires `RwkvCache`, got {type(past_key_values).__name__}.")
         use_cache = self.config.use_cache if use_cache is None else use_cache
+        output_hidden_states = (
+            self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
+        )
         return_dict = self.config.return_dict if return_dict is None else return_dict
 
         if inputs_embeds is None:
@@ -1301,7 +1302,13 @@ class RwkvModel(RwkvPreTrainedModel):
         next_att_shifts: list[torch.Tensor] = []
         next_wkv_states: list[torch.Tensor] = []
         next_ffn_shifts: list[torch.Tensor] = []
-        fused_decode = not self.training and hidden_states.shape == (1, 1, 4096) and cache is not None
+        all_hidden_states = () if output_hidden_states else None
+        fused_decode = (
+            not self.training
+            and not output_hidden_states
+            and hidden_states.shape == (1, 1, 4096)
+            and cache is not None
+        )
         if fused_decode:
             residual = None
             for block in self.blocks:
@@ -1311,12 +1318,13 @@ class RwkvModel(RwkvPreTrainedModel):
             hidden_states = hidden_states + residual
         else:
             for block in self.blocks:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
                 block_result = block(
                     hidden_states,
                     v_first,
                     cache,
                     attention_mask,
-                    use_cache,
                     training_state,
                 )
                 if training_state is None:
@@ -1338,6 +1346,8 @@ class RwkvModel(RwkvPreTrainedModel):
                 self.ln_out.bias.contiguous(),
                 eps=self.config.layer_norm_epsilon,
             ).view(batch_size, sequence_length, channels)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         final_cache = cache if use_cache else None
         next_training_state = None
@@ -1347,13 +1357,13 @@ class RwkvModel(RwkvPreTrainedModel):
                 wkv=torch.stack(next_wkv_states),
                 channel_mix_shift=torch.stack(next_ffn_shifts),
             )
-        if not return_dict:
-            if next_training_state is not None:
-                return hidden_states, next_training_state
-            return hidden_states, final_cache
-        if next_training_state is not None:
-            return RwkvModelOutput(last_hidden_state=hidden_states, training_state=next_training_state)
-        return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=final_cache)
+        output = RwkvModelOutput(
+            last_hidden_state=hidden_states,
+            past_key_values=final_cache,
+            hidden_states=all_hidden_states,
+            training_state=next_training_state,
+        )
+        return output if return_dict else output.to_tuple()
 
 
 @auto_docstring
@@ -1392,6 +1402,7 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
         input_ids,
         attention_mask=None,
         past_key_values=None,
+        inputs_embeds=None,
         use_cache=None,
         **kwargs,
     ):
@@ -1399,13 +1410,19 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
             input_ids = input_ids[:, -1:]
             if attention_mask is not None:
                 attention_mask = attention_mask[:, -1:]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
-            "use_cache": self.config.use_cache if use_cache is None else use_cache,
-            "logits_to_keep": kwargs.get("logits_to_keep", 1),
-        }
+        first_step = past_key_values is None or past_key_values.get_seq_length() == 0
+        model_inputs = (
+            {"inputs_embeds": inputs_embeds} if inputs_embeds is not None and first_step else {"input_ids": input_ids}
+        )
+        model_inputs.update(
+            {
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "use_cache": self.config.use_cache if use_cache is None else use_cache,
+                "logits_to_keep": kwargs.get("logits_to_keep", 1),
+            }
+        )
+        return model_inputs
 
     def forward(
         self,
@@ -1416,10 +1433,11 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
-    ) -> RwkvCausalLMOutput | CausalLMOutputWithPast | tuple:
+    ) -> RwkvCausalLMOutput | tuple:
         return_dict = self.config.return_dict if return_dict is None else return_dict
         outputs = self.model(
             input_ids=input_ids,
@@ -1428,6 +1446,7 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
             training_state=training_state,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
             **kwargs,
         )
@@ -1459,32 +1478,26 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
                 ).view(batch_size, selected_length, self.config.vocab_size)
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(
-                logits[:, :-1].float().reshape(-1, self.config.vocab_size),
-                labels[:, 1:].reshape(-1),
-                ignore_index=-100,
-            )
-        if not return_dict:
-            return tuple(
-                value
-                for value in (loss, logits, getattr(outputs, "training_state", None), outputs.past_key_values)
-                if value is not None
-            )
-        if getattr(outputs, "training_state", None) is not None:
-            return RwkvCausalLMOutput(
-                loss=loss,
+            loss = self.loss_function(
                 logits=logits,
-                training_state=outputs.training_state,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
             )
-        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=outputs.past_key_values)
+        output = RwkvCausalLMOutput(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            training_state=outputs.training_state,
+        )
+        return output if return_dict else output.to_tuple()
 
 
 __all__ = [
     "RwkvCache",
-    "RwkvCausalLMOutput",
     "RwkvForCausalLM",
     "RwkvModel",
-    "RwkvModelOutput",
     "RwkvPreTrainedModel",
     "RwkvTimeMix",
     "RwkvTrainingState",

@@ -36,7 +36,7 @@ if importlib.util.find_spec("torch") is not None:
     import torch
 
     from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix, RwkvTrainingState
-    from transformers.models.rwkv.modeling_rwkv import _infer_tmix_attention_linear
+    from transformers.models.rwkv.modeling_rwkv import _cache_states, _infer_tmix_attention_linear
 
 
 FLASH_RWKV2_AVAILABLE = importlib.util.find_spec("flashrwkv2") is not None
@@ -275,13 +275,29 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         self.assertIsNone(cache._rwkv_metadata_key)
         self.assertIsNone(cache._rwkv_metadata)
 
+    def test_generation_inputs_support_first_step_inputs_embeds(self):
+        model = RwkvForCausalLM(tiny_config())
+        input_ids = torch.ones(1, 2, dtype=torch.long)
+        inputs_embeds = torch.zeros(1, 2, model.config.hidden_size)
+        prepared = model.prepare_inputs_for_generation(input_ids, inputs_embeds=inputs_embeds)
+        self.assertNotIn("input_ids", prepared)
+        self.assertIs(prepared["inputs_embeds"], inputs_embeds)
+
+    def test_cache_state_shape_is_owned_by_each_time_mix_layer(self):
+        cache_config = mock.Mock(num_hidden_layers=2, number_of_conv_states=2)
+        cache = RwkvCache(cache_config)
+        hidden_states = torch.zeros(1, 3, 512)
+        layer_config = mock.Mock(num_attention_heads=4, head_size=128)
+        _, wkv_state, _ = _cache_states(cache, 0, hidden_states, layer_config)
+        self.assertEqual(wkv_state.shape, (1, 4, 128, 128))
+
 
 @require_torch
 class Rwkv7ConversionTest(unittest.TestCase):
     @staticmethod
     def _converter_module():
-        path = Path(__file__).parents[3] / "temp" / "convert_rwkv7_checkpoint.py"
-        spec = importlib.util.spec_from_file_location("convert_rwkv7_checkpoint", path)
+        path = Path(__file__).parents[3] / "temp" / "rwkv_pth2st.py"
+        spec = importlib.util.spec_from_file_location("rwkv_pth2st", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
@@ -556,10 +572,66 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         self.assertEqual(channel_mix.value.weight.device.type, "cpu")
         self.assertEqual(channel_mix._value_runtime.device.type, "cuda")
         torch.testing.assert_close(channel_mix.value.weight, expected, atol=0, rtol=0)
+        with torch.no_grad():
+            channel_mix.value.weight.add_(1)
+        model.prepare_for_inference()
+        torch.testing.assert_close(
+            channel_mix._value_runtime,
+            channel_mix.value.weight.T.cuda(),
+            atol=0,
+            rtol=0,
+        )
+        expected = channel_mix.value.weight.detach().clone()
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
             reloaded = RwkvForCausalLM.from_pretrained(directory, dtype=torch.float16)
         torch.testing.assert_close(reloaded.model.blocks[0].ffn.value.weight, expected, atol=0, rtol=0)
+
+    def test_recurrent_metadata_is_scoped_to_cuda_stream(self):
+        class FakeFlashRwkv2:
+            def __init__(self):
+                self.calls = 0
+
+            def prepare_recurrent_metadata(self, *args, **kwargs):
+                self.calls += 1
+                return object()
+
+        flash = FakeFlashRwkv2()
+        cache = RwkvCache(tiny_config())
+        device = torch.device("cuda")
+        first_stream = torch.cuda.current_stream()
+        first = cache.recurrent_metadata(flash, 1, 4, device)
+        self.assertIs(first, cache.recurrent_metadata(flash, 1, 4, device))
+        with torch.cuda.stream(torch.cuda.Stream()):
+            second = cache.recurrent_metadata(flash, 1, 4, device)
+        self.assertIsNot(first, second)
+        with torch.cuda.stream(first_stream):
+            third = cache.recurrent_metadata(flash, 1, 4, device)
+        self.assertIsNot(second, third)
+        self.assertEqual(flash.calls, 3)
+
+    def test_cuda_graph_capture_uses_prepared_stream_metadata(self):
+        config = tiny_config(hidden_size=1024, intermediate_size=4096)
+        model = RwkvForCausalLM(config).cuda().eval().prepare_for_inference()
+        input_ids = torch.ones((1, 1), device="cuda", dtype=torch.long)
+        cache = RwkvCache(config)
+        with torch.no_grad():
+            model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
+        cache.reset()
+
+        flash = importlib.import_module("flashrwkv2")
+        graph_stream = torch.cuda.Stream()
+        with torch.cuda.stream(graph_stream):
+            cache.recurrent_metadata(flash, 1, 1, input_ids.device)
+        graph_stream.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=graph_stream):
+            logits = model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1).logits
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(logits.shape, (1, 1, config.vocab_size))
+        self.assertTrue(torch.isfinite(logits).all())
 
     def test_training_forward_backward_uses_public_train_temp_family(self):
         config = tiny_config()
@@ -572,6 +644,25 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         outputs.loss.backward()
         self.assertIsNotNone(model.model.blocks[0].att.output.weight.grad)
         self.assertGreater(model.model.blocks[0].att.output.weight.grad.abs().max().item(), 0)
+
+    def test_outputs_use_one_rwkv_type_and_standard_loss_hook(self):
+        config = tiny_config()
+        model = RwkvForCausalLM(config).cuda().to(torch.bfloat16).train()
+        input_ids = torch.randint(0, config.vocab_size, (1, 16), device="cuda")
+        calls = []
+
+        def loss_function(*, logits, labels, vocab_size, **kwargs):
+            calls.append((logits, labels, vocab_size, kwargs))
+            return logits.float().sum() * 0
+
+        model.loss_function = loss_function
+        outputs = model(input_ids, labels=input_ids, use_cache=False, output_hidden_states=True)
+        self.assertEqual(type(outputs).__name__, "RwkvCausalLMOutput")
+        self.assertEqual(len(outputs.hidden_states), config.num_hidden_layers + 1)
+        self.assertEqual(calls[0][2], config.vocab_size)
+        tuple_outputs = model(input_ids, use_cache=False, return_dict=False)
+        self.assertEqual(len(tuple_outputs), 1)
+        self.assertIsInstance(tuple_outputs[0], torch.Tensor)
 
     def test_inference_prefill_decode_and_continuation(self):
         config = tiny_config(hidden_size=1024, intermediate_size=4096)

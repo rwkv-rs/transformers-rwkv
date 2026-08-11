@@ -74,8 +74,6 @@ class RwkvTokenizerTest(unittest.TestCase):
         self.assertIsNone(tokenizer.unk_token_id)
         with self.assertRaisesRegex(ValueError, "padding token"):
             tokenizer(["a", "longer"], padding=True)
-        with self.assertRaisesRegex(ValueError, "max_length >= 1"):
-            tokenizer("hello", truncation=True, max_length=0)
         tokenizer.truncation_side = "left"
         self.assertEqual(tokenizer("hello", truncation=True, max_length=1).input_ids, [0])
 
@@ -89,6 +87,23 @@ class RwkvTokenizerTest(unittest.TestCase):
         ids = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False, add_generation_prompt=True)
         self.assertEqual(ids[0], 0)
         self.assertNotEqual(ids[-1], 0)
+
+    def test_custom_chat_template_uses_standard_content_and_special_token_behavior(self):
+        tokenizer = make_tokenizer()
+        messages = [{"role": "user", "content": "A  \r\n\r\nB  "}]
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            chat_template="{{ messages[0]['content'] }}",
+            tokenize=False,
+        )
+        self.assertEqual(rendered, "A  \r\n\r\nB  ")
+        ids = tokenizer.apply_chat_template(
+            messages,
+            chat_template="{{ messages[0]['content'] }}",
+            tokenize=True,
+            return_dict=False,
+        )
+        self.assertNotEqual(ids[0], 0)
 
     def test_assistant_whitespace_is_preserved_inside_content(self):
         tokenizer = make_tokenizer()

@@ -83,7 +83,7 @@ decoding when it should not be shown to the user.
 Canonical BlinkDL `.pth` checkpoints can be converted with:
 
 ```bash
-./.venv/bin/python temp/convert_rwkv7_checkpoint.py \
+./.venv/bin/python temp/rwkv_pth2st.py \
     rwkv7-g1h-7.2b-20260710-ctx10240.pth \
     rwkv7-g1h-7.2b-hf \
     --context-length 10240
@@ -119,6 +119,10 @@ ChannelMix parameters.
 ## RwkvCache
 
 [[autodoc]] RwkvCache
+
+## RwkvTrainingState
+
+[[autodoc]] RwkvTrainingState
 
 ## RwkvModel
 

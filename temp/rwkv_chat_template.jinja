@@ -69,7 +69,7 @@
     {%- if add_generation_prompt -%}
         {%- set out.parts = out.parts + ['### Assistant', generation_text] -%}
     {%- endif -%}
-    {{- out.parts | join('\n') -}}
+    {{- (bos_token if rwkv_add_bos else '') + out.parts | join('\n') -}}
 {%- else -%}
     {%- set out = namespace(parts=[]) -%}
     {%- for message in messages -%}
@@ -92,5 +92,5 @@
         {%- set label = 'Bot✿' if rwkv_prompt_template == 'bot' else 'Assistant: ' -%}
         {%- set out.parts = out.parts + [label + generation_text] -%}
     {%- endif -%}
-    {{- out.parts | join('\n' if rwkv_prompt_template == 'bot' else '\n\n') -}}
+    {{- (bos_token if rwkv_add_bos else '') + out.parts | join('\n' if rwkv_prompt_template == 'bot' else '\n\n') -}}
 {%- endif -%}
