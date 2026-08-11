@@ -2,6 +2,7 @@
 # 1. modify the `_deps` dict in setup.py
 # 2. run `make fix-repo``
 deps = {
+    "FlashRWKV2": "FlashRWKV2==0.1.0a6",
     "Pillow": "Pillow>=10.0.1,<=15.0",
     "accelerate": "accelerate>=1.1.0",
     "av": "av",
@@ -73,7 +74,7 @@ deps = {
     "tomli": "tomli",
     "tiktoken": "tiktoken",
     "timm": "timm>=1.0.23",
-    "tokenizers": "tokenizers>=0.22.0,<=0.23.0",
+    "tokenizers": "tokenizers>=0.22.0,<=0.23.2",
     "torch": "torch>=2.5",
     "torchaudio": "torchaudio",
     "torchvision": "torchvision",

@@ -70,6 +70,7 @@ if stale_egg_info.exists():
 # 1. all dependencies should be listed here with their version requirements if any
 # 2. once modified, run: `make fix-repo` to update src/transformers/dependency_versions_table.py
 _deps = [
+    "FlashRWKV2==0.1.0a6",
     "Pillow>=10.0.1,<=15.0",
     "accelerate>=1.1.0",
     "av",
@@ -146,7 +147,7 @@ _deps = [
     "tomli",
     "tiktoken",
     "timm>=1.0.23",
-    "tokenizers>=0.22.0,<=0.23.0",
+    "tokenizers>=0.22.0,<=0.23.2",
     "torch>=2.5",
     "torchaudio",
     "torchvision",
@@ -167,6 +168,11 @@ _deps = [
 # some of the values are versioned whereas others aren't.
 deps = {b: a for a, b in (re.findall(r"^(([^!=<>~ ]+)(?:[!=<>~ ].*)?$)", x)[0] for x in _deps)}
 
+TOKENIZERS_RWKV_REQUIREMENT = (
+    "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@"
+    "c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python"
+)
+
 
 def deps_list(*pkgs):
     return [deps[pkg] for pkg in pkgs]
@@ -175,6 +181,7 @@ def deps_list(*pkgs):
 extras = {}
 
 extras["torch"] = deps_list("torch", "accelerate")
+extras["rwkv"] = deps_list("FlashRWKV2")
 extras["vision"] = deps_list("torchvision", "Pillow")
 extras["audio"] = deps_list("torchaudio", "librosa", "pyctcdecode", "phonemizer")
 if PYTHON_MINOR_VERSION < 13:
@@ -265,7 +272,7 @@ install_requires = [
     deps["packaging"],  # utilities from PyPA to e.g., compare versions
     deps["pyyaml"],  # used for the model cards metadata
     deps["regex"],  # for OpenAI GPT
-    deps["tokenizers"],
+    TOKENIZERS_RWKV_REQUIREMENT,
     deps["typer"],  # CLI utilities. In practice, already a dependency of huggingface_hub but we use it as well
     deps["safetensors"],
     deps["tqdm"],  # progress bars in model download and training scripts
