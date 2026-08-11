@@ -51,6 +51,8 @@ _STATEFUL_TRAINING_OPERATORS = (
     "statetune_cmix_bf16",
 )
 
+_STATEFUL_BOUNDARY_CHUNK_LEN = 16
+
 _INFERENCE_OPERATORS = (
     "infer_embedding_ln0_forward_varlen",
     "infer_tmix_mix6_forward_varlen",
@@ -107,6 +109,36 @@ def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
             f"device={tensor.device}, dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
         )
     return module
+
+
+def _stateful_training_metadata(
+    batch_size: int, sequence_length: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Describe canonical 16-token replay boundaries inside each logical sequence chunk."""
+
+    chunks_per_sequence = (sequence_length + _STATEFUL_BOUNDARY_CHUNK_LEN - 1) // _STATEFUL_BOUNDARY_CHUNK_LEN
+    sequence_chunk_offsets = torch.arange(
+        0,
+        (batch_size + 1) * chunks_per_sequence,
+        chunks_per_sequence,
+        device=device,
+        dtype=torch.int32,
+    )
+    sequence_starts = (torch.arange(batch_size, device=device, dtype=torch.int32) * sequence_length).unsqueeze(1)
+    within_sequence_starts = torch.arange(
+        0,
+        sequence_length,
+        _STATEFUL_BOUNDARY_CHUNK_LEN,
+        device=device,
+        dtype=torch.int32,
+    ).unsqueeze(0)
+    chunk_token_starts = (sequence_starts + within_sequence_starts).flatten()
+    sequence_ends = sequence_starts + sequence_length
+    chunk_token_ends = torch.minimum(
+        chunk_token_starts.view(batch_size, chunks_per_sequence) + _STATEFUL_BOUNDARY_CHUNK_LEN,
+        sequence_ends,
+    ).flatten()
+    return sequence_chunk_offsets, chunk_token_starts, chunk_token_ends
 
 
 def _infer_tmix_attention_linear(flashrwkv2, x: torch.Tensor, projection: nn.Module) -> torch.Tensor:
@@ -716,15 +748,7 @@ class RwkvTimeMix(nn.Module):
         head_size = self.config.head_size
 
         packed_shape = (batch_size * sequence_length, heads, head_size)
-        starts = torch.arange(
-            0,
-            batch_size * sequence_length,
-            sequence_length,
-            device=x.device,
-            dtype=torch.int32,
-        )
-        ends = starts + sequence_length
-        sequence_chunk_offsets = torch.arange(batch_size + 1, device=x.device, dtype=torch.int32)
+        sequence_chunk_offsets, starts, ends = _stateful_training_metadata(batch_size, sequence_length, x.device)
         recurrent_output, next_wkv_state, _, _ = flash.statetune_recurrent_fp32io16(
             wkv_state.contiguous(),
             sequence_chunk_offsets,

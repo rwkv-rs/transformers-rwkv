@@ -36,7 +36,11 @@ if importlib.util.find_spec("torch") is not None:
     import torch
 
     from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix, RwkvTrainingState
-    from transformers.models.rwkv.modeling_rwkv import _cache_states, _infer_tmix_attention_linear
+    from transformers.models.rwkv.modeling_rwkv import (
+        _cache_states,
+        _infer_tmix_attention_linear,
+        _stateful_training_metadata,
+    )
 
 
 FLASH_RWKV2_AVAILABLE = importlib.util.find_spec("flashrwkv2") is not None
@@ -156,6 +160,12 @@ class Rwkv7ConfigurationTest(unittest.TestCase):
         state.wkv = state.wkv.to(torch.bfloat16)
         with self.assertRaisesRegex(TypeError, "torch.float32"):
             state.validate(config, batch_size=2, device="cpu", dtype=torch.bfloat16)
+
+    def test_stateful_training_metadata_uses_canonical_replay_boundaries(self):
+        offsets, starts, ends = _stateful_training_metadata(2, 33, torch.device("cpu"))
+        self.assertEqual(offsets.tolist(), [0, 3, 6])
+        self.assertEqual(starts.tolist(), [0, 16, 32, 33, 49, 65])
+        self.assertEqual(ends.tolist(), [16, 32, 33, 49, 65, 66])
 
     def test_train_temp_low_rank_formulas(self):
         expected = {
