@@ -24,6 +24,10 @@ serialization. All product computation is delegated to the public [FlashRWKV2](h
 operator API. Training follows `RWKV-LM/RWKV-v7/train_temp`; inference follows Albatross. There is no CPU, PyTorch or
 FLA product fallback.
 
+Inference calls FlashRWKV2 at model-semantic fusion boundaries: each TimeMix layer uses PostNorm+TokenShift, WKV
+Prepare, WKV7 and Readout; each ChannelMix layer uses one complete ChannelMix operator. Transformers does not select
+sparse/dense kernels or invoke standalone projection, activation, LN, Res, TokenShift, VRes or gate helpers.
+
 The current canonical contract uses:
 
 - `head_size=64`;
@@ -36,7 +40,7 @@ The current canonical contract uses:
 
 ## Usage
 
-Install this checkout with its RWKV extra. This installs the published `FlashRWKV2==0.1.0a6` source distribution;
+Install this checkout with its RWKV extra. This installs the pinned `FlashRWKV2==0.1.0a7` distribution;
 the pinned native `tokenizers-rwkv` dependency is installed automatically:
 
 ```bash

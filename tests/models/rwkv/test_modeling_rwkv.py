@@ -18,6 +18,7 @@ import math
 import os
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -29,6 +30,7 @@ from transformers import (
     AutoTokenizer,
     RwkvConfig,
 )
+from transformers.dependency_versions_table import deps
 from transformers.testing_utils import require_peft, require_torch, require_torch_gpu
 
 
@@ -37,8 +39,10 @@ if importlib.util.find_spec("torch") is not None:
 
     from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix, RwkvTrainingState
     from transformers.models.rwkv.modeling_rwkv import (
+        _INFERENCE_OPERATORS,
         _cache_states,
-        _infer_tmix_attention_linear,
+        _infer_tmix_projection_spec,
+        _load_flash_rwkv2,
         _stateful_training_metadata,
     )
 
@@ -123,6 +127,38 @@ def train_temp_model_init(model) -> None:
 
 @require_torch
 class Rwkv7ConfigurationTest(unittest.TestCase):
+    def test_flashrwkv2_a7_inference_operator_contract(self):
+        self.assertEqual(deps["FlashRWKV2"], "FlashRWKV2==0.1.0a7")
+        expected = {
+            "infer_embedding_ln0_forward_varlen",
+            "infer_tmix_postnorm_tokenshift_forward_varlen",
+            "infer_tmix_wkv_prepare_forward_varlen",
+            "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
+            "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
+            "infer_tmix_wkv7_chunk_bf16_forward_varlen",
+            "infer_tmix_readout_forward_varlen",
+            "infer_cmix_forward_varlen",
+            "infer_post_norm_output_forward_varlen",
+            "infer_head_linear_all_forward_varlen",
+            "infer_head_linear_last_forward_varlen",
+            "prepare_tmix_wkv7_recurrent_metadata",
+        }
+        self.assertEqual(set(_INFERENCE_OPERATORS), expected)
+        self.assertEqual(len(_INFERENCE_OPERATORS), len(expected))
+
+    def test_flashrwkv2_contract_fails_closed_on_missing_operator(self):
+        missing = "infer_cmix_forward_varlen"
+        module = types.SimpleNamespace(
+            **{name: (lambda: None) for name in _INFERENCE_OPERATORS if name != missing},
+            __version__="0.1.0a7",
+            __file__="fake/flashrwkv2/__init__.py",
+        )
+        with (
+            mock.patch("transformers.models.rwkv.modeling_rwkv.importlib.import_module", return_value=module),
+            self.assertRaisesRegex(RuntimeError, missing),
+        ):
+            _load_flash_rwkv2("inference")
+
     def test_default_contract(self):
         config = RwkvConfig()
         self.assertEqual(config.model_type, "rwkv")
@@ -251,6 +287,15 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         model = RwkvForCausalLM(tiny_config()).train()
         with self.assertRaisesRegex(RuntimeError, "no product fallback"):
             model(torch.ones(1, 16, dtype=torch.long), use_cache=False)
+
+    def test_nontrivial_attention_mask_still_fails_closed(self):
+        model = RwkvForCausalLM(tiny_config()).eval()
+        with self.assertRaisesRegex(ValueError, "all-ones mask"):
+            model(
+                torch.ones(1, 2, dtype=torch.long),
+                attention_mask=torch.tensor([[1, 0]]),
+                use_cache=False,
+            )
 
     def test_explicit_low_rank_dimensions_control_parameter_shapes(self):
         model = RwkvForCausalLM(
@@ -498,7 +543,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
 @require_flash_rwkv2
 class Rwkv7FlashRwkv2Test(unittest.TestCase):
     @require_peft
-    def test_unmerged_lora_attention_projection_matches_peft(self):
+    def test_unmerged_lora_projection_spec_matches_peft(self):
         from peft import LoraConfig
 
         config = tiny_config(hidden_size=1024, intermediate_size=4096)
@@ -510,14 +555,16 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         )
         model.set_adapter("first")
         model.prepare_for_inference()
-        flash = importlib.import_module("flashrwkv2")
         x = torch.randn(5, config.hidden_size, device="cuda", dtype=torch.float16)
 
         for name in targets:
             projection = getattr(model.model.blocks[0].att, name)
             with torch.no_grad():
                 expected = projection(x)
-                actual = _infer_tmix_attention_linear(flash, x, projection)
+                weight, lora_a, lora_b, scale = _infer_tmix_projection_spec(projection)
+                actual = torch.nn.functional.linear(x, weight)
+                if lora_a is not None:
+                    actual = actual + torch.nn.functional.linear(torch.nn.functional.linear(x, lora_a), lora_b) * scale
             torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
         input_ids = torch.randint(0, config.vocab_size, (1, 5), device="cuda")
@@ -528,10 +575,12 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         projection = model.model.blocks[0].att.receptance
         model.disable_adapters()
         with torch.no_grad():
-            disabled = _infer_tmix_attention_linear(flash, x, projection)
-            base = flash.infer_tmix_linear_attention_c2c_forward_varlen(
-                x, projection.get_base_layer().weight.contiguous()
-            )
+            weight, lora_a, lora_b, scale = _infer_tmix_projection_spec(projection)
+            disabled = torch.nn.functional.linear(x, weight)
+            base = projection.get_base_layer()(x)
+        self.assertIsNone(lora_a)
+        self.assertIsNone(lora_b)
+        self.assertEqual(scale, 1.0)
         torch.testing.assert_close(disabled, base, atol=0, rtol=0)
 
         model.enable_adapters()
@@ -541,7 +590,7 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         )
         model.set_adapter(["first", "second"])
         with self.assertRaisesRegex(RuntimeError, "exactly one active"):
-            _infer_tmix_attention_linear(flash, x, projection)
+            _infer_tmix_projection_spec(projection)
 
     def test_stateful_chunk_forward_matches_single_stateful_call(self):
         config = tiny_config()
@@ -602,7 +651,7 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
             def __init__(self):
                 self.calls = 0
 
-            def prepare_recurrent_metadata(self, *args, **kwargs):
+            def prepare_tmix_wkv7_recurrent_metadata(self, *args, **kwargs):
                 self.calls += 1
                 return object()
 
@@ -685,11 +734,32 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         self.assertEqual(whole.past_key_values.get_seq_length(), 5)
         self.assertEqual(staged.past_key_values.get_seq_length(), 5)
         torch.testing.assert_close(whole.logits[:, -1], staged.logits[:, -1], atol=2e-2, rtol=2e-2)
-        self.assertEqual(whole.past_key_values.layers[0].recurrent_states[0].dtype, torch.float32)
+        first_layer = whole.past_key_values.layers[0]
+        self.assertEqual(first_layer.number_of_states, 2)
+        self.assertTrue(first_layer.is_conv_states_initialized[0])
+        self.assertTrue(first_layer.is_conv_states_initialized[1])
+        self.assertTrue(first_layer.is_recurrent_states_initialized[0])
+        self.assertFalse(first_layer.is_recurrent_states_initialized[1])
+        self.assertEqual(first_layer.recurrent_states[0].dtype, torch.float32)
+        self.assertEqual(
+            first_layer.recurrent_states[0].shape,
+            (1, config.num_attention_heads, config.head_size, config.head_size),
+        )
         staged.past_key_values.batch_repeat_interleave(2)
         self.assertEqual(staged.past_key_values.batch_size, 2)
         staged.past_key_values.batch_select_indices(torch.tensor([1], device="cuda"))
         self.assertEqual(staged.past_key_values.batch_size, 1)
+
+    def test_inference_output_hidden_states_preserves_block_boundaries(self):
+        config = tiny_config(hidden_size=1024, intermediate_size=4096)
+        model = RwkvForCausalLM(config).cuda().eval().prepare_for_inference()
+        input_ids = torch.randint(0, config.vocab_size, (1, 5), device="cuda")
+        with torch.no_grad():
+            outputs = model(input_ids, use_cache=False, output_hidden_states=True)
+        self.assertEqual(len(outputs.hidden_states), config.num_hidden_layers + 1)
+        for hidden_state in outputs.hidden_states:
+            self.assertEqual(hidden_state.shape, (1, 5, config.hidden_size))
+            self.assertTrue(torch.isfinite(hidden_state).all())
 
     def test_inference_can_compute_only_last_logits(self):
         config = tiny_config(hidden_size=1024, intermediate_size=4096)

@@ -32,22 +32,22 @@ from .configuration_rwkv import RwkvConfig
 
 
 _TRAINING_OPERATORS = (
-    "pretrain_tmix_mix6_bf16",
+    "pretrain_tmix_tokenshift_bf16",
     "pretrain_tmix_a_gate_bf16",
     "pretrain_tmix_vres_gate_bf16",
     "pretrain_tmix_kk_pre_bf16",
-    "pretrain_recurrent_bf16",
-    "pretrain_tmix_lnx_rkvres_xg_bf16",
+    "pretrain_tmix_wkv7_recurrent_bf16",
+    "pretrain_tmix_readout_bf16",
     "pretrain_cmix_bf16",
 )
 
 _STATEFUL_TRAINING_OPERATORS = (
-    "statetune_tmix_mix6_bf16",
+    "statetune_tmix_tokenshift_bf16",
     "pretrain_tmix_a_gate_bf16",
     "pretrain_tmix_vres_gate_bf16",
     "pretrain_tmix_kk_pre_bf16",
-    "statetune_recurrent_fp32io16",
-    "pretrain_tmix_lnx_rkvres_xg_bf16",
+    "statetune_tmix_wkv7_recurrent_fp32io16",
+    "pretrain_tmix_readout_bf16",
     "statetune_cmix_bf16",
 )
 
@@ -55,27 +55,17 @@ _STATEFUL_BOUNDARY_CHUNK_LEN = 16
 
 _INFERENCE_OPERATORS = (
     "infer_embedding_ln0_forward_varlen",
-    "infer_tmix_mix6_forward_varlen",
-    "infer_tmix_mix6_add_layer_norm_forward_varlen",
-    "infer_tmix_linear_attention_c2c_forward_varlen",
-    "infer_tmix_linear_ffn_key_forward_varlen",
-    "infer_tmix_lowrank_in_forward_varlen",
-    "infer_tmix_lowrank_wagv_in_forward_varlen",
-    "infer_tmix_lowrank_out_forward_varlen",
-    "infer_tmix_lowrank_vres_forward_varlen",
-    "infer_tmix_kk_a_gate_forward_varlen",
-    "infer_recurrent_fp32io16_forward_varlen",
-    "infer_tmix_lnx_rkvres_xg_forward_varlen",
-    "infer_cmix_mix_forward_varlen",
-    "infer_cmix_add_layer_norm_mix_forward_varlen",
-    "infer_cmix_sparse_down_relu_forward_varlen",
-    "infer_cmix_sparse_forward_varlen",
-    "infer_cmix_relu_square_forward_varlen",
-    "infer_cmix_linear_ffn_down_forward_varlen",
-    "infer_tmix_layer_norm_forward_varlen",
+    "infer_tmix_postnorm_tokenshift_forward_varlen",
+    "infer_tmix_wkv_prepare_forward_varlen",
+    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
+    "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
+    "infer_tmix_wkv7_chunk_bf16_forward_varlen",
+    "infer_tmix_readout_forward_varlen",
+    "infer_cmix_forward_varlen",
+    "infer_post_norm_output_forward_varlen",
     "infer_head_linear_all_forward_varlen",
     "infer_head_linear_last_forward_varlen",
-    "prepare_recurrent_metadata",
+    "prepare_tmix_wkv7_recurrent_metadata",
 )
 
 
@@ -88,6 +78,11 @@ def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
     }.get(mode)
     if required is None:
         raise ValueError(f"Unsupported FlashRWKV2 mode: {mode!r}.")
+    if tensor is not None and (not tensor.is_cuda or tensor.device.type != "cuda"):
+        raise RuntimeError(
+            f"RWKV-7 {mode} has no product fallback and requires CUDA tensors; got "
+            f"device={tensor.device}, dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
+        )
     try:
         module = importlib.import_module("flashrwkv2")
     except ImportError as error:
@@ -102,11 +97,6 @@ def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
         raise RuntimeError(
             f"RWKV-7 {mode} requires FlashRWKV2 public operators {missing}; "
             f"installed version={version}, source={source}."
-        )
-    if tensor is not None and (not tensor.is_cuda or tensor.device.type != "cuda"):
-        raise RuntimeError(
-            f"RWKV-7 {mode} has no product fallback and requires CUDA tensors; got "
-            f"device={tensor.device}, dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
         )
     return module
 
@@ -141,22 +131,23 @@ def _stateful_training_metadata(
     return sequence_chunk_offsets, chunk_token_starts, chunk_token_ends
 
 
-def _infer_tmix_attention_linear(flashrwkv2, x: torch.Tensor, projection: nn.Module) -> torch.Tensor:
-    """Run a TimeMix C2C projection while preserving active vanilla LoRA adapters."""
+def _infer_tmix_projection_spec(
+    projection: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, float]:
+    """Resolve one bias-free Linear and an optional active vanilla LoRA adapter."""
 
     get_base_layer = getattr(projection, "get_base_layer", None)
     base_layer = get_base_layer() if callable(get_base_layer) else projection
     if not isinstance(base_layer, nn.Linear):
         raise RuntimeError(
-            "RWKV-7 FlashRWKV2 inference requires TimeMix projections backed by torch.nn.Linear; "
+            "RWKV-7 FlashRWKV2 inference requires projections backed by torch.nn.Linear; "
             f"got {type(base_layer).__name__}."
         )
     if base_layer.bias is not None:
-        raise RuntimeError("RWKV-7 FlashRWKV2 TimeMix C2C projections do not support a base bias.")
+        raise RuntimeError("RWKV-7 FlashRWKV2 inference projections do not support a base bias.")
 
-    base = flashrwkv2.infer_tmix_linear_attention_c2c_forward_varlen
     if base_layer is projection:
-        return base(x, base_layer.weight.contiguous())
+        return base_layer.weight.contiguous(), None, None, 1.0
 
     required = (
         "lora_A",
@@ -182,9 +173,9 @@ def _infer_tmix_attention_linear(flashrwkv2, x: torch.Tensor, projection: nn.Mod
                 "RWKV-7 inference does not mutate PEFT adapter state in forward. Unmerge the LoRA projection "
                 "before disabling adapters."
             )
-        return base(x, base_layer.weight.contiguous())
+        return base_layer.weight.contiguous(), None, None, 1.0
     if projection.merged:
-        return base(x, base_layer.weight.contiguous())
+        return base_layer.weight.contiguous(), None, None, 1.0
 
     active_adapters = projection.active_adapters
     if isinstance(active_adapters, str):
@@ -213,19 +204,18 @@ def _infer_tmix_attention_linear(flashrwkv2, x: torch.Tensor, projection: nn.Mod
         active.append((adapter_a, adapter_b, float(projection.scaling[adapter_name])))
 
     if not active:
-        return base(x, base_layer.weight.contiguous())
+        return base_layer.weight.contiguous(), None, None, 1.0
     if len(active) != 1:
         raise RuntimeError(
             "RWKV-7 FlashRWKV2 inference supports exactly one active vanilla LoRA adapter; "
             "merge multiple adapters before inference."
         )
     adapter_a, adapter_b, scale = active[0]
-    return base(
-        x,
+    return (
         base_layer.weight.contiguous(),
-        lora_a=adapter_a.weight.contiguous(),
-        lora_b=adapter_b.weight.contiguous(),
-        lora_scale=scale,
+        adapter_a.weight.contiguous(),
+        adapter_b.weight.contiguous(),
+        scale,
     )
 
 
@@ -446,7 +436,7 @@ class RwkvCache(Cache):
                 device=device,
             )
             state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            ticket = flashrwkv2.prepare_recurrent_metadata(
+            ticket = flashrwkv2.prepare_tmix_wkv7_recurrent_metadata(
                 cu_seqlens,
                 state_indices,
                 total_tokens=batch_size * sequence_length,
@@ -550,13 +540,11 @@ class RwkvTimeMix(nn.Module):
         self.value = nn.Linear(channels, channels, bias=False)
         self.output = nn.Linear(channels, channels, bias=False)
         self.ln_x = nn.GroupNorm(heads, channels, eps=config.group_norm_epsilon)
-        self.register_buffer("_zero_residual", None, persistent=False)
         for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
             self.register_buffer(f"_{name}_original", None, persistent=False)
         self.register_load_state_dict_post_hook(self._clear_inference_layouts)
 
     def _clear_inference_layouts(self, *args) -> None:
-        self._zero_residual = None
         for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
             setattr(self, f"_{name}_original", None)
 
@@ -574,7 +562,6 @@ class RwkvTimeMix(nn.Module):
                     f"got {name} with dtype={parameter.dtype}, device={parameter.device}."
                 )
             setattr(self, f"_{name}_original", parameter.T.contiguous())
-        self._zero_residual = torch.zeros(1, self.config.hidden_size, dtype=torch.float16, device=self.w1.device)
 
     def _inference_low_rank_layouts(self) -> tuple[torch.Tensor, ...]:
         names = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
@@ -669,7 +656,7 @@ class RwkvTimeMix(nn.Module):
         value: torch.Tensor,
         gate: torch.Tensor,
     ) -> torch.Tensor:
-        output = flash.pretrain_tmix_lnx_rkvres_xg_bf16(
+        output = flash.pretrain_tmix_readout_bf16(
             recurrent_output,
             receptance.contiguous(),
             key,
@@ -693,7 +680,7 @@ class RwkvTimeMix(nn.Module):
                 f"RWKV-7 train_temp requires sequence length divisible by 16, got T={hidden_states.shape[1]}."
             )
         x = hidden_states.contiguous()
-        mixed = flash.pretrain_tmix_mix6_bf16(
+        mixed = flash.pretrain_tmix_tokenshift_bf16(
             x,
             self.x_r.reshape(-1).contiguous(),
             self.x_w.reshape(-1).contiguous(),
@@ -705,7 +692,7 @@ class RwkvTimeMix(nn.Module):
         receptance, decay_logits, key, value, v_first, gate, recurrent_a, recurrent_b = self._training_projections(
             flash, mixed, v_first
         )
-        output = flash.pretrain_recurrent_bf16(
+        output = flash.pretrain_tmix_wkv7_recurrent_bf16(
             receptance.contiguous(),
             decay_logits.contiguous(),
             key,
@@ -731,7 +718,7 @@ class RwkvTimeMix(nn.Module):
         if sequence_length <= 0:
             raise ValueError("RWKV-7 stateful training requires at least one token per chunk.")
         x = hidden_states.contiguous()
-        *mixed, next_shift_state = flash.statetune_tmix_mix6_bf16(
+        *mixed, next_shift_state = flash.statetune_tmix_tokenshift_bf16(
             x,
             shift_state.contiguous(),
             self.x_r.reshape(-1).contiguous(),
@@ -749,7 +736,7 @@ class RwkvTimeMix(nn.Module):
 
         packed_shape = (batch_size * sequence_length, heads, head_size)
         sequence_chunk_offsets, starts, ends = _stateful_training_metadata(batch_size, sequence_length, x.device)
-        recurrent_output, next_wkv_state, _, _ = flash.statetune_recurrent_fp32io16(
+        recurrent_output, next_wkv_state, _, _ = flash.statetune_tmix_wkv7_recurrent_fp32io16(
             wkv_state.contiguous(),
             sequence_chunk_offsets,
             starts,
@@ -774,10 +761,10 @@ class RwkvTimeMix(nn.Module):
     def _inference_forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        layer_norm: nn.LayerNorm,
         v_first: torch.Tensor | None,
         past_key_values: RwkvCache,
-        layer_norm: nn.LayerNorm | None = None,
-        residual: torch.Tensor | None = None,
     ):
         flash = _load_flash_rwkv2("inference", hidden_states)
         if hidden_states.dtype != torch.float16:
@@ -799,107 +786,84 @@ class RwkvTimeMix(nn.Module):
             self.x_a.reshape(-1).contiguous(),
             self.x_g.reshape(-1).contiguous(),
         )
-        if layer_norm is None:
-            xr, xw, xk, xv, xa, xg = flash.infer_tmix_mix6_forward_varlen(
-                packed,
-                *mix_parameters,
-                shift_state_pool=att_shift,
-                cu_seqlens=cu_seqlens,
-                state_indices=state_indices,
-                max_seqlen=sequence_length,
-                validated_metadata=ticket,
-            )
-        else:
-            if self._zero_residual is None:
-                raise RuntimeError("RWKV-7 Albatross fused TMix layout is not prepared.")
-            residual = self._zero_residual if residual is None else residual.reshape(-1, channels).contiguous()
-            summed, xr, xw, xk, xv, xa, xg = flash.infer_tmix_mix6_add_layer_norm_forward_varlen(
-                packed,
-                residual,
-                layer_norm.weight.contiguous(),
-                layer_norm.bias.contiguous(),
-                *mix_parameters,
-                shift_state_pool=att_shift,
-                cu_seqlens=cu_seqlens,
-                state_indices=state_indices,
-                max_seqlen=sequence_length,
-                eps=layer_norm.eps,
-                validated_metadata=ticket,
-            )
-        receptance = _infer_tmix_attention_linear(flash, xr, self.receptance)
-        key = _infer_tmix_attention_linear(flash, xk, self.key)
-        value = _infer_tmix_attention_linear(flash, xv, self.value)
+        residual = residual.reshape(-1, channels).contiguous()
+        summed, xr, xw, xk, xv, xa, xg = flash.infer_tmix_postnorm_tokenshift_forward_varlen(
+            packed,
+            residual,
+            layer_norm.weight.contiguous(),
+            layer_norm.bias.contiguous(),
+            *mix_parameters,
+            shift_state_pool=att_shift,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            max_seqlen=sequence_length,
+            eps=layer_norm.eps,
+            validated_metadata=ticket,
+        )
+        receptance_weight, receptance_lora_a, receptance_lora_b, receptance_lora_scale = _infer_tmix_projection_spec(
+            self.receptance
+        )
+        key_weight, key_lora_a, key_lora_b, key_lora_scale = _infer_tmix_projection_spec(self.key)
+        value_weight, value_lora_a, value_lora_b, value_lora_scale = _infer_tmix_projection_spec(self.value)
         w1, w2, a1, a2, v1, v2, g1, g2 = self._inference_low_rank_layouts()
-        if self.layer_idx == 0:
-            v_first = value
-            wr, ar, gr = flash.infer_tmix_lowrank_in_forward_varlen(
-                xw,
-                xa,
-                xg,
-                w1,
-                a1,
-                g1,
-                w1_runtime=self.w1.contiguous(),
-                a1_runtime=self.a1.contiguous(),
-                g1_runtime=self.g1.contiguous(),
-            )
-            decay_delta, learning_rate_delta, gate = flash.infer_tmix_lowrank_out_forward_varlen(
-                wr,
-                ar,
-                gr,
-                w2,
-                a2,
-                g2,
-                w2_runtime=self.w2.contiguous(),
-                a2_runtime=self.a2.contiguous(),
-                g2_runtime=self.g2.contiguous(),
-            )
-        else:
-            if v_first is None:
-                raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
-            wr, ar, gr, vr = flash.infer_tmix_lowrank_wagv_in_forward_varlen(
-                xw,
-                xa,
-                xg,
-                xv,
-                w1,
-                a1,
-                g1,
-                v1,
-                w1_runtime=self.w1.contiguous(),
-                a1_runtime=self.a1.contiguous(),
-                g1_runtime=self.g1.contiguous(),
-                v1_runtime=self.v1.contiguous(),
-            )
-            decay_delta, learning_rate_delta, gate, value = flash.infer_tmix_lowrank_vres_forward_varlen(
-                wr,
-                ar,
-                gr,
-                vr,
-                w2,
-                a2,
-                g2,
-                v2,
-                value,
-                v_first,
-                self.v0.reshape(-1).contiguous(),
-                w2_runtime=self.w2.contiguous(),
-                a2_runtime=self.a2.contiguous(),
-                g2_runtime=self.g2.contiguous(),
-                v2_runtime=self.v2.contiguous(),
-            )
-        key, recurrent_a, recurrent_b = flash.infer_tmix_kk_a_gate_forward_varlen(
+        if self.layer_idx != 0 and v_first is None:
+            raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
+        (
+            receptance,
+            decay_delta,
             key,
+            value,
+            recurrent_a,
+            recurrent_b,
+            gate,
+            v_first,
+        ) = flash.infer_tmix_wkv_prepare_forward_varlen(
+            xr,
+            xw,
+            xk,
+            xv,
+            xa,
+            xg,
+            receptance_weight,
+            key_weight,
+            value_weight,
+            w1,
+            a1,
+            g1,
+            v1,
+            w2,
+            a2,
+            g2,
+            v2,
+            self.v0.reshape(-1).contiguous(),
             self.k_k.reshape(-1).contiguous(),
             self.a0.reshape(-1).contiguous(),
-            learning_rate_delta,
             self.k_a.reshape(-1).contiguous(),
+            v_first=None if self.layer_idx == 0 else v_first,
+            w1_runtime=self.w1.contiguous(),
+            a1_runtime=self.a1.contiguous(),
+            g1_runtime=self.g1.contiguous(),
+            v1_runtime=self.v1.contiguous(),
+            w2_runtime=self.w2.contiguous(),
+            a2_runtime=self.a2.contiguous(),
+            g2_runtime=self.g2.contiguous(),
+            v2_runtime=self.v2.contiguous(),
+            receptance_lora_a=receptance_lora_a,
+            receptance_lora_b=receptance_lora_b,
+            receptance_lora_scale=receptance_lora_scale,
+            key_lora_a=key_lora_a,
+            key_lora_b=key_lora_b,
+            key_lora_scale=key_lora_scale,
+            value_lora_a=value_lora_a,
+            value_lora_b=value_lora_b,
+            value_lora_scale=value_lora_scale,
+            head_size=self.config.head_size,
             batch_size=batch_size,
             max_seqlen=sequence_length,
         )
         heads = self.config.num_attention_heads
         head_size = self.config.head_size
-        output = flash.infer_recurrent_fp32io16_forward_varlen(
+        output = flash.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
             receptance.view(-1, heads, head_size).contiguous(),
             decay_delta.view(-1, heads, head_size).contiguous(),
             key.view(-1, heads, head_size).contiguous(),
@@ -913,7 +877,8 @@ class RwkvTimeMix(nn.Module):
             max_seqlen=sequence_length,
             validated_metadata=ticket,
         ).view(-1, channels)
-        output = flash.infer_tmix_lnx_rkvres_xg_forward_varlen(
+        output_weight, output_lora_a, output_lora_b, output_lora_scale = _infer_tmix_projection_spec(self.output)
+        output = flash.infer_tmix_readout_forward_varlen(
             output,
             receptance,
             key,
@@ -922,27 +887,26 @@ class RwkvTimeMix(nn.Module):
             self.ln_x.weight.contiguous(),
             self.ln_x.bias.contiguous(),
             gate,
+            output_weight,
+            output_lora_a=output_lora_a,
+            output_lora_b=output_lora_b,
+            output_lora_scale=output_lora_scale,
+            head_size=self.config.head_size,
             batch_size=batch_size,
             max_seqlen=sequence_length,
         )
-        output = _infer_tmix_attention_linear(flash, output, self.output).view(batch_size, sequence_length, channels)
-        if layer_norm is not None:
-            return summed.view_as(hidden_states), output, v_first
-        return output, v_first
+        output = output.view(batch_size, sequence_length, channels)
+        return summed.view_as(hidden_states), output, v_first
 
-    def inference_forward_with_layer_norm(
+    def inference_forward_with_postnorm(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        residual: torch.Tensor,
         layer_norm: nn.LayerNorm,
         v_first: torch.Tensor | None,
         past_key_values: RwkvCache,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[:2] != (1, 1) or hidden_states.shape[2] != 4096:
-            raise ValueError("The fused Albatross TMix LayerNorm path requires shape [1,1,4096].")
-        return self._inference_forward(
-            hidden_states, v_first, past_key_values, layer_norm=layer_norm, residual=residual
-        )
+        return self._inference_forward(hidden_states, residual, layer_norm, v_first, past_key_values)
 
     def forward(
         self,
@@ -969,7 +933,10 @@ class RwkvTimeMix(nn.Module):
             raise ValueError(
                 "RWKV-7 inference requires an RwkvCache, including when the caller discards the final cache."
             )
-        return self._inference_forward(hidden_states, v_first, past_key_values)
+        raise RuntimeError(
+            "RWKV-7 inference must run TimeMix through its owning block so FlashRWKV2 can fuse residual, "
+            "LayerNorm and TokenShift."
+        )
 
 
 class RwkvChannelMix(nn.Module):
@@ -1044,6 +1011,19 @@ class RwkvChannelMix(nn.Module):
             )
         if past_key_values is None:
             raise ValueError("RWKV-7 inference requires an RwkvCache.")
+        raise RuntimeError(
+            "RWKV-7 inference must run ChannelMix through its owning block so FlashRWKV2 can fuse residual, "
+            "LayerNorm, TokenShift and the complete FFN."
+        )
+
+    def inference_forward_with_postnorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        layer_norm: nn.LayerNorm,
+        past_key_values: RwkvCache,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the complete FlashRWKV2 ChannelMix inference island."""
         flash = _load_flash_rwkv2("inference", hidden_states)
         if self._value_runtime is None:
             raise RuntimeError(
@@ -1056,73 +1036,20 @@ class RwkvChannelMix(nn.Module):
             flash, batch_size, sequence_length, hidden_states.device
         )
         packed = hidden_states.reshape(-1, channels).contiguous()
-        if channels == 4096 and packed.shape[0] <= 19:
-            return flash.infer_cmix_sparse_forward_varlen(
-                packed,
-                self.x_k.reshape(-1).contiguous(),
-                self.key.weight.contiguous(),
-                self._value_runtime,
-                shift_state_pool=ffn_shift,
-                cu_seqlens=cu_seqlens,
-                state_indices=state_indices,
-                max_seqlen=sequence_length,
-                validated_metadata=ticket,
-                deterministic=torch.are_deterministic_algorithms_enabled(),
-            ).view(batch_size, sequence_length, channels)
-        mixed = flash.infer_cmix_mix_forward_varlen(
+        summed, output = flash.infer_cmix_forward_varlen(
             packed,
-            self.x_k.reshape(-1).contiguous(),
-            shift_state_pool=ffn_shift,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            max_seqlen=sequence_length,
-            validated_metadata=ticket,
-        )
-        key = flash.infer_tmix_linear_ffn_key_forward_varlen(mixed, self.key.weight.contiguous())
-        key = flash.infer_cmix_relu_square_forward_varlen(key)
-        output = flash.infer_cmix_linear_ffn_down_forward_varlen(key, self._value_runtime)
-        return output.view(batch_size, sequence_length, channels)
-
-    def inference_forward_with_residual(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        layer_norm: nn.LayerNorm,
-        past_key_values: RwkvCache,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run Albatross's fused B1T1 residual/LayerNorm/ChannelMix path."""
-        flash = _load_flash_rwkv2("inference", hidden_states)
-        if self._value_runtime is None:
-            raise RuntimeError(
-                "RWKV-7 Albatross ChannelMix layout is not prepared; call `model.prepare_for_inference()` "
-                "after loading or modifying weights."
-            )
-        batch_size, sequence_length, channels = hidden_states.shape
-        if sequence_length != 1 or channels != 4096:
-            raise ValueError("The fused Albatross ChannelMix residual path requires sequence_length=1 and C=4096.")
-        _, _, ffn_shift = _cache_states(past_key_values, self.layer_idx, hidden_states, self.config)
-        cu_seqlens, state_indices, ticket = past_key_values.recurrent_metadata(
-            flash, batch_size, sequence_length, hidden_states.device
-        )
-        summed, mixed = flash.infer_cmix_add_layer_norm_mix_forward_varlen(
-            hidden_states.reshape(-1, channels).contiguous(),
             residual.reshape(-1, channels).contiguous(),
             layer_norm.weight.contiguous(),
             layer_norm.bias.contiguous(),
             self.x_k.reshape(-1).contiguous(),
+            self.key.weight.contiguous(),
+            self._value_runtime,
             shift_state_pool=ffn_shift,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             max_seqlen=sequence_length,
             eps=layer_norm.eps,
             validated_metadata=ticket,
-        )
-        key = flash.infer_tmix_linear_ffn_key_forward_varlen(mixed, self.key.weight.contiguous())
-        output = flash.infer_cmix_sparse_down_relu_forward_varlen(
-            key,
-            self._value_runtime,
-            batch_size=batch_size,
-            max_seqlen=sequence_length,
             deterministic=torch.are_deterministic_algorithms_enabled(),
         )
         return summed.view_as(hidden_states), output.view_as(hidden_states)
@@ -1147,6 +1074,10 @@ class RwkvBlock(nn.Module):
         attention_mask: torch.Tensor | None,
         training_state: RwkvTrainingState | None = None,
     ) -> tuple[torch.Tensor, ...]:
+        if not self.training:
+            if past_key_values is None:
+                raise ValueError("RWKV-7 inference requires an RwkvCache.")
+            raise RuntimeError("RWKV-7 inference blocks require an explicit residual tensor.")
         att_result = self.att(
             self.ln1(hidden_states),
             v_first=v_first,
@@ -1171,32 +1102,28 @@ class RwkvBlock(nn.Module):
         else:
             ffn_output, next_ffn_shift = ffn_result
             hidden_states = hidden_states + ffn_output
-        if past_key_values is not None:
-            layer = past_key_values.layers[self.layer_idx]
-            if isinstance(layer, RwkvDynamicCacheLayer):
-                layer.mark_updated(hidden_states.shape[1])
         if training_state is None:
             return hidden_states, v_first
         return hidden_states, v_first, next_att_shift, next_wkv, next_ffn_shift
 
-    def inference_forward_with_residual(
+    def inference_forward(
         self,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        residual: torch.Tensor,
         v_first: torch.Tensor | None,
         past_key_values: RwkvCache,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run one Albatross B1T1 block while carrying the ChannelMix residual into the next block."""
-        hidden_states, output, v_first = self.att.inference_forward_with_layer_norm(
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one inference block while carrying FlashRWKV2's residual between fusion islands."""
+        block_input, output, v_first = self.att.inference_forward_with_postnorm(
             hidden_states, residual, self.ln1, v_first, past_key_values
         )
-        hidden_states, residual = self.ffn.inference_forward_with_residual(
-            hidden_states, output, self.ln2, past_key_values
+        hidden_states, residual = self.ffn.inference_forward_with_postnorm(
+            block_input, output, self.ln2, past_key_values
         )
         layer = past_key_values.layers[self.layer_idx]
         if isinstance(layer, RwkvDynamicCacheLayer):
             layer.mark_updated(hidden_states.shape[1])
-        return hidden_states, residual, v_first
+        return hidden_states, residual, v_first, block_input
 
 
 @auto_docstring
@@ -1280,6 +1207,8 @@ class RwkvModel(RwkvPreTrainedModel):
             raise ValueError("Specify exactly one of `input_ids` or `inputs_embeds`.")
         if past_key_values is not None and not isinstance(past_key_values, RwkvCache):
             raise TypeError(f"RWKV-7 requires `RwkvCache`, got {type(past_key_values).__name__}.")
+        if attention_mask is not None and not torch.all(attention_mask == 1):
+            raise ValueError("RWKV-7 training and the initial equal-length inference path require an all-ones mask.")
         use_cache = self.config.use_cache if use_cache is None else use_cache
         output_hidden_states = (
             self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
@@ -1327,20 +1256,7 @@ class RwkvModel(RwkvPreTrainedModel):
         next_wkv_states: list[torch.Tensor] = []
         next_ffn_shifts: list[torch.Tensor] = []
         all_hidden_states = () if output_hidden_states else None
-        fused_decode = (
-            not self.training
-            and not output_hidden_states
-            and hidden_states.shape == (1, 1, 4096)
-            and cache is not None
-        )
-        if fused_decode:
-            residual = None
-            for block in self.blocks:
-                hidden_states, residual, v_first = block.inference_forward_with_residual(
-                    hidden_states, residual, v_first, cache
-                )
-            hidden_states = hidden_states + residual
-        else:
+        if self.training:
             for block in self.blocks:
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
@@ -1358,14 +1274,22 @@ class RwkvModel(RwkvPreTrainedModel):
                     next_att_shifts.append(next_att_shift)
                     next_wkv_states.append(next_wkv)
                     next_ffn_shifts.append(next_ffn_shift)
-
-        if self.training:
             hidden_states = self.ln_out(hidden_states)
         else:
             flash = _load_flash_rwkv2("inference", hidden_states)
+            if cache is None:
+                raise RuntimeError("RWKV-7 inference cache initialization failed.")
+            residual = torch.zeros_like(hidden_states)
+            for block in self.blocks:
+                hidden_states, residual, v_first, block_input = block.inference_forward(
+                    hidden_states, residual, v_first, cache
+                )
+                if output_hidden_states:
+                    all_hidden_states += (block_input,)
             batch_size, sequence_length, channels = hidden_states.shape
-            hidden_states = flash.infer_tmix_layer_norm_forward_varlen(
+            hidden_states = flash.infer_post_norm_output_forward_varlen(
                 hidden_states.reshape(-1, channels).contiguous(),
+                residual.reshape(-1, channels).contiguous(),
                 self.ln_out.weight.contiguous(),
                 self.ln_out.bias.contiguous(),
                 eps=self.config.layer_norm_epsilon,
