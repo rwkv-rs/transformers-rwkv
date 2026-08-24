@@ -2,7 +2,7 @@
 # 1. modify the `_deps` dict in setup.py
 # 2. run `make fix-repo``
 deps = {
-    "FlashRWKV2": "FlashRWKV2==0.1.0a7",
+    "FlashRWKV2": "FlashRWKV2==0.1.0a8",
     "Pillow": "Pillow>=10.0.1,<=15.0",
     "accelerate": "accelerate>=1.1.0",
     "av": "av",

@@ -127,8 +127,8 @@ def train_temp_model_init(model) -> None:
 
 @require_torch
 class Rwkv7ConfigurationTest(unittest.TestCase):
-    def test_flashrwkv2_a7_inference_operator_contract(self):
-        self.assertEqual(deps["FlashRWKV2"], "FlashRWKV2==0.1.0a7")
+    def test_flashrwkv2_a8_inference_operator_contract(self):
+        self.assertEqual(deps["FlashRWKV2"], "FlashRWKV2==0.1.0a8")
         expected = {
             "infer_embedding_ln0_forward_varlen",
             "infer_tmix_postnorm_tokenshift_forward_varlen",
@@ -150,7 +150,7 @@ class Rwkv7ConfigurationTest(unittest.TestCase):
         missing = "infer_cmix_forward_varlen"
         module = types.SimpleNamespace(
             **{name: (lambda: None) for name in _INFERENCE_OPERATORS if name != missing},
-            __version__="0.1.0a7",
+            __version__="0.1.0a8",
             __file__="fake/flashrwkv2/__init__.py",
         )
         with (

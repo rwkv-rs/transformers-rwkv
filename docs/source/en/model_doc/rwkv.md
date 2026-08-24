@@ -40,7 +40,7 @@ The current canonical contract uses:
 
 ## Usage
 
-Install this checkout with its RWKV extra. This installs the pinned `FlashRWKV2==0.1.0a7` distribution;
+Install this checkout with its RWKV extra. This installs the pinned `FlashRWKV2==0.1.0a8` distribution;
 the pinned native `tokenizers-rwkv` dependency is installed automatically:
 
 ```bash
