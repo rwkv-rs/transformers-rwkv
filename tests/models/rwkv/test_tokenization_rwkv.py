@@ -207,9 +207,7 @@ class RwkvTokenizerTest(unittest.TestCase):
         messages = [{"role": "user", "content": "hello"}]
         with tempfile.TemporaryDirectory() as directory:
             tokenizer.save_pretrained(directory)
-            reloaded = AutoTokenizer.from_pretrained(
-                directory, use_fast=True, trust_remote_code=False, local_files_only=True
-            )
+            reloaded = AutoTokenizer.from_pretrained(directory, use_fast=True, local_files_only=True)
             self.assertIsInstance(reloaded, RwkvTokenizerFast)
             self.assertEqual(
                 reloaded.apply_chat_template(messages, tokenize=False, add_generation_prompt=True),

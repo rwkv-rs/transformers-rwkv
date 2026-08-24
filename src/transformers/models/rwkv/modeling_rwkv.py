@@ -15,10 +15,8 @@
 
 from __future__ import annotations
 
-import importlib
 import math
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from torch import nn
@@ -26,79 +24,16 @@ from torch import nn
 from ... import initialization as init
 from ...cache_utils import Cache, CacheLayerMixin, LinearAttentionLayer
 from ...generation import GenerationMixin
+from ...integrations.flash_rwkv2 import load_flash_rwkv2 as _load_flash_rwkv2
 from ...modeling_utils import PreTrainedModel
-from ...utils import ModelOutput, auto_docstring
+from ...processing_utils import Unpack
+from ...utils import ModelOutput, TransformersKwargs, auto_docstring, can_return_tuple
+from ...utils.generic import merge_with_config_defaults
+from ...utils.output_capturing import OutputRecorder, capture_outputs
 from .configuration_rwkv import RwkvConfig
 
 
-_TRAINING_OPERATORS = (
-    "pretrain_tmix_tokenshift_bf16",
-    "pretrain_tmix_a_gate_bf16",
-    "pretrain_tmix_vres_gate_bf16",
-    "pretrain_tmix_kk_pre_bf16",
-    "pretrain_tmix_wkv7_recurrent_bf16",
-    "pretrain_tmix_readout_bf16",
-    "pretrain_cmix_bf16",
-)
-
-_STATEFUL_TRAINING_OPERATORS = (
-    "statetune_tmix_tokenshift_bf16",
-    "pretrain_tmix_a_gate_bf16",
-    "pretrain_tmix_vres_gate_bf16",
-    "pretrain_tmix_kk_pre_bf16",
-    "statetune_tmix_wkv7_recurrent_fp32io16",
-    "pretrain_tmix_readout_bf16",
-    "statetune_cmix_bf16",
-)
-
 _STATEFUL_BOUNDARY_CHUNK_LEN = 16
-
-_INFERENCE_OPERATORS = (
-    "infer_embedding_ln0_forward_varlen",
-    "infer_tmix_postnorm_tokenshift_forward_varlen",
-    "infer_tmix_wkv_prepare_forward_varlen",
-    "infer_tmix_wkv7_recurrent_fp16_forward_varlen",
-    "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-    "infer_tmix_wkv7_chunk_bf16_forward_varlen",
-    "infer_tmix_readout_forward_varlen",
-    "infer_cmix_forward_varlen",
-    "infer_post_norm_output_forward_varlen",
-    "infer_head_linear_all_forward_varlen",
-    "infer_head_linear_last_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_metadata",
-)
-
-
-def _load_flash_rwkv2(mode: str, tensor: torch.Tensor | None = None):
-    """Load the public FlashRWKV2 surface lazily and fail closed on contract drift."""
-    required = {
-        "training": _TRAINING_OPERATORS,
-        "stateful training": _STATEFUL_TRAINING_OPERATORS,
-        "inference": _INFERENCE_OPERATORS,
-    }.get(mode)
-    if required is None:
-        raise ValueError(f"Unsupported FlashRWKV2 mode: {mode!r}.")
-    if tensor is not None and (not tensor.is_cuda or tensor.device.type != "cuda"):
-        raise RuntimeError(
-            f"RWKV-7 {mode} has no product fallback and requires CUDA tensors; got "
-            f"device={tensor.device}, dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
-        )
-    try:
-        module = importlib.import_module("flashrwkv2")
-    except ImportError as error:
-        raise RuntimeError(
-            f"RWKV-7 {mode} requires the public `flashrwkv2` root API. Install this checkout with its "
-            f"`rwkv` extra; import failed: {error}"
-        ) from error
-    missing = [name for name in required if not callable(getattr(module, name, None))]
-    if missing:
-        version = getattr(module, "__version__", "unknown")
-        source = getattr(module, "__file__", "unknown")
-        raise RuntimeError(
-            f"RWKV-7 {mode} requires FlashRWKV2 public operators {missing}; "
-            f"installed version={version}, source={source}."
-        )
-    return module
 
 
 def _stateful_training_metadata(
@@ -343,6 +278,7 @@ class RwkvTrainingState:
         )
 
 
+@auto_docstring
 @dataclass
 class RwkvModelOutput(ModelOutput):
     last_hidden_state: torch.FloatTensor | None = None
@@ -351,6 +287,7 @@ class RwkvModelOutput(ModelOutput):
     training_state: RwkvTrainingState | None = None
 
 
+@auto_docstring
 @dataclass
 class RwkvCausalLMOutput(ModelOutput):
     loss: torch.FloatTensor | None = None
@@ -363,6 +300,7 @@ class RwkvCausalLMOutput(ModelOutput):
 class RwkvDynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
     """Linear-attention cache layer with RWKV's two shift states and sequence offset."""
 
+    is_compileable = False
     is_sliding = False
 
     def __init__(self, number_of_states: int = 2):
@@ -1059,6 +997,7 @@ class RwkvBlock(nn.Module):
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.hidden_state_boundary = nn.Identity()
         if layer_idx == 0:
             self.ln0 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.ln1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -1074,6 +1013,7 @@ class RwkvBlock(nn.Module):
         attention_mask: torch.Tensor | None,
         training_state: RwkvTrainingState | None = None,
     ) -> tuple[torch.Tensor, ...]:
+        hidden_states = self.hidden_state_boundary(hidden_states)
         if not self.training:
             if past_key_values is None:
                 raise ValueError("RWKV-7 inference requires an RwkvCache.")
@@ -1117,6 +1057,7 @@ class RwkvBlock(nn.Module):
         block_input, output, v_first = self.att.inference_forward_with_postnorm(
             hidden_states, residual, self.ln1, v_first, past_key_values
         )
+        block_input = self.hidden_state_boundary(block_input)
         hidden_states, residual = self.ffn.inference_forward_with_postnorm(
             block_input, output, self.ln2, past_key_values
         )
@@ -1132,6 +1073,14 @@ class RwkvPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     _no_split_modules = ["RwkvBlock"]
     _is_stateful = True
+    _can_compile_fullgraph = False
+    _can_record_outputs = {
+        "hidden_states": OutputRecorder(
+            nn.Identity,
+            layer_name="hidden_state_boundary",
+            capture_initial_hidden_state=False,
+        )
+    }
     supports_gradient_checkpointing = False
 
     # trf-ignore: TRF018
@@ -1155,6 +1104,7 @@ class RwkvModel(RwkvPreTrainedModel):
         self.emb = RwkvEmbedding(config.vocab_size, config.hidden_size)
         self.blocks = nn.ModuleList([RwkvBlock(config, index) for index in range(config.num_hidden_layers)])
         self.ln_out = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.hidden_state_boundary = nn.Identity()
         self.post_init()
 
     def reset_parameters(self) -> None:
@@ -1191,6 +1141,9 @@ class RwkvModel(RwkvPreTrainedModel):
             block.ffn.prepare_for_inference()
         return self
 
+    @merge_with_config_defaults
+    @capture_outputs(tie_last_hidden_states=False)
+    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -1199,21 +1152,14 @@ class RwkvModel(RwkvPreTrainedModel):
         training_state: RwkvTrainingState | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
-        **kwargs: Any,
-    ) -> RwkvModelOutput | tuple:
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> RwkvModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of `input_ids` or `inputs_embeds`.")
         if past_key_values is not None and not isinstance(past_key_values, RwkvCache):
             raise TypeError(f"RWKV-7 requires `RwkvCache`, got {type(past_key_values).__name__}.")
         if attention_mask is not None and not torch.all(attention_mask == 1):
             raise ValueError("RWKV-7 training and the initial equal-length inference path require an all-ones mask.")
-        use_cache = self.config.use_cache if use_cache is None else use_cache
-        output_hidden_states = (
-            self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
-        )
-        return_dict = self.config.return_dict if return_dict is None else return_dict
 
         if inputs_embeds is None:
             inputs_embeds = self.emb(input_ids)
@@ -1255,11 +1201,8 @@ class RwkvModel(RwkvPreTrainedModel):
         next_att_shifts: list[torch.Tensor] = []
         next_wkv_states: list[torch.Tensor] = []
         next_ffn_shifts: list[torch.Tensor] = []
-        all_hidden_states = () if output_hidden_states else None
         if self.training:
             for block in self.blocks:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
                 block_result = block(
                     hidden_states,
                     v_first,
@@ -1281,11 +1224,7 @@ class RwkvModel(RwkvPreTrainedModel):
                 raise RuntimeError("RWKV-7 inference cache initialization failed.")
             residual = torch.zeros_like(hidden_states)
             for block in self.blocks:
-                hidden_states, residual, v_first, block_input = block.inference_forward(
-                    hidden_states, residual, v_first, cache
-                )
-                if output_hidden_states:
-                    all_hidden_states += (block_input,)
+                hidden_states, residual, v_first, _ = block.inference_forward(hidden_states, residual, v_first, cache)
             batch_size, sequence_length, channels = hidden_states.shape
             hidden_states = flash.infer_post_norm_output_forward_varlen(
                 hidden_states.reshape(-1, channels).contiguous(),
@@ -1294,8 +1233,7 @@ class RwkvModel(RwkvPreTrainedModel):
                 self.ln_out.bias.contiguous(),
                 eps=self.config.layer_norm_epsilon,
             ).view(batch_size, sequence_length, channels)
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+        hidden_states = self.hidden_state_boundary(hidden_states)
 
         final_cache = cache if use_cache else None
         next_training_state = None
@@ -1305,13 +1243,11 @@ class RwkvModel(RwkvPreTrainedModel):
                 wkv=torch.stack(next_wkv_states),
                 channel_mix_shift=torch.stack(next_ffn_shifts),
             )
-        output = RwkvModelOutput(
+        return RwkvModelOutput(
             last_hidden_state=hidden_states,
             past_key_values=final_cache,
-            hidden_states=all_hidden_states,
             training_state=next_training_state,
         )
-        return output if return_dict else output.to_tuple()
 
 
 @auto_docstring
@@ -1348,30 +1284,30 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self,
         input_ids,
-        attention_mask=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
+        next_sequence_length: int | None = None,
+        past_key_values: RwkvCache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        is_first_iteration: bool | None = False,
+        use_cache: bool | None = None,
         **kwargs,
     ):
-        if past_key_values is not None and past_key_values.get_seq_length() > 0:
-            input_ids = input_ids[:, -1:]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, -1:]
-        first_step = past_key_values is None or past_key_values.get_seq_length() == 0
-        model_inputs = (
-            {"inputs_embeds": inputs_embeds} if inputs_embeds is not None and first_step else {"input_ids": input_ids}
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            next_sequence_length=next_sequence_length,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            is_first_iteration=is_first_iteration,
+            use_cache=use_cache,
+            **kwargs,
         )
-        model_inputs.update(
-            {
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "use_cache": self.config.use_cache if use_cache is None else use_cache,
-                "logits_to_keep": kwargs.get("logits_to_keep", 1),
-            }
-        )
+        if use_cache and not is_first_iteration:
+            model_inputs.pop("attention_mask", None)
         return model_inputs
 
+    @can_return_tuple
+    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -1381,12 +1317,9 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Any,
-    ) -> RwkvCausalLMOutput | tuple:
-        return_dict = self.config.return_dict if return_dict is None else return_dict
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> RwkvCausalLMOutput:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1394,8 +1327,6 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
             training_state=training_state,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
@@ -1432,14 +1363,13 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
-        output = RwkvCausalLMOutput(
+        return RwkvCausalLMOutput(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             training_state=outputs.training_state,
         )
-        return output if return_dict else output.to_tuple()
 
 
 __all__ = [

@@ -38,8 +38,8 @@ if importlib.util.find_spec("torch") is not None:
     import torch
 
     from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix, RwkvTrainingState
+    from transformers.integrations.flash_rwkv2 import _INFERENCE_OPERATORS
     from transformers.models.rwkv.modeling_rwkv import (
-        _INFERENCE_OPERATORS,
         _cache_states,
         _infer_tmix_projection_spec,
         _load_flash_rwkv2,
@@ -154,8 +154,20 @@ class Rwkv7ConfigurationTest(unittest.TestCase):
             __file__="fake/flashrwkv2/__init__.py",
         )
         with (
-            mock.patch("transformers.models.rwkv.modeling_rwkv.importlib.import_module", return_value=module),
+            mock.patch("transformers.integrations.flash_rwkv2.importlib.import_module", return_value=module),
             self.assertRaisesRegex(RuntimeError, missing),
+        ):
+            _load_flash_rwkv2("inference")
+
+    def test_flashrwkv2_contract_fails_closed_on_version_drift(self):
+        module = types.SimpleNamespace(
+            **{name: (lambda: None) for name in _INFERENCE_OPERATORS},
+            __version__="0.1.0a7",
+            __file__="fake/flashrwkv2/__init__.py",
+        )
+        with (
+            mock.patch("transformers.integrations.flash_rwkv2.importlib.import_module", return_value=module),
+            self.assertRaisesRegex(RuntimeError, "requires FlashRWKV2==0.1.0a8"),
         ):
             _load_flash_rwkv2("inference")
 
@@ -323,6 +335,7 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         cache = RwkvCache(tiny_config())
         self.assertEqual(cache.get_seq_length(), 0)
         self.assertEqual(len(cache.layers), 2)
+        self.assertFalse(cache.is_compileable)
         cache.reorder_cache(torch.tensor([0]))
         cache._rwkv_metadata_key = (1, 1, "cuda", 0)
         cache._rwkv_metadata = object()
@@ -334,9 +347,33 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         model = RwkvForCausalLM(tiny_config())
         input_ids = torch.ones(1, 2, dtype=torch.long)
         inputs_embeds = torch.zeros(1, 2, model.config.hidden_size)
-        prepared = model.prepare_inputs_for_generation(input_ids, inputs_embeds=inputs_embeds)
-        self.assertNotIn("input_ids", prepared)
-        self.assertIs(prepared["inputs_embeds"], inputs_embeds)
+        attention_mask = torch.ones_like(input_ids)
+        prepared = model.prepare_inputs_for_generation(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            is_first_iteration=True,
+            use_cache=True,
+        )
+        self.assertIsNone(prepared["input_ids"])
+        torch.testing.assert_close(prepared["inputs_embeds"], inputs_embeds)
+        self.assertEqual(prepared["attention_mask"].ndim, 2)
+
+    def test_generation_inputs_use_standard_cached_decode_slice(self):
+        model = RwkvForCausalLM(tiny_config())
+        input_ids = torch.arange(4).view(1, 4)
+        cache = RwkvCache(model.config)
+        prepared = model.prepare_inputs_for_generation(
+            input_ids,
+            next_sequence_length=1,
+            past_key_values=cache,
+            attention_mask=torch.ones_like(input_ids),
+            is_first_iteration=False,
+            use_cache=True,
+        )
+        self.assertTrue(torch.equal(prepared["input_ids"], input_ids[:, -1:]))
+        self.assertIs(prepared["past_key_values"], cache)
+        self.assertNotIn("attention_mask", prepared)
 
     def test_cache_state_shape_is_owned_by_each_time_mix_layer(self):
         cache_config = mock.Mock(num_hidden_layers=2, number_of_conv_states=2)
@@ -460,9 +497,9 @@ class Rwkv7ConversionTest(unittest.TestCase):
                 (
                     "from transformers import AutoConfig,AutoModel,AutoModelForCausalLM,AutoTokenizer; "
                     f"p={str(output)!r}; "
-                    "assert type(AutoConfig.from_pretrained(p,trust_remote_code=False)).__name__=='RwkvConfig'; "
-                    "assert type(AutoModel.from_pretrained(p,trust_remote_code=False)).__name__=='RwkvModel'; "
-                    "assert type(AutoModelForCausalLM.from_pretrained(p,trust_remote_code=False)).__name__"
+                    "assert type(AutoConfig.from_pretrained(p)).__name__=='RwkvConfig'; "
+                    "assert type(AutoModel.from_pretrained(p)).__name__=='RwkvModel'; "
+                    "assert type(AutoModelForCausalLM.from_pretrained(p)).__name__"
                     "=='RwkvForCausalLM'"
                 ),
             ]
@@ -513,7 +550,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
                 model_vocab_size=65536,
                 model_max_length=4096,
             )
-            tokenizer = AutoTokenizer.from_pretrained(output, trust_remote_code=False, use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(output, use_fast=True)
             self.assertTrue(tokenizer.is_fast)
             self.assertEqual(len(tokenizer), 65530)
             self.assertEqual((tokenizer.bos_token_id, tokenizer.eos_token_id), (0, 0))
