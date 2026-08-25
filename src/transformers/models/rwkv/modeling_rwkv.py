@@ -281,6 +281,12 @@ class RwkvTrainingState:
 @auto_docstring
 @dataclass
 class RwkvModelOutput(ModelOutput):
+    r"""
+    training_state (`RwkvTrainingState`, *optional*, returned when `training_state` is provided):
+        Recurrent state at the end of the input chunk. It can be passed to the next training forward to continue
+        stateful training.
+    """
+
     last_hidden_state: torch.FloatTensor | None = None
     past_key_values: RwkvCache | None = None
     hidden_states: tuple[torch.FloatTensor, ...] | None = None
@@ -290,6 +296,16 @@ class RwkvModelOutput(ModelOutput):
 @auto_docstring
 @dataclass
 class RwkvCausalLMOutput(ModelOutput):
+    r"""
+    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+        Language modeling loss for next-token prediction.
+    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+        Prediction scores of the language modeling head before SoftMax.
+    training_state (`RwkvTrainingState`, *optional*, returned when `training_state` is provided):
+        Recurrent state at the end of the input chunk. It can be passed to the next training forward to continue
+        stateful training.
+    """
+
     loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor | None = None
     past_key_values: RwkvCache | None = None
@@ -1154,6 +1170,11 @@ class RwkvModel(RwkvPreTrainedModel):
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> RwkvModelOutput:
+        r"""
+        training_state (`RwkvTrainingState`, *optional*):
+            Recurrent state returned by a previous training forward, used to continue stateful training across input
+            chunks. This argument is not valid during inference.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of `input_ids` or `inputs_embeds`.")
         if past_key_values is not None and not isinstance(past_key_values, RwkvCache):
@@ -1320,6 +1341,11 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> RwkvCausalLMOutput:
+        r"""
+        training_state (`RwkvTrainingState`, *optional*):
+            Recurrent state returned by a previous training forward, used to continue stateful training across input
+            chunks. This argument is not valid during inference.
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
