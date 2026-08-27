@@ -36,12 +36,29 @@ The current canonical contract uses:
 - FP32 recurrent WKV state;
 - one active unmerged vanilla LoRA adapter on the TimeMix `receptance`, `key`, `value`, and `output` projections;
   multiple adapters, LoRA variants, LoRA bias, and per-sample mixed-adapter batches must be merged first;
-- equal-length batches for the initial inference integration.
+- equal-length batches for training and inference. An attention mask may be omitted or may be a two-dimensional,
+  batch-matched, all-ones tensor whose length covers the current input. Padding and ragged batches fail immediately;
+  bucket inputs by length instead.
+
+### Support boundaries
+
+| Area | Supported | Not supported |
+|---|---|---|
+| Training | BF16 CUDA pretraining, stateful training, gradient checkpointing | CPU or FLA fallback |
+| Inference | Equal-length batches, recurrent continuation, greedy and beam generation, CUDA Graph | Padding, ragged or continuous batching |
+| Framework integration | Dynamic `RwkvCache`, standard generation entry points, supported vanilla LoRA | `StaticCache`, Transformers tensor-parallel plans, compiled generation, `torch.export` |
+
+CUDA Graph support does not imply that `torch.compile`, compiled generation, or `torch.export` is supported. RWKV has
+no Transformers tensor-parallel plan: FlashRWKV2's fused operators consume complete weight matrices, so Transformers
+does not expose a framework-side pseudo-sharding plan. A missing or incompatible FlashRWKV2 installation, a missing
+operator, or an input outside these boundaries raises an error instead of selecting another implementation.
 
 ## Usage
 
-Install this checkout with its RWKV extra. This installs the pinned `FlashRWKV2==0.1.0a8` distribution;
-the pinned native `tokenizers-rwkv` dependency is installed automatically:
+Every installation method installs the native tokenizer fork from the fixed Git commit
+`rwkv-rs/tokenizers-rwkv@c5d8dde5ff49c70e4656199d5033a84e03c21b2b`. The standard `AutoTokenizer` path and
+checkpoint converter require its `tokenizers.models.RwkvTrie`; there is no fallback tokenizer. Installing this checkout
+with the RWKV extra additionally installs `FlashRWKV2==0.1.0a8`--the extra does not control the tokenizer dependency:
 
 ```bash
 TORCH_CUDA_ARCH_LIST=12.0 uv pip install --pre -e ".[rwkv]"
@@ -57,6 +74,20 @@ model = AutoModelForCausalLM.from_pretrained(model_id).cuda().eval().prepare_for
 
 inputs = tokenizer("RWKV-7", return_tensors="pt").to(model.device)
 outputs = model.generate(**inputs, max_new_tokens=32)
+```
+
+`prepare_for_inference()` is an in-place conversion, not a temporary execution mode. Call it after loading or changing
+weights and after attaching adapters. It changes parameter dtypes and device placement, creates non-persistent
+transposed runtime weights, and moves the serializable ChannelMix down-projection weights to CPU so a second full GPU
+copy is not retained. Repeating the call is safe. Saving still serializes the canonical weights, and loading the saved
+checkpoint starts without runtime layouts.
+
+Calling `train()` directly on a prepared model raises an error before executing a training operator. To resume training,
+move the complete model back to CUDA BF16 first; `_apply()` then discards all inference-only runtime layouts and restores
+the offloaded canonical weights to CUDA:
+
+```python
+model = model.to(device="cuda", dtype=torch.bfloat16).train()
 ```
 
 For chat generation, render the prompt and resolve its matching stop string from the same messages and tools. Pass the

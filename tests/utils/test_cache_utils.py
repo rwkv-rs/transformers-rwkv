@@ -153,6 +153,33 @@ class CacheTest(unittest.TestCase):
         # before the fix this raised `AttributeError`. It reflects the attention layer's state.
         self.assertTrue(cache.is_initialized)
 
+    def test_linear_attention_cache_batch_operations(self):
+        layer = LinearAttentionLayer(number_of_states=2)
+        conv_state = torch.arange(12, device=torch_device).view(2, 3, 2)
+        recurrent_state = torch.arange(16, device=torch_device).view(2, 2, 2, 2)
+        layer.lazy_initialization(conv_states=conv_state, state_idx=0)
+        layer.lazy_initialization(recurrent_states=recurrent_state, state_idx=1)
+        layer.conv_states[0].copy_(conv_state)
+        layer.recurrent_states[1].copy_(recurrent_state)
+        cache = Cache(layers=[layer])
+
+        self.assertEqual(cache.batch_size, 2)
+        cache.batch_repeat_interleave(2)
+        self.assertEqual(cache.batch_size, 4)
+        torch.testing.assert_close(layer.conv_states[0], conv_state.repeat_interleave(2, dim=0))
+        torch.testing.assert_close(layer.recurrent_states[1], recurrent_state.repeat_interleave(2, dim=0))
+
+        selected = torch.tensor([3, 0], device=torch_device)
+        cache.batch_select_indices(selected)
+        self.assertEqual(cache.batch_size, 2)
+        torch.testing.assert_close(layer.conv_states[0], conv_state[[1, 0]])
+        torch.testing.assert_close(layer.recurrent_states[1], recurrent_state[[1, 0]])
+
+        cache.reorder_cache(torch.tensor([1, 1, 0], device=torch_device))
+        self.assertEqual(cache.batch_size, 3)
+        torch.testing.assert_close(layer.conv_states[0], conv_state[[0, 0, 1]])
+        torch.testing.assert_close(layer.recurrent_states[1], recurrent_state[[0, 0, 1]])
+
     def test_max_cache_len_ignores_linear_attention_layers(self):
         """`max_cache_len` must skip linear attention layers (which have no such attribute), else the static-cache
         reuse check in `_prepare_static_cache` raises `AttributeError` on a hybrid model."""

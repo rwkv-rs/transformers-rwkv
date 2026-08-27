@@ -22,9 +22,10 @@ import torch
 from torch import nn
 
 from ... import initialization as init
-from ...cache_utils import Cache, CacheLayerMixin, LinearAttentionLayer
+from ...cache_utils import Cache, LinearAttentionLayer
 from ...generation import GenerationMixin
 from ...integrations.flash_rwkv2 import load_flash_rwkv2 as _load_flash_rwkv2
+from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import ModelOutput, TransformersKwargs, auto_docstring, can_return_tuple
@@ -34,6 +35,30 @@ from .configuration_rwkv import RwkvConfig
 
 
 _STATEFUL_BOUNDARY_CHUNK_LEN = 16
+
+
+def _validate_rwkv_attention_mask(attention_mask: torch.Tensor | None, hidden_states: torch.Tensor) -> None:
+    """Reject padding and ragged batches before they reach a FlashRWKV2 provider."""
+    if attention_mask is None:
+        return
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            f"RWKV-7 attention masks must be two-dimensional [batch, sequence], got {attention_mask.ndim} dimensions."
+        )
+    if attention_mask.shape[0] != hidden_states.shape[0]:
+        raise ValueError(
+            "RWKV-7 attention-mask batch size must match the input batch size, got "
+            f"{attention_mask.shape[0]} and {hidden_states.shape[0]}."
+        )
+    if attention_mask.shape[1] < hidden_states.shape[1]:
+        raise ValueError(
+            "RWKV-7 attention masks cannot be shorter than the current input, got "
+            f"{attention_mask.shape[1]} and {hidden_states.shape[1]}."
+        )
+    if not torch.all(attention_mask == 1):
+        raise ValueError(
+            "RWKV-7 does not support padding or ragged batches; use an all-ones mask and bucket inputs by length."
+        )
 
 
 def _stateful_training_metadata(
@@ -313,19 +338,15 @@ class RwkvCausalLMOutput(ModelOutput):
     training_state: RwkvTrainingState | None = None
 
 
-class RwkvDynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
+class RwkvDynamicCacheLayer(LinearAttentionLayer):
     """Linear-attention cache layer with RWKV's two shift states and sequence offset."""
 
     is_compileable = False
     is_sliding = False
 
     def __init__(self, number_of_states: int = 2):
-        CacheLayerMixin.__init__(self)
-        LinearAttentionLayer.__init__(self, number_of_states=number_of_states)
+        super().__init__(number_of_states=number_of_states)
         self.cumulative_length = 0
-
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
-        raise RuntimeError("RWKV-7 updates shift and recurrent states through their dedicated cache methods.")
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
         return query_length, 0
@@ -333,35 +354,10 @@ class RwkvDynamicCacheLayer(LinearAttentionLayer, CacheLayerMixin):
     def get_seq_length(self) -> int:
         return self.cumulative_length
 
-    @property
-    def batch_size(self) -> int:
-        for state_idx in range(self.number_of_states):
-            if self.is_conv_states_initialized[state_idx]:
-                return self.conv_states[state_idx].shape[0]
-            if self.is_recurrent_states_initialized[state_idx]:
-                return self.recurrent_states[state_idx].shape[0]
-        return -1
-
     def mark_updated(self, sequence_length: int) -> None:
         self.cumulative_length += sequence_length
         self.has_previous_state[0] = True
         self.has_previous_state[1] = True
-
-    def batch_repeat_interleave(self, repeats: int) -> None:
-        for state_idx in range(self.number_of_states):
-            if self.is_conv_states_initialized[state_idx]:
-                self.conv_states[state_idx] = self.conv_states[state_idx].repeat_interleave(repeats, dim=0)
-            if self.is_recurrent_states_initialized[state_idx]:
-                self.recurrent_states[state_idx] = self.recurrent_states[state_idx].repeat_interleave(repeats, dim=0)
-
-    def batch_select_indices(self, indices: torch.Tensor) -> None:
-        for state_idx in range(self.number_of_states):
-            if self.is_conv_states_initialized[state_idx]:
-                self.conv_states[state_idx] = self.conv_states[state_idx].index_select(0, indices.to(self.device))
-            if self.is_recurrent_states_initialized[state_idx]:
-                self.recurrent_states[state_idx] = self.recurrent_states[state_idx].index_select(
-                    0, indices.to(self.device)
-                )
 
     def reset(self) -> None:
         super().reset()
@@ -377,6 +373,22 @@ class RwkvCache(Cache):
         )
         self._rwkv_metadata_key = None
         self._rwkv_metadata = None
+
+    def _clear_recurrent_metadata(self) -> None:
+        self._rwkv_metadata_key = None
+        self._rwkv_metadata = None
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        """Return the logical recurrent offset tracked by an RWKV layer."""
+        if layer_idx >= len(self.layers):
+            return 0
+        return self.layers[layer_idx].get_seq_length()
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
+        """Return RWKV's query-only mask size; recurrent history has no key/value axis."""
+        if layer_idx >= len(self.layers):
+            return query_length, 0
+        return self.layers[layer_idx].get_mask_sizes(query_length)
 
     def recurrent_metadata(self, flashrwkv2, batch_size: int, sequence_length: int, device: torch.device):
         stream = torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else None
@@ -401,11 +413,22 @@ class RwkvCache(Cache):
             self._rwkv_metadata = (cu_seqlens, state_indices, ticket)
         return self._rwkv_metadata
 
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        super().reorder_cache(beam_idx)
+        self._clear_recurrent_metadata()
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        super().batch_repeat_interleave(repeats)
+        self._clear_recurrent_metadata()
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        super().batch_select_indices(indices)
+        self._clear_recurrent_metadata()
+
     def reset(self) -> None:
         """Reset recurrent states and discard the stream-bound FlashRWKV2 metadata ticket."""
         super().reset()
-        self._rwkv_metadata_key = None
-        self._rwkv_metadata = None
+        self._clear_recurrent_metadata()
 
 
 def _cache_states(
@@ -871,8 +894,7 @@ class RwkvTimeMix(nn.Module):
         training_shift_state: torch.Tensor | None = None,
         training_wkv_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
-        if attention_mask is not None and not torch.all(attention_mask == 1):
-            raise ValueError("RWKV-7 training and the initial equal-length inference path require an all-ones mask.")
+        _validate_rwkv_attention_mask(attention_mask, hidden_states)
         if self.training:
             if past_key_values is not None:
                 raise ValueError("Canonical train_temp pretraining does not accept recurrent inference state.")
@@ -940,8 +962,7 @@ class RwkvChannelMix(nn.Module):
         attention_mask: torch.Tensor | None = None,
         training_shift_state: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if attention_mask is not None and not torch.all(attention_mask == 1):
-            raise ValueError("RWKV-7 ChannelMix currently requires an all-ones mask.")
+        _validate_rwkv_attention_mask(attention_mask, hidden_states)
         if self.training:
             if training_shift_state is not None:
                 if hidden_states.dtype != torch.bfloat16:
@@ -1009,7 +1030,7 @@ class RwkvChannelMix(nn.Module):
         return summed.view_as(hidden_states), output.view_as(hidden_states)
 
 
-class RwkvBlock(nn.Module):
+class RwkvBlock(GradientCheckpointingLayer):
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1025,9 +1046,9 @@ class RwkvBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         v_first: torch.Tensor | None,
-        past_key_values: RwkvCache | None,
-        attention_mask: torch.Tensor | None,
         training_state: RwkvTrainingState | None = None,
+        past_key_values: RwkvCache | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         hidden_states = self.hidden_state_boundary(hidden_states)
         if not self.training:
@@ -1097,7 +1118,7 @@ class RwkvPreTrainedModel(PreTrainedModel):
             capture_initial_hidden_state=False,
         )
     }
-    supports_gradient_checkpointing = False
+    supports_gradient_checkpointing = True
 
     # trf-ignore: TRF018
     def _init_weights(self, module):
@@ -1147,7 +1168,7 @@ class RwkvModel(RwkvPreTrainedModel):
         return RwkvCache(self.config)
 
     def prepare_for_inference(self):
-        """Convert weights to Albatross's mixed BF16-embedding/FP16-runtime layout."""
+        """Convert weights in-place to Albatross's mixed BF16-embedding/FP16-runtime layout."""
         self.to(dtype=torch.float16)
         self.emb.to(dtype=torch.bfloat16)
         if not self.config.embedding_layer_norm_fused:
@@ -1179,12 +1200,16 @@ class RwkvModel(RwkvPreTrainedModel):
             raise ValueError("Specify exactly one of `input_ids` or `inputs_embeds`.")
         if past_key_values is not None and not isinstance(past_key_values, RwkvCache):
             raise TypeError(f"RWKV-7 requires `RwkvCache`, got {type(past_key_values).__name__}.")
-        if attention_mask is not None and not torch.all(attention_mask == 1):
-            raise ValueError("RWKV-7 training and the initial equal-length inference path require an all-ones mask.")
-
         if inputs_embeds is None:
             inputs_embeds = self.emb(input_ids)
+        _validate_rwkv_attention_mask(attention_mask, inputs_embeds)
         if self.training:
+            if any(block.ffn._value_runtime is not None for block in self.blocks):
+                raise RuntimeError(
+                    "RWKV-7 is still using the in-place Albatross inference layout. To resume training, move the "
+                    "complete model to CUDA bfloat16 with `model.to(device='cuda', dtype=torch.bfloat16)`, then call "
+                    "`model.train()` before the next forward."
+                )
             if past_key_values is not None:
                 raise ValueError("Canonical RWKV-7 pretraining does not accept recurrent inference state.")
             if training_state is not None:
@@ -1227,9 +1252,9 @@ class RwkvModel(RwkvPreTrainedModel):
                 block_result = block(
                     hidden_states,
                     v_first,
-                    cache,
-                    attention_mask,
                     training_state,
+                    past_key_values=cache,
+                    attention_mask=attention_mask,
                 )
                 if training_state is None:
                     hidden_states, v_first = block_result
@@ -1323,7 +1348,7 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **kwargs,
         )
-        if use_cache and not is_first_iteration:
+        if model_inputs.get("use_cache") and not is_first_iteration:
             model_inputs.pop("attention_mask", None)
         return model_inputs
 

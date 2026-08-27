@@ -31,6 +31,7 @@ from transformers import (
     RwkvConfig,
 )
 from transformers.dependency_versions_table import deps
+from transformers.generation import GenerationMixin
 from transformers.testing_utils import require_peft, require_torch, require_torch_gpu
 
 
@@ -44,6 +45,7 @@ if importlib.util.find_spec("torch") is not None:
         _infer_tmix_projection_spec,
         _load_flash_rwkv2,
         _stateful_training_metadata,
+        _validate_rwkv_attention_mask,
     )
 
 
@@ -300,14 +302,36 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no product fallback"):
             model(torch.ones(1, 16, dtype=torch.long), use_cache=False)
 
-    def test_nontrivial_attention_mask_still_fails_closed(self):
+    def test_attention_mask_contract(self):
+        hidden_states = torch.zeros(2, 3, 8)
+        _validate_rwkv_attention_mask(None, hidden_states)
+        _validate_rwkv_attention_mask(torch.ones(2, 3), hidden_states)
+        _validate_rwkv_attention_mask(torch.ones(2, 5), hidden_states)
+        with self.assertRaisesRegex(ValueError, "two-dimensional"):
+            _validate_rwkv_attention_mask(torch.ones(2, 3, 1), hidden_states)
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            _validate_rwkv_attention_mask(torch.ones(1, 3), hidden_states)
+        with self.assertRaisesRegex(ValueError, "shorter than the current input"):
+            _validate_rwkv_attention_mask(torch.ones(2, 2), hidden_states)
+        with self.assertRaisesRegex(ValueError, "padding or ragged batches"):
+            _validate_rwkv_attention_mask(torch.tensor([[1, 1, 1], [1, 0, 0]]), hidden_states)
+
+    def test_model_rejects_padding_before_loading_the_provider(self):
         model = RwkvForCausalLM(tiny_config()).eval()
-        with self.assertRaisesRegex(ValueError, "all-ones mask"):
+        with self.assertRaisesRegex(ValueError, "bucket inputs by length"):
             model(
                 torch.ones(1, 2, dtype=torch.long),
                 attention_mask=torch.tensor([[1, 0]]),
                 use_cache=False,
             )
+
+    def test_time_mix_and_channel_mix_share_attention_mask_validation(self):
+        block = RwkvForCausalLM(tiny_config()).model.blocks[0]
+        hidden_states = torch.zeros(1, 2, block.att.config.hidden_size)
+        invalid_mask = torch.ones(1, 2, 1)
+        for layer in (block.att, block.ffn):
+            with self.subTest(layer=type(layer).__name__), self.assertRaisesRegex(ValueError, "two-dimensional"):
+                layer(hidden_states, attention_mask=invalid_mask)
 
     def test_explicit_low_rank_dimensions_control_parameter_shapes(self):
         model = RwkvForCausalLM(
@@ -334,14 +358,34 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
     def test_rwkv_cache_uses_standard_cache_interface(self):
         cache = RwkvCache(tiny_config())
         self.assertEqual(cache.get_seq_length(), 0)
+        self.assertEqual(cache.get_mask_sizes(3), (3, 0))
         self.assertEqual(len(cache.layers), 2)
         self.assertFalse(cache.is_compileable)
-        cache.reorder_cache(torch.tensor([0]))
-        cache._rwkv_metadata_key = (1, 1, "cuda", 0)
+        hidden_states = torch.zeros(2, 3, 128)
+        _, wkv_state, _ = _cache_states(cache, 0, hidden_states, tiny_config())
+        cache.layers[0].mark_updated(3)
+        self.assertEqual(cache.get_seq_length(), 3)
+        self.assertEqual(wkv_state.dtype, torch.float32)
+
+        for operation in (
+            lambda: cache.reorder_cache(torch.tensor([1, 0])),
+            lambda: cache.batch_repeat_interleave(2),
+            lambda: cache.batch_select_indices(torch.tensor([3, 0])),
+        ):
+            cache._rwkv_metadata_key = (2, 3, "cuda", 0)
+            cache._rwkv_metadata = object()
+            operation()
+            self.assertIsNone(cache._rwkv_metadata_key)
+            self.assertIsNone(cache._rwkv_metadata)
+        self.assertEqual(cache.batch_size, 2)
+
+        cache._rwkv_metadata_key = (2, 3, "cuda", 0)
         cache._rwkv_metadata = object()
         cache.reset()
+        self.assertEqual(cache.get_seq_length(), 0)
         self.assertIsNone(cache._rwkv_metadata_key)
         self.assertIsNone(cache._rwkv_metadata)
+        self.assertTrue(torch.count_nonzero(cache.layers[0].recurrent_states[0]) == 0)
 
     def test_generation_inputs_support_first_step_inputs_embeds(self):
         model = RwkvForCausalLM(tiny_config())
@@ -374,6 +418,36 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         self.assertTrue(torch.equal(prepared["input_ids"], input_ids[:, -1:]))
         self.assertIs(prepared["past_key_values"], cache)
         self.assertNotIn("attention_mask", prepared)
+
+    def test_generation_inputs_use_resolved_config_cache_setting(self):
+        model = RwkvForCausalLM(tiny_config(use_cache=True))
+        input_ids = torch.arange(4).view(1, 4)
+        cache = RwkvCache(model.config)
+        resolved = {
+            "input_ids": input_ids[:, -1:],
+            "past_key_values": cache,
+            "attention_mask": torch.ones_like(input_ids),
+            "use_cache": True,
+        }
+        with mock.patch.object(GenerationMixin, "prepare_inputs_for_generation", return_value=resolved):
+            prepared = model.prepare_inputs_for_generation(
+                input_ids,
+                next_sequence_length=1,
+                past_key_values=cache,
+                attention_mask=torch.ones_like(input_ids),
+                is_first_iteration=False,
+                use_cache=False,
+            )
+        self.assertTrue(prepared["use_cache"])
+        self.assertNotIn("attention_mask", prepared)
+
+    def test_declares_standard_gradient_checkpointing_support(self):
+        model = RwkvForCausalLM(tiny_config())
+        model.gradient_checkpointing_enable()
+        self.assertTrue(model.supports_gradient_checkpointing)
+        self.assertFalse(model.supports_tp_plan)
+        self.assertFalse(model._can_compile_fullgraph)
+        self.assertTrue(all(block.gradient_checkpointing for block in model.model.blocks))
 
     def test_cache_state_shape_is_owned_by_each_time_mix_layer(self):
         cache_config = mock.Mock(num_hidden_layers=2, number_of_conv_states=2)
@@ -658,6 +732,61 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         self.assertIsNotNone(model.model.blocks[0].att.receptance.weight.grad)
         self.assertTrue(torch.isfinite(model.model.blocks[0].att.receptance.weight.grad).all())
 
+    def test_gradient_checkpointing_matches_stateless_and_stateful_training(self):
+        config = tiny_config()
+        model = RwkvForCausalLM(config).cuda().to(torch.bfloat16).train()
+        with torch.no_grad():
+            for block in model.model.blocks:
+                block.att.output.weight.normal_(std=0.01)
+                block.ffn.value.weight.normal_(std=0.01)
+        input_ids = torch.randint(0, config.vocab_size, (1, 16), device="cuda")
+        gradient_names = (
+            "model.blocks.0.att.receptance.weight",
+            "model.blocks.0.att.output.weight",
+            "head.weight",
+        )
+
+        def run(*, checkpointing: bool, stateful: bool):
+            if checkpointing:
+                model.gradient_checkpointing_enable()
+            else:
+                model.gradient_checkpointing_disable()
+            model.zero_grad(set_to_none=True)
+            training_state = (
+                RwkvTrainingState.zeros(config, 1, device="cuda", dtype=torch.bfloat16) if stateful else None
+            )
+            outputs = model(
+                input_ids,
+                labels=input_ids,
+                training_state=training_state,
+                use_cache=False,
+            )
+            logits = outputs.logits.detach().clone()
+            loss = outputs.loss.detach().clone()
+            final_state = None
+            if outputs.training_state is not None:
+                final_state = tuple(tensor.detach().clone() for tensor in outputs.training_state.tensors())
+            outputs.loss.backward()
+            parameters = dict(model.named_parameters())
+            gradients = {name: parameters[name].grad.detach().clone() for name in gradient_names}
+            return logits, loss, final_state, gradients
+
+        for stateful in (False, True):
+            with self.subTest(stateful=stateful):
+                expected_logits, expected_loss, expected_state, expected_gradients = run(
+                    checkpointing=False, stateful=stateful
+                )
+                actual_logits, actual_loss, actual_state, actual_gradients = run(checkpointing=True, stateful=stateful)
+                torch.testing.assert_close(actual_logits, expected_logits, atol=0, rtol=0)
+                torch.testing.assert_close(actual_loss, expected_loss, atol=0, rtol=0)
+                if expected_state is None:
+                    self.assertIsNone(actual_state)
+                else:
+                    for actual, expected in zip(actual_state, expected_state, strict=True):
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                for name in gradient_names:
+                    torch.testing.assert_close(actual_gradients[name], expected_gradients[name], atol=0, rtol=0)
+
     def test_inference_preparation_offloads_only_canonical_ffn_down_layout(self):
         model = RwkvForCausalLM(tiny_config(hidden_size=1024, intermediate_size=4096)).cuda().eval()
         expected = model.model.blocks[0].ffn.value.weight.detach().cpu().half().clone()
@@ -682,6 +811,20 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
             model.save_pretrained(directory)
             reloaded = RwkvForCausalLM.from_pretrained(directory, dtype=torch.float16)
         torch.testing.assert_close(reloaded.model.blocks[0].ffn.value.weight, expected, atol=0, rtol=0)
+        self.assertIsNone(reloaded.model.blocks[0].ffn._value_runtime)
+
+        model.train()
+        input_ids = torch.randint(0, model.config.vocab_size, (1, 16), device="cuda")
+        with self.assertRaisesRegex(RuntimeError, "in-place Albatross inference layout"):
+            model(input_ids, labels=input_ids, use_cache=False)
+        model.to(device="cuda", dtype=torch.bfloat16).train()
+        self.assertTrue(all(block.ffn._value_runtime is None for block in model.model.blocks))
+        self.assertTrue(all(block.att._w1_original is None for block in model.model.blocks))
+        self.assertTrue(all(block.ffn.value.weight.is_cuda for block in model.model.blocks))
+        outputs = model(input_ids, labels=input_ids, use_cache=False)
+        outputs.loss.backward()
+        self.assertIsNotNone(model.model.blocks[0].ffn.value.weight.grad)
+        self.assertTrue(torch.isfinite(model.model.blocks[0].ffn.value.weight.grad).all())
 
     def test_recurrent_metadata_is_scoped_to_cuda_stream(self):
         class FakeFlashRwkv2:
@@ -819,6 +962,19 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         input_ids = torch.randint(1, config.vocab_size, (1, 3), device="cuda")
         with torch.no_grad():
             generated = model.generate(input_ids, max_new_tokens=2, do_sample=False)
+        self.assertEqual(generated.shape, (1, 5))
+
+    def test_beam_generation(self):
+        config = tiny_config(
+            hidden_size=1024,
+            intermediate_size=4096,
+            eos_token_id=None,
+            pad_token_id=0,
+        )
+        model = RwkvForCausalLM(config).cuda().eval().prepare_for_inference()
+        input_ids = torch.randint(1, config.vocab_size, (1, 3), device="cuda")
+        with torch.no_grad():
+            generated = model.generate(input_ids, max_new_tokens=2, num_beams=2, do_sample=False)
         self.assertEqual(generated.shape, (1, 5))
 
     def test_small_unsupported_inference_shape_fails_closed(self):
