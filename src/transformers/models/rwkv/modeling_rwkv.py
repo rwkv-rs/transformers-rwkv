@@ -91,7 +91,7 @@ def _stateful_training_metadata(
     return sequence_chunk_offsets, chunk_token_starts, chunk_token_ends
 
 
-def _infer_tmix_projection_spec(
+def _infer_linear_attention_projection_spec(
     projection: nn.Module,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, float]:
     """Resolve one bias-free Linear and an optional active vanilla LoRA adapter."""
@@ -121,7 +121,8 @@ def _infer_tmix_projection_spec(
     missing = [name for name in required if not hasattr(projection, name)]
     if missing:
         raise RuntimeError(
-            "RWKV-7 FlashRWKV2 inference only supports vanilla PEFT LoRA wrappers around TimeMix projections; "
+            "RWKV-7 FlashRWKV2 inference only supports vanilla PEFT LoRA wrappers around linear-attention "
+            "projections; "
             f"{type(projection).__name__} is missing {missing}."
         )
     if getattr(projection, "fan_in_fan_out", False):
@@ -187,9 +188,9 @@ class RwkvTrainingState:
     WKV accumulation is always FP32.
     """
 
-    time_mix_shift: torch.Tensor
-    wkv: torch.Tensor
-    channel_mix_shift: torch.Tensor
+    attention_shift: torch.Tensor
+    recurrent_state: torch.Tensor
+    mlp_shift: torch.Tensor
 
     @classmethod
     def zeros(
@@ -213,9 +214,9 @@ class RwkvTrainingState:
             config.head_size,
         )
         return cls(
-            time_mix_shift=torch.zeros(shift_shape, device=device, dtype=dtype),
-            wkv=torch.zeros(wkv_shape, device=device, dtype=torch.float32),
-            channel_mix_shift=torch.zeros(shift_shape, device=device, dtype=dtype),
+            attention_shift=torch.zeros(shift_shape, device=device, dtype=dtype),
+            recurrent_state=torch.zeros(wkv_shape, device=device, dtype=torch.float32),
+            mlp_shift=torch.zeros(shift_shape, device=device, dtype=dtype),
         )
 
     def validate(
@@ -236,9 +237,9 @@ class RwkvTrainingState:
             config.head_size,
         )
         fields = (
-            ("time_mix_shift", self.time_mix_shift, expected_shift_shape, dtype),
-            ("wkv", self.wkv, expected_wkv_shape, torch.float32),
-            ("channel_mix_shift", self.channel_mix_shift, expected_shift_shape, dtype),
+            ("attention_shift", self.attention_shift, expected_shift_shape, dtype),
+            ("recurrent_state", self.recurrent_state, expected_wkv_shape, torch.float32),
+            ("mlp_shift", self.mlp_shift, expected_shift_shape, dtype),
         )
         for name, value, shape, expected_dtype in fields:
             if not isinstance(value, torch.Tensor):
@@ -261,20 +262,20 @@ class RwkvTrainingState:
         return type(self)(*(value.clone().detach() for value in self.tensors()))
 
     def tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.time_mix_shift, self.wkv, self.channel_mix_shift
+        return self.attention_shift, self.recurrent_state, self.mlp_shift
 
     def reset_(
         self,
         batch_indices: torch.Tensor | list[int] | tuple[int, ...] | None = None,
         *,
-        time_mix: bool = True,
-        wkv: bool = True,
-        channel_mix: bool = True,
+        attention: bool = True,
+        recurrent: bool = True,
+        mlp: bool = True,
     ) -> RwkvTrainingState:
         """Zero selected batch rows in place, or all rows when indices are omitted."""
-        if not any((time_mix, wkv, channel_mix)):
+        if not any((attention, recurrent, mlp)):
             return self
-        selected = (time_mix, wkv, channel_mix)
+        selected = (attention, recurrent, mlp)
         with torch.no_grad():
             for enabled, value in zip(selected, self.tensors(), strict=True):
                 if not enabled:
@@ -290,16 +291,16 @@ class RwkvTrainingState:
         self,
         batch_indices: torch.Tensor | list[int] | tuple[int, ...] | None = None,
         *,
-        time_mix: bool = True,
-        wkv: bool = True,
-        channel_mix: bool = True,
+        attention: bool = True,
+        recurrent: bool = True,
+        mlp: bool = True,
     ) -> RwkvTrainingState:
         """Return a clone with selected batch rows reset to zero."""
         return self.clone().reset_(
             batch_indices,
-            time_mix=time_mix,
-            wkv=wkv,
-            channel_mix=channel_mix,
+            attention=attention,
+            recurrent=recurrent,
+            mlp=mlp,
         )
 
 
@@ -484,8 +485,8 @@ class RwkvLMHead(nn.Linear):
         init.orthogonal_(self.weight, gain=gain)
 
 
-class RwkvTimeMix(nn.Module):
-    """Canonical RWKV-7 TimeMix component using FlashRWKV2's public training and inference APIs."""
+class RwkvLinearAttention(nn.Module):
+    """RWKV-7 linear attention using FlashRWKV2's public training and inference APIs."""
 
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
@@ -512,11 +513,11 @@ class RwkvTimeMix(nn.Module):
         self.k_k = nn.Parameter(torch.empty(1, 1, channels))
         self.k_a = nn.Parameter(torch.empty(1, 1, channels))
         self.r_k = nn.Parameter(torch.empty(heads, config.head_size))
-        self.receptance = nn.Linear(channels, channels, bias=False)
-        self.key = nn.Linear(channels, channels, bias=False)
-        self.value = nn.Linear(channels, channels, bias=False)
-        self.output = nn.Linear(channels, channels, bias=False)
-        self.ln_x = nn.GroupNorm(heads, channels, eps=config.group_norm_epsilon)
+        self.r_proj = nn.Linear(channels, channels, bias=False)
+        self.k_proj = nn.Linear(channels, channels, bias=False)
+        self.v_proj = nn.Linear(channels, channels, bias=False)
+        self.o_proj = nn.Linear(channels, channels, bias=False)
+        self.g_norm = nn.GroupNorm(heads, channels, eps=config.group_norm_epsilon)
         for name in ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2"):
             self.register_buffer(f"_{name}_original", None, persistent=False)
         self.register_load_state_dict_post_hook(self._clear_inference_layouts)
@@ -587,25 +588,25 @@ class RwkvTimeMix(nn.Module):
                     else 1
                 )
                 init.orthogonal_(parameter, gain=gain * 0.1)
-            init.orthogonal_(self.receptance.weight, gain=1.0)
-            init.orthogonal_(self.key.weight, gain=0.1)
-            init.orthogonal_(self.value.weight, gain=1.0)
-            init.zeros_(self.output.weight)
+            init.orthogonal_(self.r_proj.weight, gain=1.0)
+            init.orthogonal_(self.k_proj.weight, gain=0.1)
+            init.orthogonal_(self.v_proj.weight, gain=1.0)
+            init.zeros_(self.o_proj.weight)
             layer_scale = (self.layer_idx + 1) / self.config.num_hidden_layers
-            init.constant_(self.ln_x.weight, layer_scale**0.7)
-            init.zeros_(self.ln_x.bias)
+            init.constant_(self.g_norm.weight, layer_scale**0.7)
+            init.zeros_(self.g_norm.bias)
 
     def _training_projections(self, flash, mixed: tuple[torch.Tensor, ...], v_first: torch.Tensor | None):
         xr, xw, xk, xv, xa, xg = mixed
-        receptance = self.receptance(xr)
+        receptance = self.r_proj(xr)
         decay_logits = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
-        key = self.key(xk)
-        value = self.value(xv)
+        key = self.k_proj(xk)
+        value = self.v_proj(xv)
         if self.layer_idx == 0:
             v_first = value
         else:
             if v_first is None:
-                raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
+                raise ValueError("`v_first` must be supplied to RWKV-7 linear-attention layers after layer 0.")
             value = flash.pretrain_tmix_vres_gate_bf16(
                 value.contiguous(),
                 v_first.contiguous(),
@@ -639,11 +640,11 @@ class RwkvTimeMix(nn.Module):
             key,
             value.contiguous(),
             self.r_k.contiguous(),
-            self.ln_x.weight.contiguous(),
-            self.ln_x.bias.contiguous(),
+            self.g_norm.weight.contiguous(),
+            self.g_norm.bias.contiguous(),
             gate,
         )
-        return self.output(output)
+        return self.o_proj(output)
 
     def _training_forward(self, hidden_states: torch.Tensor, v_first: torch.Tensor | None):
         flash = _load_flash_rwkv2("training", hidden_states)
@@ -777,14 +778,16 @@ class RwkvTimeMix(nn.Module):
             eps=layer_norm.eps,
             validated_metadata=ticket,
         )
-        receptance_weight, receptance_lora_a, receptance_lora_b, receptance_lora_scale = _infer_tmix_projection_spec(
-            self.receptance
+        receptance_weight, receptance_lora_a, receptance_lora_b, receptance_lora_scale = (
+            _infer_linear_attention_projection_spec(self.r_proj)
         )
-        key_weight, key_lora_a, key_lora_b, key_lora_scale = _infer_tmix_projection_spec(self.key)
-        value_weight, value_lora_a, value_lora_b, value_lora_scale = _infer_tmix_projection_spec(self.value)
+        key_weight, key_lora_a, key_lora_b, key_lora_scale = _infer_linear_attention_projection_spec(self.k_proj)
+        value_weight, value_lora_a, value_lora_b, value_lora_scale = _infer_linear_attention_projection_spec(
+            self.v_proj
+        )
         w1, w2, a1, a2, v1, v2, g1, g2 = self._inference_low_rank_layouts()
         if self.layer_idx != 0 and v_first is None:
-            raise ValueError("`v_first` must be supplied to RWKV-7 TimeMix layers after layer 0.")
+            raise ValueError("`v_first` must be supplied to RWKV-7 linear-attention layers after layer 0.")
         (
             receptance,
             decay_delta,
@@ -854,15 +857,17 @@ class RwkvTimeMix(nn.Module):
             max_seqlen=sequence_length,
             validated_metadata=ticket,
         ).view(-1, channels)
-        output_weight, output_lora_a, output_lora_b, output_lora_scale = _infer_tmix_projection_spec(self.output)
+        output_weight, output_lora_a, output_lora_b, output_lora_scale = _infer_linear_attention_projection_spec(
+            self.o_proj
+        )
         output = flash.infer_tmix_readout_forward_varlen(
             output,
             receptance,
             key,
             value,
             self.r_k.reshape(-1).contiguous(),
-            self.ln_x.weight.contiguous(),
-            self.ln_x.bias.contiguous(),
+            self.g_norm.weight.contiguous(),
+            self.g_norm.bias.contiguous(),
             gate,
             output_weight,
             output_lora_a=output_lora_a,
@@ -910,41 +915,42 @@ class RwkvTimeMix(nn.Module):
                 "RWKV-7 inference requires an RwkvCache, including when the caller discards the final cache."
             )
         raise RuntimeError(
-            "RWKV-7 inference must run TimeMix through its owning block so FlashRWKV2 can fuse residual, "
+            "RWKV-7 inference must run linear attention through its owning decoder layer so FlashRWKV2 can fuse "
+            "residual, "
             "LayerNorm and TokenShift."
         )
 
 
-class RwkvChannelMix(nn.Module):
+class RwkvMLP(nn.Module):
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.x_k = nn.Parameter(torch.empty(1, 1, config.hidden_size))
-        self.key = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.value = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.register_buffer("_value_runtime", None, persistent=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.register_buffer("_down_proj_runtime", None, persistent=False)
         self.register_load_state_dict_post_hook(self._clear_inference_layout)
 
     def _clear_inference_layout(self, *args) -> None:
-        self._value_runtime = None
+        self._down_proj_runtime = None
 
     def _apply(self, fn, recurse=True):
         self._clear_inference_layout()
         return super()._apply(fn, recurse=recurse)
 
     def prepare_for_inference(self) -> None:
-        runtime_device = self.key.weight.device
-        if runtime_device.type != "cuda" or self.key.weight.dtype != torch.float16:
+        runtime_device = self.up_proj.weight.device
+        if runtime_device.type != "cuda" or self.up_proj.weight.dtype != torch.float16:
             raise RuntimeError(
-                "RWKV-7 Albatross ChannelMix layout requires CUDA float16 runtime weights; "
-                f"got dtype={self.key.weight.dtype}, device={runtime_device}."
+                "RWKV-7 Albatross MLP layout requires CUDA float16 runtime weights; "
+                f"got dtype={self.up_proj.weight.dtype}, device={runtime_device}."
             )
-        self._value_runtime = self.value.weight.to(device=runtime_device, dtype=torch.float16).T.contiguous()
+        self._down_proj_runtime = self.down_proj.weight.to(device=runtime_device, dtype=torch.float16).T.contiguous()
         # Albatross replaces the canonical FFN-down layout during inference. Keep the serializable parameter on CPU
         # instead of retaining a second 4 GiB GPU copy for a 7.2B model; the non-persistent runtime layout is the only
         # one consumed after this explicit inference preparation step.
-        self.value.weight.data = self.value.weight.data.cpu()
+        self.down_proj.weight.data = self.down_proj.weight.data.cpu()
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
@@ -952,8 +958,8 @@ class RwkvChannelMix(nn.Module):
             ratio_1_to_almost0 = 1.0 - self.layer_idx / self.config.num_hidden_layers
             ddd = torch.arange(channels, dtype=torch.float32, device=self.x_k.device).view(1, 1, -1) / channels
             init.copy_(self.x_k, 1.0 - ddd.pow(ratio_1_to_almost0**4))
-            init.orthogonal_(self.key.weight, gain=1.0)
-            init.zeros_(self.value.weight)
+            init.orthogonal_(self.up_proj.weight, gain=1.0)
+            init.zeros_(self.down_proj.weight)
 
     def forward(
         self,
@@ -967,27 +973,27 @@ class RwkvChannelMix(nn.Module):
             if training_shift_state is not None:
                 if hidden_states.dtype != torch.bfloat16:
                     raise RuntimeError(
-                        f"RWKV-7 stateful ChannelMix requires bfloat16 activations; got {hidden_states.dtype}."
+                        f"RWKV-7 stateful MLP requires bfloat16 activations; got {hidden_states.dtype}."
                     )
                 flash = _load_flash_rwkv2("stateful training", hidden_states)
                 return flash.statetune_cmix_bf16(
                     hidden_states.contiguous(),
                     training_shift_state.contiguous(),
                     self.x_k.reshape(-1).contiguous(),
-                    self.key.weight.contiguous(),
-                    self.value.weight.contiguous(),
+                    self.up_proj.weight.contiguous(),
+                    self.down_proj.weight.contiguous(),
                 )
             flash = _load_flash_rwkv2("training", hidden_states)
             return flash.pretrain_cmix_bf16(
                 hidden_states.contiguous(),
                 self.x_k.reshape(-1).contiguous(),
-                self.key.weight.contiguous(),
-                self.value.weight.contiguous(),
+                self.up_proj.weight.contiguous(),
+                self.down_proj.weight.contiguous(),
             )
         if past_key_values is None:
             raise ValueError("RWKV-7 inference requires an RwkvCache.")
         raise RuntimeError(
-            "RWKV-7 inference must run ChannelMix through its owning block so FlashRWKV2 can fuse residual, "
+            "RWKV-7 inference must run the MLP through its owning decoder layer so FlashRWKV2 can fuse residual, "
             "LayerNorm, TokenShift and the complete FFN."
         )
 
@@ -998,11 +1004,11 @@ class RwkvChannelMix(nn.Module):
         layer_norm: nn.LayerNorm,
         past_key_values: RwkvCache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the complete FlashRWKV2 ChannelMix inference island."""
+        """Run the complete FlashRWKV2 MLP inference island."""
         flash = _load_flash_rwkv2("inference", hidden_states)
-        if self._value_runtime is None:
+        if self._down_proj_runtime is None:
             raise RuntimeError(
-                "RWKV-7 Albatross ChannelMix layout is not prepared; call `model.prepare_for_inference()` "
+                "RWKV-7 Albatross MLP layout is not prepared; call `model.prepare_for_inference()` "
                 "after loading or modifying weights."
             )
         batch_size, sequence_length, channels = hidden_states.shape
@@ -1017,8 +1023,8 @@ class RwkvChannelMix(nn.Module):
             layer_norm.weight.contiguous(),
             layer_norm.bias.contiguous(),
             self.x_k.reshape(-1).contiguous(),
-            self.key.weight.contiguous(),
-            self._value_runtime,
+            self.up_proj.weight.contiguous(),
+            self._down_proj_runtime,
             shift_state_pool=ffn_shift,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
@@ -1030,17 +1036,15 @@ class RwkvChannelMix(nn.Module):
         return summed.view_as(hidden_states), output.view_as(hidden_states)
 
 
-class RwkvBlock(GradientCheckpointingLayer):
+class RwkvDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_state_boundary = nn.Identity()
-        if layer_idx == 0:
-            self.ln0 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.ln1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.ln2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.att = RwkvTimeMix(config, layer_idx)
-        self.ffn = RwkvChannelMix(config, layer_idx)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.linear_attn = RwkvLinearAttention(config, layer_idx)
+        self.mlp = RwkvMLP(config, layer_idx)
 
     def forward(
         self,
@@ -1054,25 +1058,25 @@ class RwkvBlock(GradientCheckpointingLayer):
         if not self.training:
             if past_key_values is None:
                 raise ValueError("RWKV-7 inference requires an RwkvCache.")
-            raise RuntimeError("RWKV-7 inference blocks require an explicit residual tensor.")
-        att_result = self.att(
-            self.ln1(hidden_states),
+            raise RuntimeError("RWKV-7 inference decoder layers require an explicit residual tensor.")
+        att_result = self.linear_attn(
+            self.input_layernorm(hidden_states),
             v_first=v_first,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            training_shift_state=None if training_state is None else training_state.time_mix_shift[self.layer_idx],
-            training_wkv_state=None if training_state is None else training_state.wkv[self.layer_idx],
+            training_shift_state=None if training_state is None else training_state.attention_shift[self.layer_idx],
+            training_wkv_state=None if training_state is None else training_state.recurrent_state[self.layer_idx],
         )
         if training_state is None:
             output, v_first = att_result
         else:
             output, v_first, next_att_shift, next_wkv = att_result
         hidden_states = hidden_states + output
-        ffn_result = self.ffn(
-            self.ln2(hidden_states),
+        ffn_result = self.mlp(
+            self.post_attention_layernorm(hidden_states),
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            training_shift_state=None if training_state is None else training_state.channel_mix_shift[self.layer_idx],
+            training_shift_state=None if training_state is None else training_state.mlp_shift[self.layer_idx],
         )
         if training_state is None:
             hidden_states = hidden_states + ffn_result
@@ -1090,25 +1094,25 @@ class RwkvBlock(GradientCheckpointingLayer):
         v_first: torch.Tensor | None,
         past_key_values: RwkvCache,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run one inference block while carrying FlashRWKV2's residual between fusion islands."""
-        block_input, output, v_first = self.att.inference_forward_with_postnorm(
-            hidden_states, residual, self.ln1, v_first, past_key_values
+        """Run one decoder layer while carrying FlashRWKV2's residual between fusion islands."""
+        layer_input, output, v_first = self.linear_attn.inference_forward_with_postnorm(
+            hidden_states, residual, self.input_layernorm, v_first, past_key_values
         )
-        block_input = self.hidden_state_boundary(block_input)
-        hidden_states, residual = self.ffn.inference_forward_with_postnorm(
-            block_input, output, self.ln2, past_key_values
+        layer_input = self.hidden_state_boundary(layer_input)
+        hidden_states, residual = self.mlp.inference_forward_with_postnorm(
+            layer_input, output, self.post_attention_layernorm, past_key_values
         )
         layer = past_key_values.layers[self.layer_idx]
         if isinstance(layer, RwkvDynamicCacheLayer):
             layer.mark_updated(hidden_states.shape[1])
-        return hidden_states, residual, v_first, block_input
+        return hidden_states, residual, v_first, layer_input
 
 
 @auto_docstring
 class RwkvPreTrainedModel(PreTrainedModel):
     config_class = RwkvConfig
     base_model_prefix = "model"
-    _no_split_modules = ["RwkvBlock"]
+    _no_split_modules = ["RwkvDecoderLayer"]
     _is_stateful = True
     _can_compile_fullgraph = False
     _can_record_outputs = {
@@ -1124,7 +1128,7 @@ class RwkvPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         # These owning modules preserve Transformers' per-module loading markers, so from_pretrained never
         # reinitializes a complete model after loading a checkpoint.
-        if isinstance(module, RwkvEmbedding | RwkvLMHead | RwkvTimeMix | RwkvChannelMix):
+        if isinstance(module, RwkvEmbedding | RwkvLMHead | RwkvLinearAttention | RwkvMLP):
             module.reset_parameters()
         elif isinstance(module, nn.LayerNorm):
             module.reset_parameters()
@@ -1138,31 +1142,33 @@ class RwkvModel(RwkvPreTrainedModel):
                 f"RwkvModel only supports `architecture_version='rwkv7'`, got {config.architecture_version!r}."
             )
         super().__init__(config)
-        self.emb = RwkvEmbedding(config.vocab_size, config.hidden_size)
-        self.blocks = nn.ModuleList([RwkvBlock(config, index) for index in range(config.num_hidden_layers)])
-        self.ln_out = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.embed_tokens = RwkvEmbedding(config.vocab_size, config.hidden_size)
+        self.embedding_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.layers = nn.ModuleList([RwkvDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.hidden_state_boundary = nn.Identity()
         self.post_init()
 
     def reset_parameters(self) -> None:
         """Apply the final canonical train_temp initialization in model order."""
         with torch.no_grad():
-            init.uniform_(self.emb.weight, -1e-4, 1e-4)
-            for block in self.blocks:
-                for layer_norm in (getattr(block, "ln0", None), block.ln1, block.ln2):
-                    if layer_norm is not None:
-                        init.ones_(layer_norm.weight)
-                        init.zeros_(layer_norm.bias)
-                block.att.reset_parameters()
-                block.ffn.reset_parameters()
-            init.ones_(self.ln_out.weight)
-            init.zeros_(self.ln_out.bias)
+            init.uniform_(self.embed_tokens.weight, -1e-4, 1e-4)
+            init.ones_(self.embedding_norm.weight)
+            init.zeros_(self.embedding_norm.bias)
+            for layer in self.layers:
+                for layer_norm in (layer.input_layernorm, layer.post_attention_layernorm):
+                    init.ones_(layer_norm.weight)
+                    init.zeros_(layer_norm.bias)
+                layer.linear_attn.reset_parameters()
+                layer.mlp.reset_parameters()
+            init.ones_(self.norm.weight)
+            init.zeros_(self.norm.bias)
 
     def get_input_embeddings(self):
-        return self.emb
+        return self.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.emb = value
+        self.embed_tokens = value
 
     def _new_cache(self) -> RwkvCache:
         return RwkvCache(self.config)
@@ -1170,12 +1176,12 @@ class RwkvModel(RwkvPreTrainedModel):
     def prepare_for_inference(self):
         """Convert weights in-place to Albatross's mixed BF16-embedding/FP16-runtime layout."""
         self.to(dtype=torch.float16)
-        self.emb.to(dtype=torch.bfloat16)
+        self.embed_tokens.to(dtype=torch.bfloat16)
         if not self.config.embedding_layer_norm_fused:
-            self.blocks[0].ln0.to(dtype=torch.bfloat16)
-        for block in self.blocks:
-            block.att.prepare_for_inference()
-            block.ffn.prepare_for_inference()
+            self.embedding_norm.to(dtype=torch.bfloat16)
+        for layer in self.layers:
+            layer.linear_attn.prepare_for_inference()
+            layer.mlp.prepare_for_inference()
         return self
 
     @merge_with_config_defaults
@@ -1201,10 +1207,10 @@ class RwkvModel(RwkvPreTrainedModel):
         if past_key_values is not None and not isinstance(past_key_values, RwkvCache):
             raise TypeError(f"RWKV-7 requires `RwkvCache`, got {type(past_key_values).__name__}.")
         if inputs_embeds is None:
-            inputs_embeds = self.emb(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
         _validate_rwkv_attention_mask(attention_mask, inputs_embeds)
         if self.training:
-            if any(block.ffn._value_runtime is not None for block in self.blocks):
+            if any(layer.mlp._down_proj_runtime is not None for layer in self.layers):
                 raise RuntimeError(
                     "RWKV-7 is still using the in-place Albatross inference layout. To resume training, move the "
                     "complete model to CUDA bfloat16 with `model.to(device='cuda', dtype=torch.bfloat16)`, then call "
@@ -1221,7 +1227,7 @@ class RwkvModel(RwkvPreTrainedModel):
                 )
             hidden_states = inputs_embeds
             if not self.config.embedding_layer_norm_fused:
-                hidden_states = self.blocks[0].ln0(hidden_states)
+                hidden_states = self.embedding_norm(hidden_states)
             cache = None
         else:
             if training_state is not None:
@@ -1238,8 +1244,8 @@ class RwkvModel(RwkvPreTrainedModel):
                 flash = _load_flash_rwkv2("inference", inputs_embeds)
                 hidden_states = flash.infer_embedding_ln0_forward_varlen(
                     inputs_embeds.reshape(-1, self.config.hidden_size).contiguous(),
-                    self.blocks[0].ln0.weight.contiguous(),
-                    self.blocks[0].ln0.bias.contiguous(),
+                    self.embedding_norm.weight.contiguous(),
+                    self.embedding_norm.bias.contiguous(),
                     eps=self.config.layer_norm_epsilon,
                 ).view_as(inputs_embeds)
 
@@ -1248,8 +1254,8 @@ class RwkvModel(RwkvPreTrainedModel):
         next_wkv_states: list[torch.Tensor] = []
         next_ffn_shifts: list[torch.Tensor] = []
         if self.training:
-            for block in self.blocks:
-                block_result = block(
+            for layer in self.layers:
+                layer_result = layer(
                     hidden_states,
                     v_first,
                     training_state,
@@ -1257,26 +1263,26 @@ class RwkvModel(RwkvPreTrainedModel):
                     attention_mask=attention_mask,
                 )
                 if training_state is None:
-                    hidden_states, v_first = block_result
+                    hidden_states, v_first = layer_result
                 else:
-                    hidden_states, v_first, next_att_shift, next_wkv, next_ffn_shift = block_result
+                    hidden_states, v_first, next_att_shift, next_wkv, next_ffn_shift = layer_result
                     next_att_shifts.append(next_att_shift)
                     next_wkv_states.append(next_wkv)
                     next_ffn_shifts.append(next_ffn_shift)
-            hidden_states = self.ln_out(hidden_states)
+            hidden_states = self.norm(hidden_states)
         else:
             flash = _load_flash_rwkv2("inference", hidden_states)
             if cache is None:
                 raise RuntimeError("RWKV-7 inference cache initialization failed.")
             residual = torch.zeros_like(hidden_states)
-            for block in self.blocks:
-                hidden_states, residual, v_first, _ = block.inference_forward(hidden_states, residual, v_first, cache)
+            for layer in self.layers:
+                hidden_states, residual, v_first, _ = layer.inference_forward(hidden_states, residual, v_first, cache)
             batch_size, sequence_length, channels = hidden_states.shape
             hidden_states = flash.infer_post_norm_output_forward_varlen(
                 hidden_states.reshape(-1, channels).contiguous(),
                 residual.reshape(-1, channels).contiguous(),
-                self.ln_out.weight.contiguous(),
-                self.ln_out.bias.contiguous(),
+                self.norm.weight.contiguous(),
+                self.norm.bias.contiguous(),
                 eps=self.config.layer_norm_epsilon,
             ).view(batch_size, sequence_length, channels)
         hidden_states = self.hidden_state_boundary(hidden_states)
@@ -1285,9 +1291,9 @@ class RwkvModel(RwkvPreTrainedModel):
         next_training_state = None
         if training_state is not None:
             next_training_state = RwkvTrainingState(
-                time_mix_shift=torch.stack(next_att_shifts),
-                wkv=torch.stack(next_wkv_states),
-                channel_mix_shift=torch.stack(next_ffn_shifts),
+                attention_shift=torch.stack(next_att_shifts),
+                recurrent_state=torch.stack(next_wkv_states),
+                mlp_shift=torch.stack(next_ffn_shifts),
             )
         return RwkvModelOutput(
             last_hidden_state=hidden_states,
@@ -1303,12 +1309,12 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
     def __init__(self, config: RwkvConfig):
         super().__init__(config)
         self.model = RwkvModel(config)
-        self.head = RwkvLMHead(config)
+        self.lm_head = RwkvLMHead(config)
         self.post_init()
 
-    def reset_head_parameters(self) -> None:
+    def reset_lm_head_parameters(self) -> None:
         """Apply train_temp's vocabulary-dependent LM-head initialization."""
-        self.head.reset_parameters()
+        self.lm_head.reset_parameters()
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -1317,14 +1323,14 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
         self.model.set_input_embeddings(value)
 
     def get_output_embeddings(self):
-        return self.head
+        return self.lm_head
 
     def set_output_embeddings(self, value):
-        self.head = value
+        self.lm_head = value
 
     def prepare_for_inference(self):
         self.model.prepare_for_inference()
-        self.head.to(dtype=torch.float16)
+        self.lm_head.to(dtype=torch.float16)
         return self
 
     def prepare_inputs_for_generation(
@@ -1391,20 +1397,20 @@ class RwkvForCausalLM(RwkvPreTrainedModel, GenerationMixin):
             slice_indices = logits_to_keep
         selected_hidden_states = hidden_states[:, slice_indices, :]
         if self.training:
-            logits = self.head(selected_hidden_states)
+            logits = self.lm_head(selected_hidden_states)
         else:
             flash = _load_flash_rwkv2("inference", hidden_states)
             batch_size, sequence_length, channels = hidden_states.shape
             if isinstance(logits_to_keep, int) and logits_to_keep == 1:
                 logits = flash.infer_head_linear_last_forward_varlen(
                     selected_hidden_states.reshape(batch_size, channels).contiguous(),
-                    self.head.weight.contiguous(),
+                    self.lm_head.weight.contiguous(),
                     tokens_count=sequence_length,
                 ).view(batch_size, 1, self.config.vocab_size)
             else:
                 selected_length = selected_hidden_states.shape[1]
                 logits = flash.infer_head_linear_all_forward_varlen(
-                    selected_hidden_states.reshape(-1, channels).contiguous(), self.head.weight.contiguous()
+                    selected_hidden_states.reshape(-1, channels).contiguous(), self.lm_head.weight.contiguous()
                 ).view(batch_size, selected_length, self.config.vocab_size)
         loss = None
         if labels is not None:
@@ -1428,6 +1434,6 @@ __all__ = [
     "RwkvForCausalLM",
     "RwkvModel",
     "RwkvPreTrainedModel",
-    "RwkvTimeMix",
+    "RwkvLinearAttention",
     "RwkvTrainingState",
 ]

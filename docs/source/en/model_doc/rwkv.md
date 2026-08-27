@@ -15,7 +15,7 @@ specific language governing permissions and limitations under the License.
 
 ## Overview
 
-RWKV-7 is a recurrent language model whose TimeMix update uses a diagonal-plus-low-rank state transition. This
+RWKV-7 is a recurrent language model whose linear-attention update uses a diagonal-plus-low-rank state transition. This
 implementation replaces the former RWKV-4 model behind the existing `rwkv` model identity. RWKV-4 checkpoints are not
 compatible and are rejected explicitly.
 
@@ -24,8 +24,8 @@ serialization. All product computation is delegated to the public [FlashRWKV2](h
 operator API. Training follows `RWKV-LM/RWKV-v7/train_temp`; inference follows Albatross. There is no CPU, PyTorch or
 FLA product fallback.
 
-Inference calls FlashRWKV2 at model-semantic fusion boundaries: each TimeMix layer uses PostNorm+TokenShift, WKV
-Prepare, WKV7 and Readout; each ChannelMix layer uses one complete ChannelMix operator. Transformers does not select
+Inference calls FlashRWKV2 at model-semantic fusion boundaries: each linear-attention layer uses PostNorm+TokenShift,
+WKV Prepare, WKV7 and Readout; each MLP uses one complete fused operator. Transformers does not select
 sparse/dense kernels or invoke standalone projection, activation, LN, Res, TokenShift, VRes or gate helpers.
 
 The current canonical contract uses:
@@ -34,7 +34,7 @@ The current canonical contract uses:
 - BF16 CUDA tensors and sequence lengths divisible by 16 for pretraining;
 - Albatross's mixed BF16 embedding / FP16 model layout for inference;
 - FP32 recurrent WKV state;
-- one active unmerged vanilla LoRA adapter on the TimeMix `receptance`, `key`, `value`, and `output` projections;
+- one active unmerged vanilla LoRA adapter on the linear-attention `r_proj`, `k_proj`, `v_proj`, and `o_proj` modules;
   multiple adapters, LoRA variants, LoRA bias, and per-sample mixed-adapter batches must be merged first;
 - equal-length batches for training and inference. An attention mask may be omitted or may be a two-dimensional,
   batch-matched, all-ones tensor whose length covers the current input. Padding and ragged batches fail immediately;
@@ -78,7 +78,7 @@ outputs = model.generate(**inputs, max_new_tokens=32)
 
 `prepare_for_inference()` is an in-place conversion, not a temporary execution mode. Call it after loading or changing
 weights and after attaching adapters. It changes parameter dtypes and device placement, creates non-persistent
-transposed runtime weights, and moves the serializable ChannelMix down-projection weights to CPU so a second full GPU
+transposed runtime weights, and moves the serializable MLP `down_proj` weights to CPU so a second full GPU
 copy is not retained. Repeating the call is safe. Saving still serializes the canonical weights, and loading the saved
 checkpoint starts without runtime layouts.
 
@@ -124,19 +124,23 @@ Canonical BlinkDL `.pth` checkpoints can be converted with:
     --context-length 10240
 ```
 
-The converter preserves canonical tensor names under the single standard `model.` base-model prefix and writes
-Safetensors without a per-tensor compatibility table. It builds a standard fast `tokenizer.json` from the pinned
+The converter treats BlinkDL names as an input format and writes the native Transformers decoder layout. For example,
+`blocks.0.att.receptance.weight` becomes `model.layers.0.linear_attn.r_proj.weight`,
+`blocks.0.ffn.value.weight` becomes `model.layers.0.mlp.down_proj.weight`, and `head.weight` becomes
+`lm_head.weight`. The converted Safetensors checkpoint therefore works with standard module discovery, adapter target
+selection, and framework tooling without preserving a second set of runtime aliases. The converter also builds a
+standard fast `tokenizer.json` from the pinned
 `rwkv-rs/rwkv7-g1-st` `rwkv_vocab_v20230424.json` artifact and writes the native RWKV chat template. Pass
 `--rwkv-vocab-json` to use a hash-verified local copy of that JSON artifact or `--chat-template` to select the template
 file. The tokenizer uses the RWKV World byte-level greedy longest-match algorithm. BOS and EOS share token ID 0;
 padding and unknown tokens are intentionally undefined.
 
-For a new model, the four TimeMix low-rank dimensions are derived from `hidden_size` with the exact `train_temp`
+For a new model, the four linear-attention low-rank dimensions are derived from `hidden_size` with the exact `train_temp`
 formulas. Converted checkpoints instead record the dimensions found in `w1/a1/v1/g1` and preserve them verbatim;
 loading a checkpoint never recomputes or replaces its serialized low-rank dimensions. Randomly initialized models
 also use the final effective parameter initialization from `train_temp`, including SmallInitEmb, the
-vocabulary-dependent orthogonal LM head, layer-scaled GroupNorm weights, and the depth-dependent TimeMix and
-ChannelMix parameters.
+vocabulary-dependent orthogonal LM head, layer-scaled GroupNorm weights, and the depth-dependent linear-attention and
+MLP parameters.
 
 ## RwkvTokenizerFast
 
@@ -146,9 +150,9 @@ ChannelMix parameters.
 
 [[autodoc]] RwkvConfig
 
-## RwkvTimeMix
+## RwkvLinearAttention
 
-[[autodoc]] RwkvTimeMix
+[[autodoc]] RwkvLinearAttention
     - forward
 
 ## RwkvCache

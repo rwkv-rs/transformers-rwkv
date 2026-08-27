@@ -38,11 +38,11 @@ from transformers.testing_utils import require_peft, require_torch, require_torc
 if importlib.util.find_spec("torch") is not None:
     import torch
 
-    from transformers import RwkvCache, RwkvForCausalLM, RwkvModel, RwkvTimeMix, RwkvTrainingState
+    from transformers import RwkvCache, RwkvForCausalLM, RwkvLinearAttention, RwkvModel, RwkvTrainingState
     from transformers.integrations.flash_rwkv2 import _INFERENCE_OPERATORS
     from transformers.models.rwkv.modeling_rwkv import (
         _cache_states,
-        _infer_tmix_projection_spec,
+        _infer_linear_attention_projection_spec,
         _load_flash_rwkv2,
         _stateful_training_metadata,
         _validate_rwkv_attention_mask,
@@ -95,36 +95,72 @@ def train_temp_tmix_init(module, config, layer_idx: int) -> None:
             parameter = getattr(module, name)
             gain = math.sqrt(parameter.shape[0] / parameter.shape[1]) if parameter.shape[0] > parameter.shape[1] else 1
             torch.nn.init.orthogonal_(parameter, gain=gain * 0.1)
-        torch.nn.init.orthogonal_(module.receptance.weight, gain=1.0)
-        torch.nn.init.orthogonal_(module.key.weight, gain=0.1)
-        torch.nn.init.orthogonal_(module.value.weight, gain=1.0)
-        module.output.weight.zero_()
-        module.ln_x.weight.fill_(((layer_idx + 1) / config.num_hidden_layers) ** 0.7)
-        module.ln_x.bias.zero_()
+        torch.nn.init.orthogonal_(module.r_proj.weight, gain=1.0)
+        torch.nn.init.orthogonal_(module.k_proj.weight, gain=0.1)
+        torch.nn.init.orthogonal_(module.v_proj.weight, gain=1.0)
+        module.o_proj.weight.zero_()
+        module.g_norm.weight.fill_(((layer_idx + 1) / config.num_hidden_layers) ** 0.7)
+        module.g_norm.bias.zero_()
 
 
 def train_temp_model_init(model) -> None:
     config = model.config
     with torch.no_grad():
-        model.model.emb.weight.uniform_(-1e-4, 1e-4)
-        for layer_idx, block in enumerate(model.model.blocks):
-            for layer_norm in (getattr(block, "ln0", None), block.ln1, block.ln2):
-                if layer_norm is not None:
-                    layer_norm.weight.fill_(1.0)
-                    layer_norm.bias.zero_()
-            train_temp_tmix_init(block.att, config, layer_idx)
+        model.model.embed_tokens.weight.uniform_(-1e-4, 1e-4)
+        model.model.embedding_norm.weight.fill_(1.0)
+        model.model.embedding_norm.bias.zero_()
+        for layer_idx, layer in enumerate(model.model.layers):
+            for layer_norm in (layer.input_layernorm, layer.post_attention_layernorm):
+                layer_norm.weight.fill_(1.0)
+                layer_norm.bias.zero_()
+            train_temp_tmix_init(layer.linear_attn, config, layer_idx)
             channels = config.hidden_size
             ratio_1_to_almost0 = 1.0 - layer_idx / config.num_hidden_layers
             ddd = torch.arange(channels, dtype=torch.float32).view(1, 1, -1) / channels
-            block.ffn.x_k.copy_(1.0 - ddd.pow(ratio_1_to_almost0**4))
-            torch.nn.init.orthogonal_(block.ffn.key.weight, gain=1.0)
-            block.ffn.value.weight.zero_()
-        model.model.ln_out.weight.fill_(1.0)
-        model.model.ln_out.bias.zero_()
+            layer.mlp.x_k.copy_(1.0 - ddd.pow(ratio_1_to_almost0**4))
+            torch.nn.init.orthogonal_(layer.mlp.up_proj.weight, gain=1.0)
+            layer.mlp.down_proj.weight.zero_()
+        model.model.norm.weight.fill_(1.0)
+        model.model.norm.bias.zero_()
         gain = (
             0.5 * math.sqrt(config.vocab_size / config.hidden_size) if config.vocab_size > config.hidden_size else 0.5
         )
-        torch.nn.init.orthogonal_(model.head.weight, gain=gain)
+        torch.nn.init.orthogonal_(model.lm_head.weight, gain=gain)
+
+
+def canonical_rwkv7_state_dict(model) -> dict[str, torch.Tensor]:
+    canonical = {}
+    for key, value in model.state_dict().items():
+        if key.startswith("model.embed_tokens."):
+            source_key = key.replace("model.embed_tokens.", "emb.", 1)
+        elif key.startswith("model.embedding_norm."):
+            source_key = key.replace("model.embedding_norm.", "blocks.0.ln0.", 1)
+        elif key.startswith("model.norm."):
+            source_key = key.replace("model.norm.", "ln_out.", 1)
+        elif key.startswith("lm_head."):
+            source_key = key.replace("lm_head.", "head.", 1)
+        else:
+            parts = key.split(".")
+            layer_idx, component, *suffix = parts[2:]
+            component = {
+                "input_layernorm": "ln1",
+                "post_attention_layernorm": "ln2",
+                "linear_attn": "att",
+                "mlp": "ffn",
+            }[component]
+            if component == "att":
+                suffix[0] = {
+                    "r_proj": "receptance",
+                    "k_proj": "key",
+                    "v_proj": "value",
+                    "o_proj": "output",
+                    "g_norm": "ln_x",
+                }.get(suffix[0], suffix[0])
+            elif component == "ffn":
+                suffix[0] = {"up_proj": "key", "down_proj": "value"}.get(suffix[0], suffix[0])
+            source_key = ".".join(("blocks", layer_idx, component, *suffix))
+        canonical[source_key] = value
+    return canonical
 
 
 @require_torch
@@ -188,26 +224,26 @@ class Rwkv7ConfigurationTest(unittest.TestCase):
     def test_training_state_contract_and_selective_reset(self):
         config = tiny_config()
         state = RwkvTrainingState.zeros(config, 3, device="cpu", dtype=torch.bfloat16)
-        self.assertEqual(state.time_mix_shift.shape, (2, 3, 128))
-        self.assertEqual(state.wkv.shape, (2, 3, 2, 64, 64))
-        self.assertEqual(state.wkv.dtype, torch.float32)
+        self.assertEqual(state.attention_shift.shape, (2, 3, 128))
+        self.assertEqual(state.recurrent_state.shape, (2, 3, 2, 64, 64))
+        self.assertEqual(state.recurrent_state.dtype, torch.float32)
         state.validate(config, batch_size=3, device="cpu", dtype=torch.bfloat16)
-        state.time_mix_shift.fill_(1)
-        state.wkv.fill_(2)
-        state.channel_mix_shift.fill_(3)
+        state.attention_shift.fill_(1)
+        state.recurrent_state.fill_(2)
+        state.mlp_shift.fill_(3)
         cloned = state.clone_detach()
-        cloned.reset_([1], wkv=False)
-        self.assertEqual(cloned.time_mix_shift[:, 1].count_nonzero(), 0)
-        self.assertEqual(cloned.channel_mix_shift[:, 1].count_nonzero(), 0)
-        self.assertTrue(torch.all(cloned.wkv == 2))
-        self.assertTrue(torch.all(state.time_mix_shift == 1))
+        cloned.reset_([1], recurrent=False)
+        self.assertEqual(cloned.attention_shift[:, 1].count_nonzero(), 0)
+        self.assertEqual(cloned.mlp_shift[:, 1].count_nonzero(), 0)
+        self.assertTrue(torch.all(cloned.recurrent_state == 2))
+        self.assertTrue(torch.all(state.attention_shift == 1))
 
     def test_training_state_rejects_shape_dtype_and_device_mismatch(self):
         config = tiny_config()
         state = RwkvTrainingState.zeros(config, 2, device="cpu", dtype=torch.bfloat16)
         with self.assertRaisesRegex(ValueError, "must have shape"):
             state.clone().validate(config, batch_size=1, device="cpu", dtype=torch.bfloat16)
-        state.wkv = state.wkv.to(torch.bfloat16)
+        state.recurrent_state = state.recurrent_state.to(torch.bfloat16)
         with self.assertRaisesRegex(TypeError, "torch.float32"):
             state.validate(config, batch_size=2, device="cpu", dtype=torch.bfloat16)
 
@@ -284,17 +320,23 @@ class Rwkv7ConfigurationTest(unittest.TestCase):
 class Rwkv7ModelStructureTest(unittest.TestCase):
     all_model_classes = (RwkvModel, RwkvForCausalLM)
 
-    def test_public_component_and_canonical_tensor_names(self):
+    def test_public_component_and_transformers_tensor_names(self):
         model = RwkvForCausalLM(tiny_config())
-        self.assertIsInstance(model.model.blocks[0].att, RwkvTimeMix)
+        self.assertIsInstance(model.model.layers[0].linear_attn, RwkvLinearAttention)
         state = model.state_dict()
-        self.assertEqual(state["model.blocks.0.att.w1"].shape, (128, 32))
-        self.assertEqual(state["model.blocks.0.att.w2"].shape, (32, 128))
-        self.assertEqual(state["model.blocks.0.att.v0"].shape, (1, 1, 128))
-        self.assertEqual(state["model.blocks.0.att.v1"].shape, (128, 32))
-        self.assertEqual(state["model.blocks.1.att.v1"].shape, (128, 32))
-        self.assertEqual(state["model.blocks.0.ffn.key.weight"].shape, (512, 128))
-        self.assertEqual(state["model.blocks.0.ffn.value.weight"].shape, (128, 512))
+        self.assertEqual(state["model.layers.0.linear_attn.w1"].shape, (128, 32))
+        self.assertEqual(state["model.layers.0.linear_attn.w2"].shape, (32, 128))
+        self.assertEqual(state["model.layers.0.linear_attn.v0"].shape, (1, 1, 128))
+        self.assertEqual(state["model.layers.0.linear_attn.v1"].shape, (128, 32))
+        self.assertEqual(state["model.layers.1.linear_attn.v1"].shape, (128, 32))
+        self.assertEqual(state["model.layers.0.linear_attn.r_proj.weight"].shape, (128, 128))
+        self.assertEqual(state["model.layers.0.linear_attn.g_norm.weight"].shape, (128,))
+        self.assertEqual(state["model.layers.0.mlp.up_proj.weight"].shape, (512, 128))
+        self.assertEqual(state["model.layers.0.mlp.down_proj.weight"].shape, (128, 512))
+        self.assertEqual(state["model.embed_tokens.weight"].shape, (256, 128))
+        self.assertEqual(state["model.embedding_norm.weight"].shape, (128,))
+        self.assertEqual(state["model.norm.weight"].shape, (128,))
+        self.assertEqual(state["lm_head.weight"].shape, (256, 128))
         self.assertTrue(all(tensor.isfinite().all() for tensor in state.values()))
 
     def test_runtime_fails_closed_on_cpu(self):
@@ -325,19 +367,19 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
                 use_cache=False,
             )
 
-    def test_time_mix_and_channel_mix_share_attention_mask_validation(self):
-        block = RwkvForCausalLM(tiny_config()).model.blocks[0]
-        hidden_states = torch.zeros(1, 2, block.att.config.hidden_size)
+    def test_linear_attention_and_mlp_share_attention_mask_validation(self):
+        layer = RwkvForCausalLM(tiny_config()).model.layers[0]
+        hidden_states = torch.zeros(1, 2, layer.linear_attn.config.hidden_size)
         invalid_mask = torch.ones(1, 2, 1)
-        for layer in (block.att, block.ffn):
-            with self.subTest(layer=type(layer).__name__), self.assertRaisesRegex(ValueError, "two-dimensional"):
-                layer(hidden_states, attention_mask=invalid_mask)
+        for module in (layer.linear_attn, layer.mlp):
+            with self.subTest(module=type(module).__name__), self.assertRaisesRegex(ValueError, "two-dimensional"):
+                module(hidden_states, attention_mask=invalid_mask)
 
     def test_explicit_low_rank_dimensions_control_parameter_shapes(self):
         model = RwkvForCausalLM(
             tiny_config(decay_low_rank_dim=17, a_low_rank_dim=19, v_low_rank_dim=23, gate_low_rank_dim=29)
         )
-        attention = model.model.blocks[0].att
+        attention = model.model.layers[0].linear_attn
         self.assertEqual(attention.w1.shape, (128, 17))
         self.assertEqual(attention.a1.shape, (128, 19))
         self.assertEqual(attention.v1.shape, (128, 23))
@@ -349,7 +391,7 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         expected = RwkvForCausalLM(config)
         torch.manual_seed(20260806)
         actual.model.reset_parameters()
-        actual.reset_head_parameters()
+        actual.reset_lm_head_parameters()
         torch.manual_seed(20260806)
         train_temp_model_init(expected)
         for name, tensor in actual.state_dict().items():
@@ -447,9 +489,9 @@ class Rwkv7ModelStructureTest(unittest.TestCase):
         self.assertTrue(model.supports_gradient_checkpointing)
         self.assertFalse(model.supports_tp_plan)
         self.assertFalse(model._can_compile_fullgraph)
-        self.assertTrue(all(block.gradient_checkpointing for block in model.model.blocks))
+        self.assertTrue(all(layer.gradient_checkpointing for layer in model.model.layers))
 
-    def test_cache_state_shape_is_owned_by_each_time_mix_layer(self):
+    def test_cache_state_shape_is_owned_by_each_linear_attention_layer(self):
         cache_config = mock.Mock(num_hidden_layers=2, number_of_conv_states=2)
         cache = RwkvCache(cache_config)
         hidden_states = torch.zeros(1, 3, 512)
@@ -544,10 +586,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
     def test_minimal_conversion_and_fresh_model_process(self):
         converter = self._converter_module()
         model = RwkvForCausalLM(tiny_config())
-        source = {
-            key.removeprefix("model.") if key.startswith("model.") else key: value
-            for key, value in model.state_dict().items()
-        }
+        source = canonical_rwkv7_state_dict(model)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkpoint = root / "rwkv7.pth"
@@ -583,10 +622,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
         converter = self._converter_module()
         config = tiny_config(decay_low_rank_dim=17, a_low_rank_dim=19, v_low_rank_dim=23, gate_low_rank_dim=29)
         model = RwkvForCausalLM(config)
-        source = {
-            key.removeprefix("model.") if key.startswith("model.") else key: value
-            for key, value in model.state_dict().items()
-        }
+        source = canonical_rwkv7_state_dict(model)
         inferred = converter.infer_config(source, context_length=16)
         self.assertEqual(
             (
@@ -601,10 +637,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
     def test_converter_rejects_cross_layer_low_rank_drift(self):
         converter = self._converter_module()
         model = RwkvForCausalLM(tiny_config())
-        source = {
-            key.removeprefix("model.") if key.startswith("model.") else key: value
-            for key, value in model.state_dict().items()
-        }
+        source = canonical_rwkv7_state_dict(model)
         source["blocks.1.att.w1"] = torch.empty(128, 31)
         source["blocks.1.att.w2"] = torch.empty(31, 128)
         with self.assertRaisesRegex(ValueError, "must agree across all layers"):
@@ -644,7 +677,7 @@ class Rwkv7ConversionTest(unittest.TestCase):
     def test_converter_detaches_larger_source_storage(self):
         source_storage = torch.arange(16, dtype=torch.float32)
         converted = self._converter_module().convert_state_dict({"emb.weight": source_storage[4:8]})
-        tensor = converted["model.emb.weight"]
+        tensor = converted["model.embed_tokens.weight"]
         self.assertEqual(tensor.untyped_storage().nbytes(), tensor.numel() * tensor.element_size())
         self.assertEqual(tensor.tolist(), [4.0, 5.0, 6.0, 7.0])
 
@@ -659,7 +692,7 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
 
         config = tiny_config(hidden_size=1024, intermediate_size=4096)
         model = RwkvForCausalLM(config).cuda().eval()
-        targets = ["receptance", "key", "value", "output"]
+        targets = ["r_proj", "k_proj", "v_proj", "o_proj"]
         model.add_adapter(
             LoraConfig(r=8, lora_alpha=16, target_modules=targets, init_lora_weights=False),
             adapter_name="first",
@@ -669,10 +702,10 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         x = torch.randn(5, config.hidden_size, device="cuda", dtype=torch.float16)
 
         for name in targets:
-            projection = getattr(model.model.blocks[0].att, name)
+            projection = getattr(model.model.layers[0].linear_attn, name)
             with torch.no_grad():
                 expected = projection(x)
-                weight, lora_a, lora_b, scale = _infer_tmix_projection_spec(projection)
+                weight, lora_a, lora_b, scale = _infer_linear_attention_projection_spec(projection)
                 actual = torch.nn.functional.linear(x, weight)
                 if lora_a is not None:
                     actual = actual + torch.nn.functional.linear(torch.nn.functional.linear(x, lora_a), lora_b) * scale
@@ -683,10 +716,10 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
             output = model(input_ids, use_cache=False)
         self.assertTrue(torch.isfinite(output.logits).all())
 
-        projection = model.model.blocks[0].att.receptance
+        projection = model.model.layers[0].linear_attn.r_proj
         model.disable_adapters()
         with torch.no_grad():
-            weight, lora_a, lora_b, scale = _infer_tmix_projection_spec(projection)
+            weight, lora_a, lora_b, scale = _infer_linear_attention_projection_spec(projection)
             disabled = torch.nn.functional.linear(x, weight)
             base = projection.get_base_layer()(x)
         self.assertIsNone(lora_a)
@@ -701,7 +734,7 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         )
         model.set_adapter(["first", "second"])
         with self.assertRaisesRegex(RuntimeError, "exactly one active"):
-            _infer_tmix_projection_spec(projection)
+            _infer_linear_attention_projection_spec(projection)
 
     def test_stateful_chunk_forward_matches_single_stateful_call(self):
         config = tiny_config()
@@ -727,23 +760,23 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         input_ids = torch.randint(0, config.vocab_size, (1, 7), device="cuda")
         state = RwkvTrainingState.zeros(config, 1, device="cuda", dtype=torch.bfloat16)
         outputs = model(input_ids, labels=input_ids, training_state=state, use_cache=False)
-        self.assertEqual(outputs.training_state.wkv.dtype, torch.float32)
+        self.assertEqual(outputs.training_state.recurrent_state.dtype, torch.float32)
         outputs.loss.backward()
-        self.assertIsNotNone(model.model.blocks[0].att.receptance.weight.grad)
-        self.assertTrue(torch.isfinite(model.model.blocks[0].att.receptance.weight.grad).all())
+        self.assertIsNotNone(model.model.layers[0].linear_attn.r_proj.weight.grad)
+        self.assertTrue(torch.isfinite(model.model.layers[0].linear_attn.r_proj.weight.grad).all())
 
     def test_gradient_checkpointing_matches_stateless_and_stateful_training(self):
         config = tiny_config()
         model = RwkvForCausalLM(config).cuda().to(torch.bfloat16).train()
         with torch.no_grad():
-            for block in model.model.blocks:
-                block.att.output.weight.normal_(std=0.01)
-                block.ffn.value.weight.normal_(std=0.01)
+            for layer in model.model.layers:
+                layer.linear_attn.o_proj.weight.normal_(std=0.01)
+                layer.mlp.down_proj.weight.normal_(std=0.01)
         input_ids = torch.randint(0, config.vocab_size, (1, 16), device="cuda")
         gradient_names = (
-            "model.blocks.0.att.receptance.weight",
-            "model.blocks.0.att.output.weight",
-            "head.weight",
+            "model.layers.0.linear_attn.r_proj.weight",
+            "model.layers.0.linear_attn.o_proj.weight",
+            "lm_head.weight",
         )
 
         def run(*, checkpointing: bool, stateful: bool):
@@ -787,44 +820,44 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
                 for name in gradient_names:
                     torch.testing.assert_close(actual_gradients[name], expected_gradients[name], atol=0, rtol=0)
 
-    def test_inference_preparation_offloads_only_canonical_ffn_down_layout(self):
+    def test_inference_preparation_offloads_only_mlp_down_projection(self):
         model = RwkvForCausalLM(tiny_config(hidden_size=1024, intermediate_size=4096)).cuda().eval()
-        expected = model.model.blocks[0].ffn.value.weight.detach().cpu().half().clone()
+        expected = model.model.layers[0].mlp.down_proj.weight.detach().cpu().half().clone()
 
         model.prepare_for_inference().prepare_for_inference()
 
-        channel_mix = model.model.blocks[0].ffn
-        self.assertEqual(channel_mix.value.weight.device.type, "cpu")
-        self.assertEqual(channel_mix._value_runtime.device.type, "cuda")
-        torch.testing.assert_close(channel_mix.value.weight, expected, atol=0, rtol=0)
+        mlp = model.model.layers[0].mlp
+        self.assertEqual(mlp.down_proj.weight.device.type, "cpu")
+        self.assertEqual(mlp._down_proj_runtime.device.type, "cuda")
+        torch.testing.assert_close(mlp.down_proj.weight, expected, atol=0, rtol=0)
         with torch.no_grad():
-            channel_mix.value.weight.add_(1)
+            mlp.down_proj.weight.add_(1)
         model.prepare_for_inference()
         torch.testing.assert_close(
-            channel_mix._value_runtime,
-            channel_mix.value.weight.T.cuda(),
+            mlp._down_proj_runtime,
+            mlp.down_proj.weight.T.cuda(),
             atol=0,
             rtol=0,
         )
-        expected = channel_mix.value.weight.detach().clone()
+        expected = mlp.down_proj.weight.detach().clone()
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
             reloaded = RwkvForCausalLM.from_pretrained(directory, dtype=torch.float16)
-        torch.testing.assert_close(reloaded.model.blocks[0].ffn.value.weight, expected, atol=0, rtol=0)
-        self.assertIsNone(reloaded.model.blocks[0].ffn._value_runtime)
+        torch.testing.assert_close(reloaded.model.layers[0].mlp.down_proj.weight, expected, atol=0, rtol=0)
+        self.assertIsNone(reloaded.model.layers[0].mlp._down_proj_runtime)
 
         model.train()
         input_ids = torch.randint(0, model.config.vocab_size, (1, 16), device="cuda")
         with self.assertRaisesRegex(RuntimeError, "in-place Albatross inference layout"):
             model(input_ids, labels=input_ids, use_cache=False)
         model.to(device="cuda", dtype=torch.bfloat16).train()
-        self.assertTrue(all(block.ffn._value_runtime is None for block in model.model.blocks))
-        self.assertTrue(all(block.att._w1_original is None for block in model.model.blocks))
-        self.assertTrue(all(block.ffn.value.weight.is_cuda for block in model.model.blocks))
+        self.assertTrue(all(layer.mlp._down_proj_runtime is None for layer in model.model.layers))
+        self.assertTrue(all(layer.linear_attn._w1_original is None for layer in model.model.layers))
+        self.assertTrue(all(layer.mlp.down_proj.weight.is_cuda for layer in model.model.layers))
         outputs = model(input_ids, labels=input_ids, use_cache=False)
         outputs.loss.backward()
-        self.assertIsNotNone(model.model.blocks[0].ffn.value.weight.grad)
-        self.assertTrue(torch.isfinite(model.model.blocks[0].ffn.value.weight.grad).all())
+        self.assertIsNotNone(model.model.layers[0].mlp.down_proj.weight.grad)
+        self.assertTrue(torch.isfinite(model.model.layers[0].mlp.down_proj.weight.grad).all())
 
     def test_recurrent_metadata_is_scoped_to_cuda_stream(self):
         class FakeFlashRwkv2:
@@ -881,8 +914,8 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         self.assertEqual(outputs.logits.dtype, torch.bfloat16)
         self.assertTrue(torch.isfinite(outputs.loss))
         outputs.loss.backward()
-        self.assertIsNotNone(model.model.blocks[0].att.output.weight.grad)
-        self.assertGreater(model.model.blocks[0].att.output.weight.grad.abs().max().item(), 0)
+        self.assertIsNotNone(model.model.layers[0].linear_attn.o_proj.weight.grad)
+        self.assertGreater(model.model.layers[0].linear_attn.o_proj.weight.grad.abs().max().item(), 0)
 
     def test_outputs_use_one_rwkv_type_and_standard_loss_hook(self):
         config = tiny_config()
@@ -930,7 +963,7 @@ class Rwkv7FlashRwkv2Test(unittest.TestCase):
         staged.past_key_values.batch_select_indices(torch.tensor([1], device="cuda"))
         self.assertEqual(staged.past_key_values.batch_size, 1)
 
-    def test_inference_output_hidden_states_preserves_block_boundaries(self):
+    def test_inference_output_hidden_states_preserves_layer_boundaries(self):
         config = tiny_config(hidden_size=1024, intermediate_size=4096)
         model = RwkvForCausalLM(config).cuda().eval().prepare_for_inference()
         input_ids = torch.randint(0, config.vocab_size, (1, 5), device="cuda")
