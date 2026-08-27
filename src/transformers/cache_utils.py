@@ -946,14 +946,42 @@ class LinearAttentionCacheLayerMixin(ABC):
                 self.recurrent_states[i].zero_()
             self.has_previous_state[i] = False
 
-    def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorders the cache for beam search, given the selected beam indices."""
+    @property
+    def batch_size(self) -> int:
+        """Return the common batch size of initialized linear-attention states, or ``-1`` when empty."""
+        batch_sizes = []
         for i in range(self.number_of_states):
             if self.is_conv_states_initialized[i]:
-                self.conv_states[i] = self.conv_states[i].index_select(0, beam_idx.to(self.device))
-            # recurrent_states can stay empty sometimes, see e.g. lfm2 which only uses the conv_states
+                batch_sizes.append(self.conv_states[i].shape[0])
             if self.is_recurrent_states_initialized[i]:
-                self.recurrent_states[i] = self.recurrent_states[i].index_select(0, beam_idx.to(self.device))
+                batch_sizes.append(self.recurrent_states[i].shape[0])
+        if not batch_sizes:
+            return -1
+        if len(set(batch_sizes)) != 1:
+            raise ValueError(f"Linear-attention states have inconsistent batch sizes: {batch_sizes}.")
+        return batch_sizes[0]
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        """Repeat every initialized state in the batch dimension."""
+        for i in range(self.number_of_states):
+            if self.is_conv_states_initialized[i]:
+                self.conv_states[i] = self.conv_states[i].repeat_interleave(repeats, dim=0)
+            if self.is_recurrent_states_initialized[i]:
+                self.recurrent_states[i] = self.recurrent_states[i].repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        """Select batch indices from every initialized state."""
+        for i in range(self.number_of_states):
+            if self.is_conv_states_initialized[i]:
+                state = self.conv_states[i]
+                self.conv_states[i] = state.index_select(0, indices.to(state.device))
+            if self.is_recurrent_states_initialized[i]:
+                state = self.recurrent_states[i]
+                self.recurrent_states[i] = state.index_select(0, indices.to(state.device))
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorders the cache for beam search, given the selected beam indices."""
+        self.batch_select_indices(beam_idx)
 
     def activate_past_recording(self):
         """
@@ -1634,7 +1662,11 @@ class Cache:
         (e.g. an all-linear-attention cache queried before the first forward)."""
         # ``LinearAttentionLayer`` sets ``batch_size`` lazily — skip layers that haven't been
         # initialized yet (``generate`` queries this on a fresh cache during cache-reuse checks).
-        values = [layer.batch_size for layer in self.layers if hasattr(layer, "batch_size")]
+        values = []
+        for layer in self.layers:
+            value = getattr(layer, "batch_size", -1)
+            if value >= 0:
+                values.append(value)
         if not values:
             return -1
         if len(set(values)) > 1:

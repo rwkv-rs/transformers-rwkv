@@ -15,12 +15,17 @@
 import json
 import tempfile
 import unittest
+from importlib.metadata import distribution
 from pathlib import Path
 
+import tokenizers
 import torch
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
 from tokenizers import Tokenizer, decoders, models, processors
 
 from transformers import AutoTokenizer, RwkvTokenizerFast, StopStringCriteria
+from transformers.dependency_versions_table import deps
 
 
 SPECIAL_TOKEN = "<|endoftext|>"
@@ -62,6 +67,25 @@ def make_tokenizer() -> RwkvTokenizerFast:
 
 
 class RwkvTokenizerTest(unittest.TestCase):
+    def test_installed_git_fork_contract(self):
+        installed = distribution("tokenizers")
+        direct_url = json.loads(installed.read_text("direct_url.json"))
+        self.assertEqual(direct_url["url"], "https://github.com/rwkv-rs/tokenizers-rwkv.git")
+        self.assertEqual(
+            direct_url["vcs_info"]["commit_id"],
+            "c5d8dde5ff49c70e4656199d5033a84e03c21b2b",
+        )
+        self.assertEqual(direct_url["subdirectory"], "bindings/python")
+        self.assertTrue(Path(tokenizers.__file__).is_relative_to(installed.locate_file("")))
+        self.assertIn(Version(tokenizers.__version__), SpecifierSet(deps["tokenizers"].removeprefix("tokenizers")))
+        self.assertTrue(callable(models.RwkvTrie.from_file))
+
+        with tempfile.TemporaryDirectory() as directory:
+            vocab = Path(directory) / "vocab.json"
+            vocab.write_text(json.dumps({SPECIAL_TOKEN: 0, "a": 1}), encoding="utf-8")
+            backend = Tokenizer(models.RwkvTrie.from_file(str(vocab)))
+        self.assertEqual(backend.encode("a").ids, [1])
+
     def test_special_token_contract(self):
         tokenizer = make_tokenizer()
         payload = tokenizer.encode("hello", add_special_tokens=False)
