@@ -87,7 +87,7 @@ def infer_config(state: dict[str, torch.Tensor], context_length: int) -> RwkvCon
         raise ValueError("`blocks.0.ffn.key.weight` does not match the embedding hidden size.")
     if intermediate_size != 4 * hidden_size:
         raise ValueError(
-            "`blocks.0.ffn.key.weight` must use the canonical ChannelMix width 4 * hidden_size; "
+            "`blocks.0.ffn.key.weight` must use the canonical MLP width 4 * hidden_size; "
             f"got intermediate_size={intermediate_size} and hidden_size={hidden_size}."
         )
     decay_rank = _infer_low_rank_dim(state, layer_ids, "w", hidden_size)
@@ -111,10 +111,48 @@ def infer_config(state: dict[str, torch.Tensor], context_length: int) -> RwkvCon
     )
 
 
+def _transformers_weight_name(key: str) -> str:
+    if key.startswith("emb."):
+        return key.replace("emb.", "model.embed_tokens.", 1)
+    if key.startswith("ln_out."):
+        return key.replace("ln_out.", "model.norm.", 1)
+    if key.startswith("head."):
+        return key.replace("head.", "lm_head.", 1)
+
+    parts = key.split(".")
+    if len(parts) < 4 or parts[0] != "blocks":
+        raise ValueError(f"Unsupported canonical RWKV-7 tensor name `{key}`.")
+
+    layer_idx, component, *suffix = parts[1:]
+    if component == "ln0":
+        if layer_idx != "0":
+            raise ValueError(f"Unsupported canonical RWKV-7 tensor name `{key}`.")
+        return ".".join(("model", "embedding_norm", *suffix))
+    component = {
+        "ln1": "input_layernorm",
+        "ln2": "post_attention_layernorm",
+        "att": "linear_attn",
+        "ffn": "mlp",
+    }.get(component)
+    if component is None:
+        raise ValueError(f"Unsupported canonical RWKV-7 tensor name `{key}`.")
+    if component == "linear_attn":
+        suffix[0] = {
+            "receptance": "r_proj",
+            "key": "k_proj",
+            "value": "v_proj",
+            "output": "o_proj",
+            "ln_x": "g_norm",
+        }.get(suffix[0], suffix[0])
+    elif component == "mlp":
+        suffix[0] = {"key": "up_proj", "value": "down_proj"}.get(suffix[0], suffix[0])
+    return ".".join(("model", "layers", layer_idx, component, *suffix))
+
+
 def convert_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     converted = {}
     for key, tensor in state.items():
-        target_key = key if key.startswith("head.") else f"model.{key}"
+        target_key = _transformers_weight_name(key)
         # Released `.pth` checkpoints can store contiguous tensor views backed by
         # a larger flat storage. Clone so each Safetensors entry owns exactly its
         # logical bytes instead of retaining the source storage span.
