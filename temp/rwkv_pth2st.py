@@ -210,13 +210,11 @@ def write_shards(
     output: Path,
     max_shard_size: str,
 ) -> None:
-    planning_state = {target: state[source] for target, source in target_to_source.items()}
     split = split_torch_state_dict_into_shards(
-        planning_state,
+        expected,
         filename_pattern="model{suffix}.safetensors",
         max_shard_size=max_shard_size,
     )
-    del planning_state
 
     for filename, target_keys in split.filename_to_tensors.items():
         shard = {}

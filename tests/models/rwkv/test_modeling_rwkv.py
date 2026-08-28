@@ -403,6 +403,11 @@ class RwkvConverterTest(unittest.TestCase):
         config = tiny_config()
         source = self.canonical_state_dict(config)
         expected_embedding = source["emb.weight"].clone()
+        storage = torch.cat([tensor.flatten() for tensor in source.values()])
+        offset = 0
+        for key, tensor in source.items():
+            source[key] = storage[offset : offset + tensor.numel()].view_as(tensor)
+            offset += tensor.numel()
         plan, dropped = self.converter.translation_plan(source)
         expected = self.converter.expected_state_dict(config)
         for source_key in dropped:
