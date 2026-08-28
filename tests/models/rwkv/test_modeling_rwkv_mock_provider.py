@@ -201,6 +201,7 @@ class FakeFlashRwkv2:
         normalized = F.layer_norm(residual, (x.shape[-1],), weight, bias, eps).view(batch_size, sequence_length, -1)
         outputs = self._mix(normalized, shift_state_pool, parameters)
         shift_state_pool.copy_(outputs[-1])
+        self.expected_cmix_input = residual
         return (residual, *(value.view_as(x) for value in outputs[:6]))
 
     @staticmethod
@@ -361,6 +362,8 @@ class FakeFlashRwkv2:
         validated_metadata=None,
         deterministic=False,
     ):
+        if x.data_ptr() != self.expected_cmix_input.data_ptr():
+            raise AssertionError("ChannelMix must consume the layer input returned by TimeMix.")
         batch_size = state_indices.numel()
         sequence_length = x.shape[0] // batch_size
         residual = x + residual

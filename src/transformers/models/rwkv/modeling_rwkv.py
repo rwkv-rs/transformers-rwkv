@@ -790,7 +790,7 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
             hidden_states = hidden_states + feed_forward_output
             return hidden_states, v_first, next_attention_shift, next_wkv_state, next_feed_forward_shift
 
-        attention_output, residual, v_first = self.linear_attn(
+        attention_output, layer_input, v_first = self.linear_attn(
             hidden_states,
             v_first,
             attention_shift,
@@ -800,9 +800,9 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
             inference_metadata=inference_metadata,
         )
         hidden_states, residual = self.mlp(
-            attention_output,
+            layer_input,
             feed_forward_shift,
-            residual=residual,
+            residual=attention_output,
             layer_norm=self.post_attention_layernorm,
             inference_metadata=inference_metadata,
         )
