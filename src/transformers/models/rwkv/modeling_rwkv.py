@@ -395,8 +395,8 @@ class RwkvAttention(nn.Module):
                 v1 = torch.zeros(rank, self.hidden_size, dtype=self.w1.dtype, device=self.w1.device)
                 v2 = torch.zeros(self.hidden_size, rank, dtype=self.w1.dtype, device=self.w1.device)
                 v0 = torch.zeros(self.hidden_size, dtype=self.w1.dtype, device=self.w1.device)
-                v1_runtime = v1.t().contiguous()
-                v2_runtime = v2.t().contiguous()
+                v1_runtime = v2
+                v2_runtime = v1
                 self._layer_zero_v = (v1, v2, v0, v1_runtime, v2_runtime)
             else:
                 v1 = self.v1.t().contiguous()

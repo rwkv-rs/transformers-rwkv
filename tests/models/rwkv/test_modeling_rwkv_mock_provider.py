@@ -493,6 +493,8 @@ class RwkvMockProviderTest(unittest.TestCase):
                 (self.config.v_low_rank_dim, self.config.hidden_size),
             ),
         )
+        self.assertEqual(layer_zero_v[0].data_ptr(), layer_zero_v[4].data_ptr())
+        self.assertEqual(layer_zero_v[1].data_ptr(), layer_zero_v[3].data_ptr())
         self.assertFalse(any("runtime" in key for key in state_keys))
 
         model.to(dtype=torch.float16)
