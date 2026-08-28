@@ -471,6 +471,17 @@ class RwkvMockProviderTest(unittest.TestCase):
             self.assertIsNotNone(layer.linear_attn._low_rank_canonical)
             self.assertIsNotNone(layer.mlp._value_runtime)
             self.assertEqual(layer.mlp.value.weight.device.type, "cpu")
+        layer_zero_v = model.model.layers[0].linear_attn._layer_zero_v
+        self.assertEqual(
+            tuple(tensor.shape for tensor in layer_zero_v),
+            (
+                (self.config.v_low_rank_dim, self.config.hidden_size),
+                (self.config.hidden_size, self.config.v_low_rank_dim),
+                (self.config.hidden_size,),
+                (self.config.hidden_size, self.config.v_low_rank_dim),
+                (self.config.v_low_rank_dim, self.config.hidden_size),
+            ),
+        )
         self.assertFalse(any("runtime" in key for key in state_keys))
 
         model.to(dtype=torch.float16)

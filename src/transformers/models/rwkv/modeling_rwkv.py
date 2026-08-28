@@ -391,7 +391,7 @@ class RwkvAttention(nn.Module):
                 self.g1.t().contiguous(),
             ]
             if self.layer_idx == 0:
-                rank = 1
+                rank = self.config.v_low_rank_dim
                 v1 = torch.zeros(rank, self.hidden_size, dtype=self.w1.dtype, device=self.w1.device)
                 v2 = torch.zeros(self.hidden_size, rank, dtype=self.w1.dtype, device=self.w1.device)
                 v0 = torch.zeros(self.hidden_size, dtype=self.w1.dtype, device=self.w1.device)
