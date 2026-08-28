@@ -723,7 +723,7 @@ class RwkvFeedForward(nn.Module):
         if key_lora_a is not None or key_lora_b is not None:
             raise RuntimeError("Merge ChannelMix key LoRA adapters before RWKV-7 inference.")
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
-        residual, output = flash_rwkv2.infer_cmix_forward_varlen(
+        hidden_states, residual = flash_rwkv2.infer_cmix_forward_varlen(
             hidden_states.contiguous(),
             residual.contiguous(),
             layer_norm.weight,
@@ -739,7 +739,7 @@ class RwkvFeedForward(nn.Module):
             validated_metadata=ticket,
             deterministic=torch.are_deterministic_algorithms_enabled(),
         )
-        return output, residual
+        return hidden_states, residual
 
     def forward(
         self,

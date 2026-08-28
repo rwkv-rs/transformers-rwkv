@@ -195,6 +195,12 @@ class FakeFlashRwkv2:
         eps=1e-5,
         validated_metadata=None,
     ):
+        layer_index = getattr(self, "layer_index", 0)
+        if layer_index:
+            expected_x, expected_residual = self.expected_tmix_inputs
+            if x.data_ptr() != expected_x.data_ptr() or residual.data_ptr() != expected_residual.data_ptr():
+                raise AssertionError("TimeMix must preserve ChannelMix's hidden and residual stream order.")
+        self.layer_index = (layer_index + 1) % self.num_layers
         batch_size = state_indices.numel()
         sequence_length = x.shape[0] // batch_size
         residual = x + residual
@@ -373,6 +379,7 @@ class FakeFlashRwkv2:
         shift_state_pool.copy_(normalized[:, -1])
         activation = F.relu(F.linear(mixed, key_weight)).square()
         output = activation.view(-1, activation.shape[-1]) @ value_weight
+        self.expected_tmix_inputs = (residual, output)
         return residual, output
 
     @staticmethod
@@ -400,6 +407,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         torch.manual_seed(101)
         self.config = tiny_config()
         self.fake = FakeFlashRwkv2()
+        self.fake.num_layers = self.config.num_hidden_layers
         self.loader = mock.patch(
             "transformers.models.rwkv.modeling_rwkv.load_flash_rwkv2",
             return_value=self.fake,
