@@ -575,7 +575,6 @@ src/transformers/models/roberta_prelayernorm/convert_roberta_prelayernorm_origin
 src/transformers/models/roc_bert/configuration_roc_bert.py
 src/transformers/models/roformer/modeling_roformer.py
 src/transformers/models/rwkv/configuration_rwkv.py
-src/transformers/models/rwkv/convert_rwkv_checkpoint_to_hf.py
 src/transformers/models/rwkv/modeling_rwkv.py
 src/transformers/models/sam/configuration_sam.py
 src/transformers/models/sam/convert_sam_to_hf.py

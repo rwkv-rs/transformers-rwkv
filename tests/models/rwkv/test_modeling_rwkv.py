@@ -1,4 +1,4 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,403 +12,414 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import importlib.util
+import json
+import tempfile
 import unittest
-from unittest.util import safe_repr
+from importlib.metadata import version
+from pathlib import Path
 
-from parameterized import parameterized
+from packaging.requirements import Requirement
 
-from transformers import AutoTokenizer, RwkvConfig, is_torch_available
-from transformers.testing_utils import require_torch, slow, torch_device
+from transformers import RwkvConfig, is_torch_available
+from transformers.dependency_versions_table import deps
+from transformers.testing_utils import require_peft, require_torch
 
-from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
-from ...test_modeling_common import ModelTesterMixin, ids_tensor, random_attention_mask
-from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
     import torch
 
-    from transformers import (
-        RwkvForCausalLM,
-        RwkvModel,
+    from transformers import RwkvForCausalLM, RwkvModel
+    from transformers.cache_utils import DynamicCache, LinearAttentionLayer
+    from transformers.integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
+    from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+    from transformers.models.rwkv.modeling_rwkv import (
+        RwkvAttention,
+        RwkvCache,
+        RwkvDecoderLayer,
+        RwkvFeedForward,
+        RwkvPreTrainedModel,
     )
 
+    all_model_classes = (RwkvModel, RwkvForCausalLM)
 
-class RwkvModelTester:
-    def __init__(
-        self,
-        parent,
-        batch_size=14,
-        seq_length=7,
-        is_training=True,
-        use_token_type_ids=False,
-        use_input_mask=True,
-        use_labels=True,
-        use_mc_token_ids=True,
-        vocab_size=99,
-        hidden_size=32,
-        num_hidden_layers=2,
-        intermediate_size=37,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
-        max_position_embeddings=512,
-        type_vocab_size=16,
-        type_sequence_label_size=2,
-        num_labels=3,
-        num_choices=4,
-        scope=None,
-    ):
-        self.parent = parent
-        self.batch_size = batch_size
-        self.seq_length = seq_length
-        self.is_training = is_training
-        self.use_token_type_ids = use_token_type_ids
-        self.use_input_mask = use_input_mask
-        self.use_labels = use_labels
-        self.use_mc_token_ids = use_mc_token_ids
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.num_hidden_layers = num_hidden_layers
-        self.intermediate_size = intermediate_size
-        self.hidden_act = hidden_act
-        self.hidden_dropout_prob = hidden_dropout_prob
-        self.attention_probs_dropout_prob = attention_probs_dropout_prob
-        self.max_position_embeddings = max_position_embeddings
-        self.type_vocab_size = type_vocab_size
-        self.type_sequence_label_size = type_sequence_label_size
-        self.num_labels = num_labels
-        self.num_choices = num_choices
-        self.scope = scope
-        self.bos_token_id = vocab_size - 1
-        self.eos_token_id = vocab_size - 1
-        self.pad_token_id = vocab_size - 1
 
-    def prepare_config_and_inputs(
-        self, gradient_checkpointing=False, scale_attn_by_inverse_layer_idx=False, reorder_and_upcast_attn=False
-    ):
-        input_ids = ids_tensor([self.batch_size, self.seq_length], self.vocab_size)
-
-        input_mask = None
-        if self.use_input_mask:
-            input_mask = random_attention_mask([self.batch_size, self.seq_length])
-
-        token_type_ids = None
-        if self.use_token_type_ids:
-            token_type_ids = ids_tensor([self.batch_size, self.seq_length], self.type_vocab_size)
-
-        mc_token_ids = None
-        if self.use_mc_token_ids:
-            mc_token_ids = ids_tensor([self.batch_size, self.num_choices], self.seq_length)
-
-        sequence_labels = None
-        token_labels = None
-        choice_labels = None
-        if self.use_labels:
-            sequence_labels = ids_tensor([self.batch_size], self.type_sequence_label_size)
-            token_labels = ids_tensor([self.batch_size, self.seq_length], self.num_labels)
-            choice_labels = ids_tensor([self.batch_size], self.num_choices)
-
-        config = self.get_config(
-            gradient_checkpointing=gradient_checkpointing,
-            scale_attn_by_inverse_layer_idx=scale_attn_by_inverse_layer_idx,
-            reorder_and_upcast_attn=reorder_and_upcast_attn,
-        )
-
-        return (
-            config,
-            input_ids,
-            input_mask,
-            token_type_ids,
-            mc_token_ids,
-            sequence_labels,
-            token_labels,
-            choice_labels,
-        )
-
-    def get_config(
-        self, gradient_checkpointing=False, scale_attn_by_inverse_layer_idx=False, reorder_and_upcast_attn=False
-    ):
-        return RwkvConfig(
-            vocab_size=self.vocab_size,
-            hidden_size=self.hidden_size,
-            num_hidden_layers=self.num_hidden_layers,
-            intermediate_size=self.intermediate_size,
-            activation_function=self.hidden_act,
-            resid_pdrop=self.hidden_dropout_prob,
-            attn_pdrop=self.attention_probs_dropout_prob,
-            n_positions=self.max_position_embeddings,
-            type_vocab_size=self.type_vocab_size,
-            use_cache=True,
-            bos_token_id=self.bos_token_id,
-            eos_token_id=self.eos_token_id,
-            pad_token_id=self.pad_token_id,
-            gradient_checkpointing=gradient_checkpointing,
-            scale_attn_by_inverse_layer_idx=scale_attn_by_inverse_layer_idx,
-            reorder_and_upcast_attn=reorder_and_upcast_attn,
-        )
-
-    def get_pipeline_config(self):
-        config = self.get_config()
-        config.vocab_size = 300
-        return config
-
-    def create_and_check_rwkv_model(self, config, input_ids, input_mask, token_type_ids, *args):
-        config.output_hidden_states = True
-        model = RwkvModel(config=config)
-        model.to(torch_device)
-        model.eval()
-
-        result = model(input_ids)
-
-        self.parent.assertEqual(result.last_hidden_state.shape, (self.batch_size, self.seq_length, self.hidden_size))
-        self.parent.assertEqual(len(result.hidden_states), config.num_hidden_layers + 1)
-
-    def create_and_check_causl_lm(self, config, input_ids, input_mask, token_type_ids, *args):
-        model = RwkvForCausalLM(config)
-        model.to(torch_device)
-        model.eval()
-
-        result = model(input_ids, labels=input_ids)
-        self.parent.assertEqual(result.loss.shape, ())
-        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.vocab_size))
-
-    def create_and_check_state_equivalency(self, config, input_ids, input_mask, token_type_ids, *args):
-        model = RwkvModel(config=config)
-        model.to(torch_device)
-        model.eval()
-
-        outputs = model(input_ids)
-        output_whole = outputs.last_hidden_state
-
-        outputs = model(input_ids[:, :2])
-        output_one = outputs.last_hidden_state
-
-        # Using the state computed on the first inputs, we will get the same output
-        outputs = model(input_ids[:, 2:], state=outputs.state)
-        output_two = outputs.last_hidden_state
-
-        self.parent.assertTrue(torch.allclose(torch.cat([output_one, output_two], dim=1), output_whole, atol=1e-5))
-
-    def prepare_config_and_inputs_for_common(self):
-        config_and_inputs = self.prepare_config_and_inputs()
-
-        (
-            config,
-            input_ids,
-            input_mask,
-            token_type_ids,
-            mc_token_ids,
-            sequence_labels,
-            token_labels,
-            choice_labels,
-        ) = config_and_inputs
-
-        inputs_dict = {"input_ids": input_ids}
-
-        return config, inputs_dict
+def tiny_config(**kwargs) -> RwkvConfig:
+    values = {
+        "vocab_size": 128,
+        "context_length": 32,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "intermediate_size": 256,
+        "head_size": 64,
+        "decay_low_rank_dim": 32,
+        "a_low_rank_dim": 32,
+        "v_low_rank_dim": 32,
+        "gate_low_rank_dim": 32,
+    }
+    values.update(kwargs)
+    return RwkvConfig(**values)
 
 
 @require_torch
-class RwkvModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
-    all_model_classes = (RwkvModel, RwkvForCausalLM) if is_torch_available() else ()
-    pipeline_model_mapping = (
-        {"feature-extraction": RwkvModel, "text-generation": RwkvForCausalLM} if is_torch_available() else {}
-    )
-    test_missing_keys = False
-
+class RwkvConfigTest(unittest.TestCase):
     def setUp(self):
-        self.model_tester = RwkvModelTester(self)
-        self.config_tester = ConfigTester(
-            self, config_class=RwkvConfig, n_embd=37, common_properties=["hidden_size", "num_hidden_layers"]
-        )
-
-    def assertInterval(self, member, container, msg=None):
-        r"""
-        Simple utility function to check if a member is inside an interval.
-        """
-        if isinstance(member, torch.Tensor):
-            max_value, min_value = member.max().item(), member.min().item()
-        elif isinstance(member, (list, tuple)):
-            max_value, min_value = max(member), min(member)
-
-        if not isinstance(container, list):
-            raise TypeError("container should be a list or tuple")
-        elif len(container) != 2:
-            raise ValueError("container should have 2 elements")
-
-        expected_min, expected_max = container
-
-        is_inside_interval = (min_value >= expected_min) and (max_value <= expected_max)
-
-        if not is_inside_interval:
-            standardMsg = f"{safe_repr(member)} not found in {safe_repr(container)}"
-            self.fail(self._formatMessage(msg, standardMsg))
+        self.config_tester = ConfigTester(self, config_class=RwkvConfig, hidden_size=64)
 
     def test_config(self):
         self.config_tester.run_common_tests()
 
-    def test_rwkv_model(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs()
-        self.model_tester.create_and_check_rwkv_model(*config_and_inputs)
+    def test_rank_formulas_and_fixed_contract(self):
+        config = RwkvConfig(hidden_size=1024, num_hidden_layers=24)
+        self.assertEqual(config.num_attention_heads, 16)
+        self.assertEqual(config.intermediate_size, 4096)
+        self.assertEqual(config.decay_low_rank_dim, 64)
+        self.assertEqual(config.a_low_rank_dim, 64)
+        self.assertEqual(config.v_low_rank_dim, 64)
+        self.assertEqual(config.gate_low_rank_dim, 160)
+        self.assertEqual(config.wkv_state_dtype, "float32")
 
-    def test_rwkv_lm_head_model(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs()
-        self.model_tester.create_and_check_causl_lm(*config_and_inputs)
+    def test_rwkv4_and_noncanonical_fields_fail_closed(self):
+        invalid = (
+            {"attention_hidden_size": 64},
+            {"rescale_every": 6},
+            {"head_size": 128},
+            {"intermediate_size": 320},
+            {"wkv_state_dtype": "float16"},
+            {"pad_token_id": 0},
+            {"tie_word_embeddings": True},
+        )
+        for override in invalid:
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                tiny_config(**override)
 
-    def test_state_equivalency(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs()
-        self.model_tester.create_and_check_state_equivalency(*config_and_inputs)
 
-    def test_attention_outputs(self):
-        r"""
-        Overriding the test_attention_outputs test as the attention outputs of Rwkv are different from other models
-        it has a shape `batch_size, seq_len, hidden_size`.
-        """
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        config.return_dict = True
+@require_torch
+class RwkvStructureTest(unittest.TestCase):
+    def test_public_types_and_standard_outputs(self):
+        self.assertTrue(issubclass(RwkvPreTrainedModel, torch.nn.Module))
+        self.assertTrue(issubclass(RwkvAttention, torch.nn.Module))
+        self.assertTrue(issubclass(RwkvFeedForward, torch.nn.Module))
+        self.assertTrue(issubclass(RwkvDecoderLayer, torch.nn.Module))
+        self.assertTrue(issubclass(RwkvCache, object))
+        self.assertNotIn("RwkvTrainingState", __import__("transformers").__dict__)
+        self.assertNotIn("RwkvModelOutput", __import__("transformers").__dict__)
+        self.assertIs(BaseModelOutputWithPast, type(BaseModelOutputWithPast()))
+        self.assertIs(CausalLMOutputWithPast, type(CausalLMOutputWithPast()))
 
-        seq_len = getattr(self.model_tester, "seq_length", None)
+    def test_qwen_style_module_and_state_dict_names(self):
+        model = RwkvForCausalLM(tiny_config())
+        layer = model.model.layers[0]
+        self.assertEqual(
+            set(layer._modules),
+            {"linear_attn", "mlp", "input_layernorm", "post_attention_layernorm"},
+        )
+        keys = set(model.state_dict())
+        required = {
+            "model.embed_tokens.weight",
+            "model.embedding_norm.weight",
+            "model.layers.0.linear_attn.r_proj.weight",
+            "model.layers.0.mlp.key.weight",
+            "model.layers.0.mlp.value.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        }
+        self.assertTrue(required.issubset(keys))
+        self.assertFalse(any(key.startswith("model.layers.0.linear_attn.v0") for key in keys))
+        self.assertFalse(any(key.startswith("model.layers.0.linear_attn.v1") for key in keys))
+        self.assertFalse(any(key.startswith("model.layers.0.linear_attn.v2") for key in keys))
+        self.assertIn("model.layers.1.linear_attn.v0", keys)
+        self.assertFalse(any("time_mix" in key or "receptance" in key for key in keys))
 
-        for model_class in self.all_model_classes:
-            inputs_dict["output_attentions"] = True
-            inputs_dict["output_hidden_states"] = False
-            config.return_dict = True
-            model = model_class._from_config(config, attn_implementation="eager")
-            config = model.config
-            model.to(torch_device)
-            model.eval()
-
-            inputs = self._prepare_for_class(inputs_dict, model_class)
-            batch_size = inputs["input_ids"].shape[0]
-            with torch.no_grad():
-                outputs = model(**inputs)
-            attentions = outputs.attentions
-            self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
-
-            # check that output_attentions also work using config
-            del inputs_dict["output_attentions"]
-            config.output_attentions = True
-            model = model_class(config)
-            model.to(torch_device)
-            model.eval()
-
-            inputs = self._prepare_for_class(inputs_dict, model_class)
-            batch_size = inputs["input_ids"].shape[0]
-            with torch.no_grad():
-                outputs = model(**inputs)
-            attentions = outputs.attentions
-            self.assertEqual(len(attentions), self.model_tester.num_hidden_layers)
-
-            self.assertListEqual(
-                list(attentions[0].shape[-3:]),
-                [batch_size, seq_len, config.hidden_size],
+    def test_initialization_matches_train_temp_formulas(self):
+        torch.manual_seed(11)
+        config = tiny_config()
+        model = RwkvForCausalLM(config)
+        attention = model.model.layers[1].linear_attn
+        channels = config.hidden_size
+        position = torch.arange(channels, dtype=torch.float32)
+        ddd = position / channels
+        ratio = 1.0 - 1 / config.num_hidden_layers
+        expected_x_r = 1 - ddd.pow(0.2 * ratio)
+        torch.testing.assert_close(attention.x_r.float(), expected_x_r)
+        linear = position / (channels - 1) - 0.5
+        torch.testing.assert_close(attention.v0.float(), 0.73 - linear * 0.4)
+        self.assertTrue(torch.equal(attention.w1, torch.zeros_like(attention.w1)))
+        self.assertTrue(torch.equal(attention.a1, torch.zeros_like(attention.a1)))
+        self.assertTrue(torch.equal(attention.v1, torch.zeros_like(attention.v1)))
+        self.assertTrue(torch.equal(attention.g1, torch.zeros_like(attention.g1)))
+        self.assertTrue(torch.equal(attention.o_proj.weight, torch.zeros_like(attention.o_proj.weight)))
+        self.assertTrue(
+            torch.equal(
+                model.model.layers[0].mlp.value.weight, torch.zeros_like(model.model.layers[0].mlp.value.weight)
             )
-            out_len = len(outputs)
+        )
+        self.assertLessEqual(float(model.model.embed_tokens.weight.detach().abs().max()), 1e-4)
 
-            # Check attention is always last and order is fine
-            inputs_dict["output_attentions"] = True
-            inputs_dict["output_hidden_states"] = True
-            model = model_class(config)
-            model.to(torch_device)
-            model.eval()
+    def test_cpu_mask_and_cache_boundaries_fail_closed(self):
+        model = RwkvModel(tiny_config()).half().eval()
+        input_ids = torch.tensor([[1, 2]])
+        with self.assertRaisesRegex(ValueError, "padding or ragged"):
+            model(input_ids, attention_mask=torch.tensor([[1, 0]]))
+        with self.assertRaisesRegex(TypeError, "only RwkvCache"):
+            model(input_ids, past_key_values=DynamicCache())
+        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+            model(input_ids)
 
-            inputs = self._prepare_for_class(inputs_dict, model_class)
-            batch_size = inputs["input_ids"].shape[0]
-            with torch.no_grad():
-                outputs = model(**inputs)
-
-            added_hidden_states = 1
-            self.assertEqual(out_len + added_hidden_states, len(outputs))
-
-            self_attentions = outputs.attentions
-
-            self.assertEqual(len(self_attentions), self.model_tester.num_hidden_layers)
-            self.assertListEqual(
-                list(self_attentions[0].shape[-3:]),
-                [batch_size, seq_len, config.hidden_size],
+    def test_provider_is_pinned_to_a9_and_validates_only_requested_roots(self):
+        requirement = Requirement(deps["FlashRWKV2"])
+        self.assertEqual(str(requirement.specifier), "==0.1.0a9")
+        self.assertEqual(version("FlashRWKV2"), "0.1.0a9")
+        module = load_flash_rwkv2(
+            (
+                "pretrain_tmix_wkv7_recurrent_bf16",
+                "statetune_tmix_wkv7_recurrent_fp32io16",
+                "infer_tmix_wkv_prepare_forward_varlen",
             )
+        )
+        self.assertEqual(module.__version__, "0.1.0a9")
+        with self.assertRaisesRegex(RuntimeError, "public operators"):
+            load_flash_rwkv2("operator_that_does_not_exist")
 
-    @slow
-    def test_model_from_pretrained(self):
-        model_name = "RWKV/rwkv-4-169m-pile"
-        model = RwkvModel.from_pretrained(model_name)
-        self.assertIsNotNone(model)
+    def test_plain_linear_spec_and_bias_failure(self):
+        projection = torch.nn.Linear(8, 8, bias=False)
+        weight, lora_a, lora_b, scale = flash_rwkv2_linear_spec(projection)
+        self.assertIs(weight, projection.weight)
+        self.assertIsNone(lora_a)
+        self.assertIsNone(lora_b)
+        self.assertEqual(scale, 1.0)
+        with self.assertRaisesRegex(RuntimeError, "base bias"):
+            flash_rwkv2_linear_spec(torch.nn.Linear(8, 8, bias=True))
 
-    def test_beam_sample_generate_dict_output(self):
-        # This model has a custom attention output shape AND config flags, let's skip those checks
-        old_has_attentions = self.has_attentions
-        self.has_attentions = False
-        super().test_beam_sample_generate_dict_output()
-        self.has_attentions = old_has_attentions
+    @require_peft
+    def test_peft_linear_spec_active_disabled_merged_and_unsupported(self):
+        from peft import LoraConfig, get_peft_model
 
-    def test_beam_search_generate_dict_output(self):
-        # This model has a custom attention output shape AND config flags, let's skip those checks
-        old_has_attentions = self.has_attentions
-        self.has_attentions = False
-        super().test_beam_search_generate_dict_output()
-        self.has_attentions = old_has_attentions
+        model = get_peft_model(
+            RwkvForCausalLM(tiny_config()),
+            LoraConfig(r=4, lora_alpha=8, target_modules=["r_proj"]),
+        )
+        projection = model.base_model.model.model.layers[0].linear_attn.r_proj
+        weight, lora_a, lora_b, scale = flash_rwkv2_linear_spec(projection)
+        self.assertIs(weight, projection.get_base_layer().weight)
+        self.assertIs(lora_a, projection.lora_A["default"].weight)
+        self.assertIs(lora_b, projection.lora_B["default"].weight)
+        self.assertEqual(scale, 2.0)
 
-    def test_greedy_generate_dict_outputs(self):
-        # This model has a custom attention output shape AND config flags, let's skip those checks
-        old_has_attentions = self.has_attentions
-        self.has_attentions = False
-        super().test_greedy_generate_dict_outputs()
-        self.has_attentions = old_has_attentions
+        model.disable_adapter_layers()
+        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0))
+        model.enable_adapter_layers()
+        model.merge_adapter()
+        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0))
+        model.unmerge_adapter()
 
-    def test_sample_generate_dict_output(self):
-        # This model has a custom attention output shape AND config flags, let's skip those checks
-        old_has_attentions = self.has_attentions
-        self.has_attentions = False
-        super().test_sample_generate_dict_output()
-        self.has_attentions = old_has_attentions
+        model.add_adapter("second", LoraConfig(r=4, lora_alpha=4, target_modules=["r_proj"]))
+        projection.set_adapter(["default", "second"])
+        with self.assertRaisesRegex(RuntimeError, "exactly one active"):
+            flash_rwkv2_linear_spec(projection)
 
-    @unittest.skip("This model doesn't support padding")
-    def test_left_padding_compatibility(self):
-        pass
-
-    @unittest.skip("This model doesn't support beam search with cache, as the cache cannot be reordered")
-    def test_beam_search_generate(self):
-        pass
-
-    @unittest.skip("This model doesn't support beam search with cache, as the cache cannot be reordered")
-    def test_beam_sample_generate(self):
-        pass
-
-    @parameterized.expand([("greedy", 1), ("beam search", 2)])
-    def test_generate_from_inputs_embeds(self, _, num_beams):
-        # Skip beam search
-        if num_beams == 2:
-            self.skipTest("This model doesn't support beam search with cache, as the cache cannot be reordered")
-        else:
-            super().test_generate_from_inputs_embeds("greedy", 1)
+        dora_model = get_peft_model(
+            RwkvForCausalLM(tiny_config()),
+            LoraConfig(r=4, lora_alpha=8, use_dora=True, target_modules=["r_proj"]),
+        )
+        dora_projection = dora_model.base_model.model.model.layers[0].linear_attn.r_proj
+        with self.assertRaisesRegex(RuntimeError, "vanilla LoRA"):
+            flash_rwkv2_linear_spec(dora_projection)
 
 
-@slow
-class RWKVIntegrationTests(unittest.TestCase):
+@require_torch
+class RwkvCacheTest(unittest.TestCase):
     def setUp(self):
-        self.model_id = "RWKV/rwkv-4-169m-pile"
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.config = tiny_config()
+        self.hidden = torch.zeros(2, 3, self.config.hidden_size, dtype=torch.bfloat16)
 
-    def test_simple_generate(self):
-        expected_output = "Hello my name is Jasmine and I am a newbie to the"
-        model = RwkvForCausalLM.from_pretrained(self.model_id).to(torch_device)
+    def test_layout_length_and_linear_attention_layers(self):
+        cache = RwkvCache(self.config)
+        self.assertTrue(all(isinstance(layer, LinearAttentionLayer) for layer in cache.layers))
+        self.assertTrue(all(layer.number_of_states == 2 for layer in cache.layers))
+        attention_shift, wkv_state, mlp_shift = cache.layer_states(0, self.hidden)
+        self.assertEqual(attention_shift.shape, (2, 64))
+        self.assertEqual(mlp_shift.shape, (2, 64))
+        self.assertEqual(wkv_state.shape, (2, 1, 64, 64))
+        self.assertEqual(wkv_state.dtype, torch.float32)
+        cache.advance(3, 2, self.hidden.device)
+        self.assertEqual(cache.get_seq_length(), 3)
+        self.assertEqual(cache.stream_lengths.tolist(), [3, 3])
 
-        input_ids = self.tokenizer("Hello my name is", return_tensors="pt").input_ids.to(torch_device)
-        output = model.generate(input_ids, max_new_tokens=10)
-        output_sentence = self.tokenizer.decode(output[0].tolist())
+    def test_training_update_preserves_autograd_and_detach_cuts_it(self):
+        cache = RwkvCache(self.config)
+        _, wkv_state, _ = cache.layer_states(0, self.hidden)
+        attention_shift = (self.hidden[:, -1] + 1).requires_grad_()
+        next_wkv = wkv_state.clone().requires_grad_() + 1
+        mlp_shift = (self.hidden[:, -1] + 2).requires_grad_()
+        cache.update_layer(0, attention_shift, next_wkv, mlp_shift, training=True)
+        self.assertIsNotNone(cache.layers[0].conv_states[0].grad_fn)
+        self.assertIsNotNone(cache.layers[0].recurrent_states[0].grad_fn)
+        cloned = cache.clone()
+        detached = cache.detach()
+        self.assertIsNotNone(cloned.layers[0].conv_states[0].grad_fn)
+        self.assertIsNone(detached.layers[0].conv_states[0].grad_fn)
+        self.assertNotEqual(cloned.layers[0].conv_states[0].data_ptr(), cache.layers[0].conv_states[0].data_ptr())
 
-        self.assertEqual(output_sentence, expected_output)
+    def test_reset_repeat_select_and_reorder(self):
+        cache = RwkvCache(self.config)
+        cache.layer_states(0, self.hidden)
+        cache.advance(3, 2, self.hidden.device)
+        cache.batch_repeat_interleave(2)
+        self.assertEqual(cache.batch_size, 4)
+        cache.batch_select_indices(torch.tensor([3, 1]))
+        self.assertEqual(cache.batch_size, 2)
+        cache.reset(torch.tensor([0]))
+        self.assertEqual(cache.stream_lengths.tolist(), [0, 3])
+        cache.reorder_cache(torch.tensor([1, 0]))
+        self.assertEqual(cache.stream_lengths.tolist(), [3, 0])
+        cache.reset()
+        self.assertEqual(cache.get_seq_length(), 0)
+        self.assertEqual(cache.stream_lengths.tolist(), [0, 0])
 
-    def test_simple_generate_bf16(self):
-        expected_output = "Hello my name is Jasmine and I am a newbie to the"
+    def test_training_chunk_metadata_covers_arbitrary_lengths(self):
+        cache = RwkvCache(self.config)
+        for sequence_length in (1, 7, 15, 16, 17, 31):
+            offsets, starts, ends = cache.training_metadata(2, sequence_length, self.hidden.device)
+            self.assertEqual(offsets[0].item(), 0)
+            self.assertEqual(offsets[-1].item(), len(starts))
+            self.assertEqual(starts[0].item(), 0)
+            self.assertEqual(ends[-1].item(), 2 * sequence_length)
+            self.assertTrue(torch.all(ends > starts))
+            self.assertTrue(torch.all(ends - starts <= 16))
 
-        input_ids = self.tokenizer("Hello my name is", return_tensors="pt").input_ids.to(torch_device)
-        model = RwkvForCausalLM.from_pretrained(self.model_id, dtype=torch.bfloat16).to(torch_device)
 
-        output = model.generate(input_ids, max_new_tokens=10)
-        output_sentence = self.tokenizer.decode(output[0].tolist())
+@require_torch
+class RwkvConverterTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).parents[3] / "temp" / "rwkv_pth2st.py"
+        spec = importlib.util.spec_from_file_location("rwkv_pth2st", path)
+        cls.converter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.converter)
 
-        self.assertEqual(output_sentence, expected_output)
+    @staticmethod
+    def canonical_state_dict(config: RwkvConfig) -> dict[str, torch.Tensor]:
+        model_state = RwkvForCausalLM(config).state_dict()
+        source = {}
+        top_level = {
+            "model.embed_tokens.weight": "emb.weight",
+            "model.embedding_norm.weight": "blocks.0.ln0.weight",
+            "model.embedding_norm.bias": "blocks.0.ln0.bias",
+            "model.norm.weight": "ln_out.weight",
+            "model.norm.bias": "ln_out.bias",
+            "lm_head.weight": "head.weight",
+        }
+        projection = {
+            "r_proj": "receptance",
+            "k_proj": "key",
+            "v_proj": "value",
+            "o_proj": "output",
+            "g_norm": "ln_x",
+        }
+        for target_key, tensor in model_state.items():
+            if target_key in top_level:
+                source_key = top_level[target_key]
+            else:
+                parts = target_key.split(".")
+                layer_idx, component = parts[2], parts[3]
+                suffix = parts[4:]
+                component = {
+                    "linear_attn": "att",
+                    "mlp": "ffn",
+                    "input_layernorm": "ln1",
+                    "post_attention_layernorm": "ln2",
+                }[component]
+                if component == "att":
+                    suffix[0] = projection.get(suffix[0], suffix[0])
+                source_key = ".".join(("blocks", layer_idx, component, *suffix))
+            value = tensor.detach().clone()
+            if target_key.split(".")[-1] in {
+                "x_r",
+                "x_w",
+                "x_k",
+                "x_v",
+                "x_a",
+                "x_g",
+                "w0",
+                "a0",
+                "v0",
+                "k_k",
+                "k_a",
+            }:
+                value = value.view(1, 1, -1)
+            source[source_key] = value
+        source["blocks.0.att.v0"] = torch.zeros(1, 1, config.hidden_size)
+        source["blocks.0.att.v1"] = torch.zeros(config.hidden_size, config.v_low_rank_dim)
+        source["blocks.0.att.v2"] = torch.zeros(config.v_low_rank_dim, config.hidden_size)
+        return source
+
+    def test_inference_translation_and_layer_zero_drop(self):
+        config = tiny_config(decay_low_rank_dim=17, a_low_rank_dim=19, v_low_rank_dim=23, gate_low_rank_dim=29)
+        source = self.canonical_state_dict(config)
+        inferred = self.converter.infer_config(source, context_length=16)
+        self.assertEqual(
+            (
+                inferred.decay_low_rank_dim,
+                inferred.a_low_rank_dim,
+                inferred.v_low_rank_dim,
+                inferred.gate_low_rank_dim,
+            ),
+            (17, 19, 23, 29),
+        )
+        plan, dropped = self.converter.translation_plan(source)
+        self.assertEqual(dropped, self.converter.LAYER_ZERO_UNUSED)
+        expected = self.converter.expected_state_dict(inferred)
+        self.converter.validate_plan(source, plan, dropped, expected)
+        self.assertEqual(set(plan), set(expected))
+        self.assertEqual(plan["model.layers.0.mlp.key.weight"], "blocks.0.ffn.key.weight")
+
+    def test_converter_rejects_compiled_and_cross_layer_rank_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "compiled.pth"
+            torch.save({"_orig_mod.emb.weight": torch.empty(1)}, checkpoint)
+            with self.assertRaisesRegex(ValueError, "_orig_mod"):
+                self.converter.load_checkpoint(checkpoint)
+
+        source = self.canonical_state_dict(tiny_config())
+        source["blocks.1.att.w1"] = torch.empty(64, 31)
+        source["blocks.1.att.w2"] = torch.empty(31, 64)
+        with self.assertRaisesRegex(ValueError, "rank must agree"):
+            self.converter.infer_config(source, context_length=16)
+
+    def test_converter_rejects_noncanonical_broad_squeeze_shapes(self):
+        config = tiny_config()
+        source = self.canonical_state_dict(config)
+        source["blocks.0.att.x_r"] = source["blocks.0.att.x_r"].reshape(1, config.hidden_size, 1)
+        plan, dropped = self.converter.translation_plan(source)
+        with self.assertRaisesRegex(ValueError, "mismatched"):
+            self.converter.validate_plan(source, plan, dropped, self.converter.expected_state_dict(config))
+
+    def test_shard_writer_consumes_source_and_writes_reloadable_values(self):
+        from safetensors import safe_open
+
+        config = tiny_config()
+        source = self.canonical_state_dict(config)
+        expected_embedding = source["emb.weight"].clone()
+        plan, dropped = self.converter.translation_plan(source)
+        expected = self.converter.expected_state_dict(config)
+        for source_key in dropped:
+            source.pop(source_key)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            self.converter.write_shards(source, plan, expected, output, "20KB")
+            index_path = output / "model.safetensors.index.json"
+            self.assertTrue(index_path.is_file())
+            index = json.loads(index_path.read_text())
+            self.assertEqual(set(index["weight_map"]), set(expected))
+            embedding_file = output / index["weight_map"]["model.embed_tokens.weight"]
+            with safe_open(embedding_file, framework="pt") as shard:
+                actual = shard.get_tensor("model.embed_tokens.weight")
+            torch.testing.assert_close(actual, expected_embedding)
+        self.assertFalse(source)
+
+
+if __name__ == "__main__":
+    unittest.main()
