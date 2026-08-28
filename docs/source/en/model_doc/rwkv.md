@@ -17,139 +17,155 @@ rendered properly in your Markdown viewer.
 
 # RWKV
 
-
 ## Overview
 
-The RWKV model (version 4) was proposed in [this repo](https://github.com/BlinkDL/RWKV-LM)
+RWKV-7 is a recurrent language model whose TimeMix layers update a fixed-size matrix state instead of retaining a
+key/value tensor for every earlier token. The implementation follows the canonical RWKV-LM training equations and uses
+the FlashRWKV2 CUDA provider for both training and inference. The former RWKV-4 implementation and its state/output
+types are not compatible with RWKV-7 checkpoints.
 
-It suggests a tweak in the traditional Transformer attention to make it linear. This way, the model can be used as recurrent network: passing inputs for timestamp 0 and timestamp 1 together is the same as passing inputs at timestamp 0, then inputs at timestamp 1 along with the state of timestamp 0 (see example below).
+This integration requires CUDA and `FlashRWKV2==0.1.0a9`; it intentionally has no CPU or FLA execution fallback. Install
+the RWKV dependencies with:
 
-This can be more efficient than a regular Transformer and can deal with sentence of any length (even if the model uses a fixed context length for training).
+```bash
+pip install "transformers[rwkv]"
+```
 
-This model was contributed by [sgugger](https://huggingface.co/sgugger).
-The original code can be found [here](https://github.com/BlinkDL/RWKV-LM).
+Training uses BF16 model tensors. Inference uses FP16 model tensors, except for the BF16 embedding/LN0 fusion and FP32
+WKV states. Inputs in one batch must have equal length because RWKV-7 does not use a padding token.
 
-## Usage example
+## Inference
+
+Converted checkpoints use standard `AutoModelForCausalLM`, `AutoTokenizer`, `generate()`, and [`RwkvCache`] APIs.
 
 ```python
 import torch
 
-from transformers import AutoTokenizer, RwkvModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-model = RwkvModel.from_pretrained("sgugger/rwkv-430M-pile", device_map="auto")
-tokenizer = AutoTokenizer.from_pretrained("sgugger/rwkv-430M-pile")
+checkpoint = "/path/to/converted-rwkv7"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+model = AutoModelForCausalLM.from_pretrained(
+    checkpoint,
+    dtype=torch.float16,
+).cuda().eval()
 
-inputs = tokenizer("This is an example.", return_tensors="pt").to(model.device)
-# Feed everything to the model
-outputs = model(inputs["input_ids"])
-output_whole = outputs.last_hidden_state
+messages = [{"role": "user", "content": "Explain recurrent language models briefly."}]
+inputs = tokenizer.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(model.device)
 
-outputs = model(inputs["input_ids"][:, :2])
-output_one = outputs.last_hidden_state
-
-# Using the state computed on the first inputs, we will get the same output
-outputs = model(inputs["input_ids"][:, 2:], state=outputs.state)
-output_two = outputs.last_hidden_state
-
-torch.allclose(torch.cat([output_one, output_two], dim=1), output_whole, atol=1e-5)
+output_ids = model.generate(
+    **inputs,
+    max_new_tokens=128,
+    tokenizer=tokenizer,
+    stop_strings=model.generation_config.stop_strings,
+)
+print(tokenizer.decode(output_ids[0, inputs.input_ids.shape[1] :]))
 ```
 
-If you want to make sure the model stops generating when `'\n\n'` is detected, we recommend using the following stopping criteria:
+The bundled Jinja template supports the RWKV bot and assistant prompt styles, tool-use conversations, and open/fake
+thinking prompts through ordinary `apply_chat_template()` keyword arguments. `GenerationConfig.stop_strings` contains
+the stop markers for all three prompt styles.
+
+## Stateful execution
+
+Pass the returned `past_key_values` back to the model to continue a stream. [`RwkvCache`] stores two token-shift vectors
+and one FP32 WKV matrix per layer. It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
 
 ```python
-from transformers import StoppingCriteria
+from transformers import RwkvCache
 
 
-class RwkvStoppingCriteria(StoppingCriteria):
-    def __init__(self, eos_sequence = [187,187], eos_token_id = 537):
-        self.eos_sequence = eos_sequence
-        self.eos_token_id = eos_token_id
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        last_2_ids = input_ids[:,-2:].tolist()
-        return self.eos_sequence in last_2_ids
-
-
-output = model.generate(inputs["input_ids"], max_new_tokens=64, stopping_criteria = [RwkvStoppingCriteria()])
+cache = RwkvCache(model.config)
+first = model(input_ids=inputs.input_ids, past_key_values=cache, use_cache=True)
+continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache, use_cache=True)
 ```
+
+Stateful BF16 training keeps the recurrent state in the autograd graph. Call `cache.detach()` when starting a truncated
+backpropagation segment.
+
+## Training
+
+Move the complete model back to BF16 before training. Stateless training uses the canonical FlashRWKV2 pretraining
+operators for sequence lengths divisible by 16; other non-empty chunks use the differentiable zero-initial-state
+StateTune path.
+
+```python
+model.to(device="cuda", dtype=torch.bfloat16).train()
+outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
+outputs.loss.backward()
+```
+
+For recurrent training, create one [`RwkvCache`] and pass it through the chunks. The cache update occurs outside each
+checkpointed decoder layer, so gradient checkpointing does not apply the state transition twice.
+
+## LoRA and CUDA Graphs
+
+During FP16 inference, FlashRWKV2 accepts one active, unmerged vanilla PEFT LoRA adapter on each TimeMix R/K/V/O
+projection. Disabled and merged adapters are also supported. Merge adapters that use multiple active branches, DoRA,
+variants, bias, or ChannelMix targets before inference; unsupported layouts fail before a kernel launch.
+
+Inference runtime layouts are created automatically by the first warmup forward. That warmup also moves the canonical
+ChannelMix value weight to CPU after creating its transposed runtime layout. Calling `.to(...)` or loading a state dict
+invalidates these non-persistent layouts and restores the canonical parameter. For CUDA Graph decode, warm up the fixed
+batch/sequence shape and its [`RwkvCache`] on the capture stream before capture; cache state tensors retain fixed
+addresses during eval updates.
+
+## Converting a canonical checkpoint
+
+The converter accepts canonical BlinkDL release keys only. It drops block 0's unused value-residual tensors, plans
+Safetensors shards before cloning them, and writes one shard at a time to bound peak host memory.
+
+```bash
+python temp/rwkv_pth2st.py \
+  /path/to/rwkv7-g1i.pth \
+  /path/to/converted-rwkv7 \
+  --context-length 10240 \
+  --max-shard-size 5GB
+```
+
+The output includes the model config, generation config, sharded Safetensors, the fixed RWKV World tokenizer, and the
+single standard chat template.
 
 ## RwkvConfig
 
 [[autodoc]] RwkvConfig
+
+## RwkvTokenizer
+
+[[autodoc]] RwkvTokenizer
+
+## RwkvCache
+
+[[autodoc]] RwkvCache
 
 ## RwkvModel
 
 [[autodoc]] RwkvModel
     - forward
 
-## RwkvLMHeadModel
+## RwkvForCausalLM
 
 [[autodoc]] RwkvForCausalLM
     - forward
 
-## Rwkv attention and the recurrent formulas
+## RwkvAttention
 
-In a traditional auto-regressive Transformer, attention is written as
+[[autodoc]] RwkvAttention
 
-$$O = \hbox{softmax}(QK^{T} / \sqrt{d}) V$$
+## RwkvFeedForward
 
-with $Q$, $K$ and $V$ are matrices of shape `seq_len x hidden_size` named query, key and value (they are actually bigger matrices with a batch dimension and an attention head dimension but we're only interested in the last two, which is where the matrix product is taken, so for the sake of simplicity we only consider those two). The product $QK^{T}$ then has shape `seq_len x seq_len` and we can take the matrix product with $V$ to get the output $O$ of the same shape as the others.  
+[[autodoc]] RwkvFeedForward
 
-Replacing the softmax by its value gives:
+## RwkvDecoderLayer
 
-$$O_{i} = \frac{\sum_{j=1}^{i} e^{Q_{i} K_{j}^{T} / \sqrt{d}} V_{j}}{\sum_{j=1}^{i} e^{Q_{i} K_{j}^{T} / \sqrt{d}}}$$
+[[autodoc]] RwkvDecoderLayer
 
-Note that the entries in $QK^{T}$ corresponding to $j > i$ are masked (the sum stops at j) because the attention is not allowed to look at future tokens (only past ones).
+## RwkvPreTrainedModel
 
-In comparison, the RWKV attention is given by
-
-$$O_{i} = \sigma(R_{i}) \frac{\sum_{j=1}^{i} e^{W_{i-j} + K_{j}} V_{j}}{\sum_{j=1}^{i} e^{W_{i-j} + K_{j}}}$$
-
-where $R$ is a new matrix called receptance by the author, $K$ and $V$ are still the key and value ($\sigma$ here is the sigmoid function). $W$ is a new vector that represents the position of the token and is given by
-
-$$W_{0} = u \hbox{  and  } W_{k} = (k-1)w \hbox{ for } k \geq 1$$
-
-with $u$ and $w$ learnable parameters called in the code `time_first` and `time_decay` respectively. The numerator and denominator can both be expressed recursively. Naming them $N_{i}$ and $D_{i}$ we have:
-
-$$N_{i} = e^{u + K_{i}} V_{i} + \hat{N}_{i} \hbox{  where  } \hat{N}_{i} = e^{K_{i-1}} V_{i-1} + e^{w + K_{i-2}} V_{i-2} \cdots + e^{(i-2)w + K_{1}} V_{1}$$
-
-so $\hat{N}_{i}$ (called `numerator_state` in the code) satisfies
-
-$$\hat{N}_{0} = 0 \hbox{  and  } \hat{N}_{j+1} = e^{K_{j}} V_{j} + e^{w} \hat{N}_{j}$$
-
-and
-
-$$D_{i} = e^{u + K_{i}} + \hat{D}_{i} \hbox{  where  } \hat{D}_{i} = e^{K_{i-1}} + e^{w + K_{i-2}} \cdots + e^{(i-2)w + K_{1}}$$
-
-so $\hat{D}_{i}$ (called `denominator_state` in the code) satisfies
-
-$$\hat{D}_{0} = 0 \hbox{  and  } \hat{D}_{j+1} = e^{K_{j}} + e^{w} \hat{D}_{j}$$
-
-The actual recurrent formula used are a tiny bit more complex, as for numerical stability we don't want to compute exponentials of big numbers. Usually the softmax is not computed as is, but the exponential of the maximum term is divided of the numerator and denominator:
-
-$$\frac{e^{x_{i}}}{\sum_{j=1}^{n} e^{x_{j}}} = \frac{e^{x_{i} - M}}{\sum_{j=1}^{n} e^{x_{j} - M}}$$
-
-with $M$ the maximum of all $x_{j}$. So here on top of saving the numerator state ($\hat{N}$) and the denominator state ($\hat{D}$) we also keep track of the maximum of all terms encountered in the exponentials. So we actually use
-
-$$\tilde{N}_{i} = e^{-M_{i}} \hat{N}_{i} \hbox{  and  } \tilde{D}_{i} = e^{-M_{i}} \hat{D}_{i}$$
-
-defined by the following recurrent formulas:
-
-$$\tilde{N}_{0} = 0 \hbox{  and  } \tilde{N}_{j+1} = e^{K_{j} - q} V_{j} + e^{w + M_{j} - q} \tilde{N}_{j} \hbox{  where  } q = \max(K_{j}, w + M_{j})$$
-
-and
-
-$$\tilde{D}_{0} = 0 \hbox{  and  } \tilde{D}_{j+1} = e^{K_{j} - q} + e^{w + M_{j} - q} \tilde{D}_{j} \hbox{  where  } q = \max(K_{j}, w + M_{j})$$
-
-and $M_{j+1} = q$. With those, we can then compute
-
-$$N_{i} = e^{u + K_{i} - q} V_{i} + e^{M_{i}} \tilde{N}_{i} \hbox{  where  } q = \max(u + K_{i}, M_{i})$$
-
-and
-
-$$D_{i} = e^{u + K_{i} - q} + e^{M_{i}} \tilde{D}_{i} \hbox{  where  } q = \max(u + K_{i}, M_{i})$$
-
-which finally gives us
-
-$$O_{i} = \sigma(R_{i}) \frac{N_{i}}{D_{i}}$$
+[[autodoc]] RwkvPreTrainedModel

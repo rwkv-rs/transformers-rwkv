@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2026 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,18 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import TYPE_CHECKING
+"""Rust-backed tokenizer for the RWKV World vocabulary."""
 
-from ...utils import _LazyModule
-from ...utils.import_utils import define_import_structure
+from tokenizers.models import RwkvTrie
+
+from ...tokenization_utils_tokenizers import TokenizersBackend
 
 
-if TYPE_CHECKING:
-    from .configuration_rwkv import *
-    from .modeling_rwkv import *
-    from .tokenization_rwkv import *
-else:
-    import sys
+class RwkvTokenizer(TokenizersBackend):
+    """Greedy longest-match byte tokenizer backed by `tokenizers.models.RwkvTrie`."""
 
-    _file = globals()["__file__"]
-    sys.modules[__name__] = _LazyModule(__name__, _file, define_import_structure(_file), module_spec=__spec__)
+    model_input_names = ["input_ids", "attention_mask"]
+    model = RwkvTrie
+
+
+__all__ = ["RwkvTokenizer"]
