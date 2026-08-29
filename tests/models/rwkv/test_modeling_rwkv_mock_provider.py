@@ -1117,6 +1117,14 @@ class RwkvMockProviderTest(unittest.TestCase):
             checkpoint = Path(directory) / "checkpoint-1"
             reloaded = RwkvForCausalLM.from_pretrained(checkpoint, dtype=torch.bfloat16)
             self.assertEqual(reloaded(torch.tensor([[1, 2, 3]]), use_cache=False).logits.shape, (1, 3, 128))
+            self.assertEqual(
+                (
+                    reloaded.generation_config.presence_penalty,
+                    reloaded.generation_config.frequency_penalty,
+                    reloaded.generation_config.penalty_decay,
+                ),
+                (0.0, 0.0, 0.996),
+            )
 
             resumed_arguments = TrainingArguments(
                 output_dir=directory,
