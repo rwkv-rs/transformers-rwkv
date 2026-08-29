@@ -498,6 +498,41 @@ class _RwkvGenerationCache(dict[tuple, _RwkvGenerationModelRunner]):
 class RwkvGenerationMixin(GenerationMixin):
     _supported_generation_modes = [GenerationMode.GREEDY_SEARCH, GenerationMode.SAMPLE]
 
+    def adjust_generation_fn(
+        self,
+        generation_config,
+        from_auto_class,
+        from_pipeline,
+        pretrained_model_name_or_path,
+        cache_dir,
+        force_download,
+        proxies,
+        local_files_only,
+        token,
+        revision,
+        subfolder,
+        trust_remote_code,
+        **kwargs,
+    ):
+        super().adjust_generation_fn(
+            generation_config,
+            from_auto_class,
+            from_pipeline,
+            pretrained_model_name_or_path,
+            cache_dir,
+            force_download,
+            proxies,
+            local_files_only,
+            token,
+            revision,
+            subfolder,
+            trust_remote_code,
+            **kwargs,
+        )
+        self.generation_config.presence_penalty = getattr(self.generation_config, "presence_penalty", 0.0)
+        self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
+        self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
+
     def _get_rwkv_generation_cache(self) -> _RwkvGenerationCache:
         cache = getattr(self, "_rwkv_generation_graphs", None)
         if cache is None:
