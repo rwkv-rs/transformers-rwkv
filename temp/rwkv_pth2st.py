@@ -29,6 +29,35 @@ MODEL_VOCAB_SIZE = 65536
 BOS_EOS_TOKEN = "<|endoftext|>"
 CHAT_TEMPLATE = Path(__file__).with_name("rwkv_chat_template.jinja")
 STOP_STRINGS = ["✿", "\nUser:", "\n### User"]
+GENERATION_CONFIGS = {
+    "generation_config.json": {
+        "do_sample": True,
+        "temperature": 0.96,
+        "top_p": 0.76,
+        "top_k": 32,
+        "presence_penalty": 1.0,
+        "frequency_penalty": 0.1,
+        "penalty_decay": 0.988,
+    },
+    "fake_think_generation_config.json": {
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.28,
+        "top_k": 32,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "penalty_decay": 0.996,
+    },
+    "tools_generation_config.json": {
+        "do_sample": True,
+        "temperature": 0.96,
+        "top_p": 0.76,
+        "top_k": 32,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "penalty_decay": 0.996,
+    },
+}
 LAYER_ZERO_UNUSED = {
     "blocks.0.att.v0",
     "blocks.0.att.v1",
@@ -56,9 +85,7 @@ def _shape(state: dict[str, torch.Tensor], key: str, dimensions: int) -> torch.S
     return tensor.shape
 
 
-def _rank(
-    state: dict[str, torch.Tensor], layer_ids: list[int], stem: str, hidden_size: int
-) -> int:
+def _rank(state: dict[str, torch.Tensor], layer_ids: list[int], stem: str, hidden_size: int) -> int:
     ranks = set()
     for layer_idx in layer_ids:
         first = f"blocks.{layer_idx}.att.{stem}1"
@@ -66,9 +93,7 @@ def _rank(
         input_hidden, rank = _shape(state, first, 2)
         output_rank, output_hidden = _shape(state, second, 2)
         if input_hidden != hidden_size or output_hidden != hidden_size or output_rank != rank:
-            raise ValueError(
-                f"`{first}` and `{second}` must form [hidden, rank] and [rank, hidden] projections."
-            )
+            raise ValueError(f"`{first}` and `{second}` must form [hidden, rank] and [rank, hidden] projections.")
         ranks.add(rank)
     if len(ranks) != 1:
         raise ValueError(f"RWKV-7 `{stem}` rank must agree across layers, got {sorted(ranks)}.")
@@ -242,9 +267,7 @@ def resolve_tokenizer_source(tokenizer_source: Path | None) -> Path:
         )
     digest = hashlib.sha256(tokenizer_source.read_bytes()).hexdigest()
     if digest != TOKENIZER_SHA256:
-        raise ValueError(
-            f"RWKV tokenizer SHA-256 mismatch: expected {TOKENIZER_SHA256}, got {digest}."
-        )
+        raise ValueError(f"RWKV tokenizer SHA-256 mismatch: expected {TOKENIZER_SHA256}, got {digest}.")
     return tokenizer_source
 
 
@@ -291,6 +314,17 @@ def save_tokenizer(tokenizer_source: Path | None, output: Path, context_length: 
     validate_tokenizer(reloaded)
 
 
+def save_generation_configs(config: RwkvConfig, output: Path) -> None:
+    for config_file_name, parameters in GENERATION_CONFIGS.items():
+        generation_config = GenerationConfig(
+            bos_token_id=config.bos_token_id,
+            eos_token_id=config.eos_token_id,
+            stop_strings=STOP_STRINGS,
+            **parameters,
+        )
+        generation_config.save_pretrained(output, config_file_name=config_file_name)
+
+
 def convert_checkpoint(
     checkpoint: Path,
     output: Path,
@@ -309,9 +343,7 @@ def convert_checkpoint(
     output.mkdir(parents=True, exist_ok=True)
     config.architectures = ["RwkvForCausalLM"]
     config.save_pretrained(output)
-    generation_config = GenerationConfig.from_model_config(config)
-    generation_config.stop_strings = STOP_STRINGS
-    generation_config.save_pretrained(output)
+    save_generation_configs(config, output)
     write_shards(state, target_to_source, expected, output, max_shard_size)
     save_tokenizer(tokenizer_source, output, context_length)
     if state:
