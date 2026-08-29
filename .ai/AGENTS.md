@@ -52,8 +52,8 @@ We try to avoid direct inheritance between model-specific files in `src/transfor
 Transformers 是 LLM 社区的标准库, 很早成为生态中心, 本仓库需要按照社区主流做法(参考 FLA 中对 RWKV 的**代码风格**, 以及 Transformers 中 Qwen3.5 Kimi-K3 等带有 Linear RNN Layer 的模型的**功能设计**与**代码风格**)完成 RWKV 模型的接入, 通过最简洁直接的方式替代上游仓库中 rwkv 的实现. (因为它实际上是早已过时的 rwkv4 而非我们需要支持的 rwkv7)
 代码原则: 每一个文件/类型/函数/变量都需要找到相似实现作为原型, 若该原型带有模型名则将其替换为 `RWKV` 或其它大小写变种, 否则保持同名.
 在 ./temp 目录下尽可能精简实现权重转换脚本, 对齐 FLA 中 RWKV7 的代码风格, 避免维护不必要的重命名契约.
-本仓库对 rwkv7 预训练的支持数值精度与吞吐应完全对齐 RWKV-LM/blob/main/RWKV-v7/train_temp;
-本仓库对 rwkv7 推理的支持数值精度与吞吐应完全对齐 Albatross;
+本仓库对 rwkv7 预训练的支持数值精度与吞吐应完全对齐**最新版本**的 RWKV-LM/blob/main/RWKV-v7/train_temp;
+本仓库对 rwkv7 推理的支持数值精度与吞吐应完全对齐**最新版本**的 Albatross, 在 ./temp 目录下尽可能精简实现自定义 bench, 需要在真实 batch_size = {1, 4, 64, 320, 512} 7.2B 生成场景下端到端完成测速, prefill速度 = prompt长度 / 首 token 延迟, decode速度 = completion长度 / (生成总耗时 - 首 token 延迟), 补充: 需要实现异步 detokenize, 这部分不应影响生成速度;
 FlashRWKV (https://github.com/rwkv-rs/FlashRWKV) 是 RWKV 社区权威算子实现仓库, 为本仓库提供高性能后端, 本仓库对算子相关内容只做导入不做开发. 如精度与推理速度因为 FlashRWKV 实现错误导致精度差/推理速度慢, 应直接与用户反馈, 无需跨越实现边界完成修复.
 为 Transformers 的支持应服务于主流研究需求: 假设存在一个用户, 创建自定义模型 Qwen2Rwkv, 要加载一个魔改的 Qwen 3.5, 所有的 GDN 换成 128 head_size的 RWKV Tmix, 所有 GQA 换成 256 head_size 的 RWKV Tmix, Norm 都用 RWKV 的 LayerNorm, emb lm_head moe 都用 Qwen 3.5 的实现, 应当做到50行代码左右实现对应功能. (暂不实现)
 
