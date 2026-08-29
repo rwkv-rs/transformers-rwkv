@@ -33,8 +33,8 @@ class RwkvConfig(PreTrainedConfig):
         Width of each RWKV-7 recurrent head.
     group_norm_epsilon (`float`, *optional*, defaults to 0.00064):
         Epsilon used by the head-wise normalization in TimeMix.
-    wkv_state_dtype (`str`, *optional*, defaults to `"float32"`):
-        Dtype used for the recurrent WKV matrix.
+    wkv_mode (`str`, *optional*, defaults to `"fp32io16"`):
+        WKV state mode used by CUDA-graph generation. Public [`RwkvCache`] state remains float32.
     decay_low_rank_dim (`int`, *optional*):
         Rank of the time-decay projection. Inferred from `hidden_size` when omitted.
     a_low_rank_dim (`int`, *optional*):
@@ -63,18 +63,18 @@ class RwkvConfig(PreTrainedConfig):
     pad_token_id: int | None = None
     tie_word_embeddings: bool = False
     use_cache: bool = True
-    wkv_state_dtype: str = "float32"
+    wkv_mode: str = "fp32io16"
     decay_low_rank_dim: int | None = None
     a_low_rank_dim: int | None = None
     v_low_rank_dim: int | None = None
     gate_low_rank_dim: int | None = None
 
     def __post_init__(self, **kwargs):
-        legacy = sorted({"attention_hidden_size", "rescale_every"}.intersection(kwargs))
+        legacy = sorted({"attention_hidden_size", "rescale_every", "wkv_state_dtype"}.intersection(kwargs))
         if legacy:
             names = ", ".join(f"`{name}`" for name in legacy)
             raise ValueError(
-                f"Legacy RWKV-4 configuration fields are no longer supported: {names}. "
+                f"Legacy RWKV configuration fields are no longer supported: {names}. "
                 "This `rwkv` implementation requires an RWKV-7 checkpoint."
             )
         if self.intermediate_size is None:
@@ -123,8 +123,8 @@ class RwkvConfig(PreTrainedConfig):
             raise ValueError(f"`context_length` must be positive, got {self.context_length}.")
         if self.layer_norm_epsilon <= 0 or self.group_norm_epsilon <= 0:
             raise ValueError("RWKV-7 normalization epsilons must be positive.")
-        if self.wkv_state_dtype != "float32":
-            raise ValueError(f"RWKV-7 WKV state must use float32, got {self.wkv_state_dtype!r}.")
+        if self.wkv_mode not in {"fp32io16", "fp16"}:
+            raise ValueError(f"`wkv_mode` must be one of {{'fp32io16', 'fp16'}}, got {self.wkv_mode!r}.")
         ranks = {
             "decay_low_rank_dim": self.decay_low_rank_dim,
             "a_low_rank_dim": self.a_low_rank_dim,

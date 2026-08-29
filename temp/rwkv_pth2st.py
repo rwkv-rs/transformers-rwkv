@@ -101,7 +101,7 @@ def infer_config(state: dict[str, torch.Tensor], context_length: int) -> RwkvCon
         a_low_rank_dim=_rank(state, layer_ids, "a", hidden_size),
         v_low_rank_dim=_rank(state, layer_ids[1:], "v", hidden_size),
         gate_low_rank_dim=_rank(state, layer_ids, "g", hidden_size),
-        wkv_state_dtype="float32",
+        wkv_mode="fp32io16",
     )
 
 
