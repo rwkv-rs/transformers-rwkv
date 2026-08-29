@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from transformers import is_torch_available
-from transformers.testing_utils import require_accelerate, require_peft, require_torch
+from transformers.testing_utils import require_accelerate, require_peft, require_torch, require_torch_gpu
 
 
 if is_torch_available():
@@ -26,11 +27,13 @@ if is_torch_available():
     import torch.nn.functional as F
 
     from transformers import RwkvConfig, RwkvForCausalLM
+    from transformers.generation import EosTokenCriteria, LogitsProcessor, MaxLengthCriteria, StopStringCriteria
     from transformers.modeling_outputs import CausalLMOutputWithPast
+    from transformers.models.rwkv.generation_rwkv import _rwkv_prefill_lengths
     from transformers.models.rwkv.modeling_rwkv import RwkvCache
 
 
-def tiny_config() -> RwkvConfig:
+def tiny_config(**kwargs) -> RwkvConfig:
     return RwkvConfig(
         vocab_size=128,
         context_length=32,
@@ -42,7 +45,59 @@ def tiny_config() -> RwkvConfig:
         a_low_rank_dim=32,
         v_low_rank_dim=32,
         gate_low_rank_dim=32,
+        **kwargs,
     )
+
+
+def single_token_stop_criteria(vocab_size: int, token_id: int) -> StopStringCriteria:
+    criteria = object.__new__(StopStringCriteria)
+    criteria.stop_strings = ("x",)
+    criteria.maximum_token_len = 1
+    criteria.num_stop_strings = 1
+    criteria.max_valid_positions = 1
+    criteria.max_valid_end_lens = 1
+    criteria.target_lens = torch.tensor([1], dtype=torch.int32)
+    criteria.embedding_vec = torch.full((vocab_size + 1, 3), -1, dtype=torch.int32)
+    criteria.embedding_vec[:, -1] = 1
+    criteria.embedding_vec[token_id, 1] = 1
+    return criteria
+
+
+class FakeRecurrentState:
+    def __init__(self, state_pool, elapsed_state_pool, sequence_capacity):
+        self._state_pool = state_pool
+        self._elapsed_state_pool = elapsed_state_pool
+        self._sequence_capacity = sequence_capacity
+
+    def clone(self):
+        elapsed_state_pool = None if self._elapsed_state_pool is None else self._elapsed_state_pool.clone()
+        return type(self)(self._state_pool.clone(), elapsed_state_pool, self._sequence_capacity)
+
+    def copy_(self, other):
+        self._state_pool.copy_(other._state_pool)
+        if self._elapsed_state_pool is not None:
+            self._elapsed_state_pool.copy_(other._elapsed_state_pool)
+        return self
+
+    def zero_(self):
+        self._state_pool.zero_()
+        if self._elapsed_state_pool is not None:
+            self._elapsed_state_pool.zero_()
+        return self
+
+
+class RecordingStreamer:
+    def __init__(self):
+        self.values = []
+        self.thread_ids = []
+        self.end_thread_id = None
+
+    def put(self, value):
+        self.values.append(value.clone())
+        self.thread_ids.append(threading.get_ident())
+
+    def end(self):
+        self.end_thread_id = threading.get_ident()
 
 
 class FakeFlashRwkv2:
@@ -181,6 +236,61 @@ class FakeFlashRwkv2:
     def prepare_tmix_wkv7_recurrent_metadata(*args, **kwargs):
         return object()
 
+    @staticmethod
+    def prepare_tmix_wkv7_recurrent_fp16_state(
+        state_pool_size, channels, *, sequence_capacity, head_size=64, device=None
+    ):
+        state_pool = torch.zeros(
+            state_pool_size,
+            channels // head_size,
+            head_size,
+            head_size,
+            dtype=torch.float16,
+            device=device,
+        )
+        elapsed_state_pool = torch.zeros(state_pool_size, dtype=torch.int32, device=device)
+        return FakeRecurrentState(state_pool, elapsed_state_pool, sequence_capacity)
+
+    @staticmethod
+    def prepare_tmix_wkv7_recurrent_fp32io16_state(
+        state_pool_size, channels, *, sequence_capacity, head_size=64, device=None
+    ):
+        state_pool = torch.zeros(
+            state_pool_size,
+            channels // head_size,
+            head_size,
+            head_size,
+            dtype=torch.float32,
+            device=device,
+        )
+        return FakeRecurrentState(state_pool, None, sequence_capacity)
+
+    @staticmethod
+    def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state_pool):
+        return FakeRecurrentState(state_pool, None, state_pool.shape[0])
+
+    @staticmethod
+    def setup_sampling_states(seed, num_slots):
+        return torch.full((num_slots, 1), seed, dtype=torch.int64, device="cuda")
+
+    @staticmethod
+    def infer_sampling_temperature_topk_topp_forward_varlen(
+        logits,
+        states,
+        slot_indices,
+        *,
+        temperature=1.0,
+        top_k=-1,
+        top_p=1.0,
+    ):
+        _ = slot_indices, temperature, top_p
+        candidate_count = logits.shape[-1] if top_k == -1 else top_k
+        candidates = torch.topk(logits, k=candidate_count, dim=-1).indices
+        choices = torch.remainder(states[:, 0], candidate_count)
+        sampled = candidates.gather(1, choices[:, None]).squeeze(1)
+        states.add_(1)
+        return sampled
+
     def infer_tmix_postnorm_tokenshift_forward_varlen(
         self,
         x,
@@ -295,7 +405,7 @@ class FakeFlashRwkv2:
         a,
         b,
         *,
-        state_pool,
+        state,
         cu_seqlens,
         state_indices,
         scale=1.0,
@@ -311,9 +421,44 @@ class FakeFlashRwkv2:
         ]
         if decay_bias is not None:
             values[1] = values[1] + decay_bias.view(1, 1, *values[1].shape[2:])
-        output, final_state = self._recurrence(state_pool, *values)
-        state_pool.copy_(final_state)
+        output, final_state = self._recurrence(state._state_pool, *values)
+        state._state_pool.copy_(final_state)
         return (output * scale).view_as(value)
+
+    def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
+        self,
+        receptance,
+        decay_logits,
+        key,
+        value,
+        a,
+        b,
+        *,
+        state,
+        cu_seqlens,
+        state_indices,
+        scale=1.0,
+        decay_bias=None,
+        max_seqlen=None,
+        validated_metadata=None,
+    ):
+        output = self.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+            receptance,
+            decay_logits,
+            key,
+            value,
+            a,
+            b,
+            state=state,
+            cu_seqlens=cu_seqlens,
+            state_indices=state_indices,
+            scale=scale,
+            decay_bias=decay_bias,
+            max_seqlen=max_seqlen,
+            validated_metadata=validated_metadata,
+        )
+        state._elapsed_state_pool.add_(max_seqlen)
+        return output
 
     @staticmethod
     def infer_tmix_readout_forward_varlen(
@@ -412,12 +557,18 @@ class RwkvMockProviderTest(unittest.TestCase):
             "transformers.models.rwkv.modeling_rwkv.load_flash_rwkv2",
             return_value=self.fake,
         )
+        self.generation_loader = mock.patch(
+            "transformers.models.rwkv.generation_rwkv.load_flash_rwkv2",
+            return_value=self.fake,
+        )
         self.metadata = mock.patch.object(RwkvCache, "recurrent_metadata", fake_recurrent_metadata)
         self.loader.start()
+        self.generation_loader.start()
         self.metadata.start()
 
     def tearDown(self):
         self.metadata.stop()
+        self.generation_loader.stop()
         self.loader.stop()
 
     def test_stateless_training_outputs_loss_backward_and_tuple(self):
@@ -434,6 +585,228 @@ class RwkvMockProviderTest(unittest.TestCase):
         self.assertIsNotNone(model.model.layers[0].linear_attn.o_proj.weight.grad)
         tuple_output = model(input_ids, logits_to_keep=2, return_dict=False)
         self.assertEqual(tuple_output[0].shape, (2, 2, self.config.vocab_size))
+
+    def test_graph_prefill_consumes_every_prompt_token_except_the_last_once(self):
+        self.assertEqual(_rwkv_prefill_lengths(1, None), ())
+        self.assertEqual(_rwkv_prefill_lengths(9, None), (8,))
+        self.assertEqual(_rwkv_prefill_lengths(9, 4), (4, 4))
+        self.assertEqual(_rwkv_prefill_lengths(10, 4), (4, 4, 1))
+        self.assertEqual(_rwkv_prefill_lengths(12, 4), (4, 4, 3))
+
+    @require_torch_gpu
+    def test_cuda_graph_generation_reuses_prefill_and_decode_graphs(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(1, self.config.vocab_size, (2, 6), device="cuda")
+
+        reference_cache = RwkvCache(self.config)
+        model.model._forward_state_only(input_ids[:, :-1], None, reference_cache, False)
+        reference_token = input_ids[:, -1:]
+        reference_completion = []
+        for _ in range(3):
+            reference_logits = model(
+                reference_token,
+                past_key_values=reference_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            ).logits[:, -1]
+            reference_token = torch.argmax(reference_logits.float(), dim=-1, keepdim=True)
+            reference_completion.append(reference_token)
+        expected = torch.cat((input_ids, *reference_completion), dim=-1)
+
+        first = model.generate(
+            input_ids,
+            max_new_tokens=3,
+            prefill_chunk_size=2,
+            do_sample=False,
+            eos_token_id=None,
+        )
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+        second = model.generate(
+            input_ids,
+            max_new_tokens=3,
+            prefill_chunk_size=2,
+            do_sample=False,
+            eos_token_id=None,
+        )
+
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, first)
+        self.assertEqual(len(model._rwkv_generation_graphs), 1)
+        self.assertEqual(runtime.prefill_lengths, (2, 2, 1))
+        self.assertEqual(reference_cache.get_seq_length(), 8)
+        for layer_idx, reference_layer in enumerate(reference_cache.layers):
+            torch.testing.assert_close(
+                runtime.state.attention_shift[layer_idx], reference_layer.conv_states[0].squeeze(-1)
+            )
+            torch.testing.assert_close(
+                runtime.state.feed_forward_shift[layer_idx], reference_layer.conv_states[1].squeeze(-1)
+            )
+            torch.testing.assert_close(
+                runtime.state.recurrent_states[layer_idx]._state_pool, reference_layer.recurrent_states[0]
+            )
+
+    @require_torch_gpu
+    def test_single_token_prompt_starts_with_decode_graph_and_exposes_first_logits(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(1, self.config.vocab_size, (2, 1), device="cuda")
+        reference_cache = RwkvCache(self.config)
+        reference_logits = (
+            model(
+                input_ids,
+                past_key_values=reference_cache,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            .logits[:, -1]
+            .float()
+        )
+
+        generated = model.generate(
+            input_ids,
+            max_new_tokens=1,
+            do_sample=False,
+            eos_token_id=None,
+        )
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+
+        self.assertEqual(runtime.prefill_lengths, ())
+        torch.testing.assert_close(runtime.decode_graph.logits, reference_logits)
+        torch.testing.assert_close(generated[:, 1], torch.argmax(reference_logits, dim=-1))
+
+    @require_torch_gpu
+    def test_cuda_graph_sampling_uses_fixed_seed_and_rapid_sampling_parameters(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(1, self.config.vocab_size, (4, 3), device="cuda")
+        sampling_kwargs = {
+            "max_new_tokens": 4,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_k": 8,
+            "top_p": 0.9,
+            "eos_token_id": None,
+        }
+
+        torch.manual_seed(1234)
+        first = model.generate(input_ids, **sampling_kwargs)
+        torch.manual_seed(1234)
+        second = model.generate(input_ids, **sampling_kwargs)
+        torch.manual_seed(4321)
+        third = model.generate(input_ids, **sampling_kwargs)
+
+        torch.testing.assert_close(second, first)
+        self.assertFalse(torch.equal(third, first))
+        self.assertEqual(len(model._rwkv_generation_graphs), 1)
+
+    @require_torch_gpu
+    def test_cuda_graph_standard_stopping_criteria_override_config(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(1, self.config.vocab_size, (1, 4), device="cuda")
+        eos_token_id = 1
+        fixed_logits = torch.full((1, self.config.vocab_size), -1e4, device="cuda")
+        fixed_logits[:, eos_token_id] = 1
+
+        with mock.patch.object(self.fake, "infer_head_linear_last_forward_varlen", return_value=fixed_logits):
+            generated = model.generate(
+                input_ids,
+                max_new_tokens=5,
+                do_sample=False,
+                eos_token_id=2,
+                stopping_criteria=[EosTokenCriteria(eos_token_id)],
+            )
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+
+        self.assertEqual(generated.shape, (1, 5))
+        self.assertEqual(generated[0, -1].item(), eos_token_id)
+        self.assertEqual(runtime.decode_graph.completion_lengths.item(), 1)
+        self.assertFalse(runtime.decode_graph.unfinished.item())
+
+        model._rwkv_generation_graphs.clear()
+        with mock.patch.object(self.fake, "infer_head_linear_last_forward_varlen", return_value=fixed_logits):
+            generated = model.generate(
+                input_ids,
+                max_new_tokens=5,
+                do_sample=False,
+                eos_token_id=None,
+                stopping_criteria=[MaxLengthCriteria(input_ids.shape[1] + 2)],
+            )
+        self.assertEqual(generated.shape[1], input_ids.shape[1] + 2)
+
+    @require_torch_gpu
+    def test_finished_rows_are_padded_while_other_batch_rows_continue(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(2, self.config.vocab_size, (2, 4), device="cuda")
+        stop_token = 1
+        fixed_logits = torch.full((2, self.config.vocab_size), -1e4, device="cuda")
+        fixed_logits[0, stop_token] = 1
+        fixed_logits[1, 2] = 1
+
+        first_criteria = single_token_stop_criteria(self.config.vocab_size, stop_token)
+        second_criteria = single_token_stop_criteria(self.config.vocab_size, stop_token)
+        tokenizer = object()
+        with mock.patch.object(self.fake, "infer_head_linear_last_forward_varlen", return_value=fixed_logits):
+            generated = model.generate(
+                input_ids,
+                max_new_tokens=4,
+                do_sample=False,
+                eos_token_id=None,
+                stopping_criteria=[first_criteria],
+                tokenizer=tokenizer,
+            )
+            repeated = model.generate(
+                input_ids,
+                max_new_tokens=4,
+                do_sample=False,
+                eos_token_id=None,
+                stopping_criteria=[second_criteria],
+                tokenizer=tokenizer,
+            )
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+        completion_lengths = runtime.decode_graph.completion_lengths.tolist()
+
+        self.assertEqual(completion_lengths[0], 1)
+        self.assertGreater(completion_lengths[1], 1)
+        torch.testing.assert_close(generated[0, 5:], torch.zeros_like(generated[0, 5:]))
+        torch.testing.assert_close(repeated, generated)
+        self.assertEqual(len(model._rwkv_generation_graphs), 1)
+
+    @require_torch_gpu
+    def test_cuda_graph_fp16_mode_uses_provider_managed_state(self):
+        config = tiny_config(wkv_mode="fp16")
+        model = RwkvForCausalLM(config).half().eval().cuda()
+        input_ids = torch.randint(1, config.vocab_size, (2, 3), device="cuda")
+
+        generated = model.generate(
+            input_ids,
+            max_new_tokens=2,
+            do_sample=False,
+            eos_token_id=None,
+        )
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+
+        self.assertEqual(generated.shape, (2, 5))
+        self.assertEqual(runtime.state.recurrent_states[0]._state_pool.dtype, torch.float16)
+
+    @require_torch_gpu
+    def test_streamer_uses_async_pinned_completion_copies(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(1, self.config.vocab_size, (2, 3), device="cuda")
+        streamer = RecordingStreamer()
+        calling_thread = threading.get_ident()
+
+        generated = model.generate(
+            input_ids,
+            max_new_tokens=4,
+            do_sample=False,
+            eos_token_id=None,
+            streamer=streamer,
+        )
+        self.assertEqual(len(streamer.values), 5)
+        torch.testing.assert_close(streamer.values[0], input_ids.cpu())
+        streamed_completion = torch.stack(streamer.values[1:], dim=1)
+        torch.testing.assert_close(streamed_completion, generated[:, 3:].cpu())
+        self.assertEqual(streamer.thread_ids[0], calling_thread)
+        self.assertTrue(all(thread_id != calling_thread for thread_id in streamer.thread_ids[1:]))
+        self.assertNotEqual(streamer.end_thread_id, calling_thread)
 
     def test_bfloat16_evaluation_uses_stateless_training_operators(self):
         model = RwkvForCausalLM(self.config).to(dtype=torch.bfloat16).train()
@@ -523,6 +896,35 @@ class RwkvMockProviderTest(unittest.TestCase):
             self.assertIsNone(layer.mlp._value_runtime)
             self.assertEqual(layer.mlp.value.weight.dtype, torch.bfloat16)
 
+    def test_state_only_inference_skips_final_norm_and_head(self):
+        model = RwkvForCausalLM(self.config).half().eval()
+        input_ids = torch.randint(0, self.config.vocab_size, (2, 5))
+        cache = RwkvCache(self.config)
+
+        with (
+            mock.patch.object(
+                self.fake,
+                "infer_post_norm_output_forward_varlen",
+                side_effect=AssertionError("state-only inference must skip final norm"),
+            ),
+            mock.patch.object(
+                self.fake,
+                "infer_head_linear_last_forward_varlen",
+                side_effect=AssertionError("state-only inference must skip the LM head"),
+            ),
+            mock.patch.object(
+                self.fake,
+                "infer_sampling_temperature_topk_topp_forward_varlen",
+                side_effect=AssertionError("state-only inference must skip sampling"),
+            ),
+        ):
+            hidden_states, residual, all_hidden_states = model.model._forward_state_only(input_ids, None, cache, False)
+
+        self.assertEqual(hidden_states.shape, (10, self.config.hidden_size))
+        self.assertEqual(residual.shape, hidden_states.shape)
+        self.assertIsNone(all_hidden_states)
+        self.assertEqual(cache.get_seq_length(), 5)
+
     def test_gradient_checkpointing_preserves_state_and_gradients(self):
         plain = RwkvForCausalLM(self.config).to(dtype=torch.bfloat16).train()
         checkpointed = RwkvForCausalLM(self.config).to(dtype=torch.bfloat16).train()
@@ -564,26 +966,40 @@ class RwkvMockProviderTest(unittest.TestCase):
             checkpointed_gradient = dict(checkpointed.named_parameters())[name].grad
             torch.testing.assert_close(checkpointed_gradient, plain_gradient)
 
-    def test_standard_greedy_and_beam_generation(self):
+    def test_unsupported_generation_modes_fail_closed(self):
         model = RwkvForCausalLM(self.config).half().eval()
         input_ids = torch.randint(1, self.config.vocab_size, (1, 4))
-        greedy = model.generate(
-            input_ids,
-            max_new_tokens=3,
-            do_sample=False,
-            eos_token_id=None,
-        )
-        self.assertEqual(greedy.shape, (1, 7))
+        with self.assertRaisesRegex(ValueError, "static input batch on one CUDA device"):
+            model.generate(
+                input_ids,
+                max_new_tokens=3,
+                do_sample=False,
+                eos_token_id=None,
+            )
 
-        model.to(dtype=torch.float16)
-        beam = model.generate(
-            input_ids,
-            max_new_tokens=3,
-            do_sample=False,
-            num_beams=2,
-            eos_token_id=None,
+    @require_torch_gpu
+    def test_unsupported_cuda_graph_inputs_fail_closed(self):
+        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        input_ids = torch.randint(1, self.config.vocab_size, (2, 4), device="cuda")
+
+        cases = (
+            (
+                "padding or ragged batches",
+                {"attention_mask": torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]], device="cuda")},
+            ),
+            ("custom logits processors", {"logits_processor": [LogitsProcessor()]}),
+            ("detailed generation outputs", {"return_dict_in_generate": True}),
+            ("generation mode 'GenerationMode.BEAM_SEARCH'", {"num_beams": 2}),
         )
-        self.assertEqual(beam.shape, (1, 7))
+        for error, kwargs in cases:
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                model.generate(
+                    input_ids,
+                    max_new_tokens=2,
+                    do_sample=False,
+                    eos_token_id=None,
+                    **kwargs,
+                )
 
     @require_peft
     def test_lora_active_disabled_and_merged_inference(self):
