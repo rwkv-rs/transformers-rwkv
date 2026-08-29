@@ -61,6 +61,9 @@ def run_generate(model, input_ids, args, streamer=None):
         max_new_tokens=args.completion_length,
         prefill_chunk_size=args.prefill_chunk_size,
         do_sample=args.do_sample,
+        presence_penalty=args.presence_penalty,
+        frequency_penalty=args.frequency_penalty,
+        penalty_decay=args.penalty_decay,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,
@@ -124,6 +127,9 @@ def benchmark_worker(args) -> dict:
         "completion_length": args.completion_length,
         "prefill_chunk_size": args.prefill_chunk_size,
         "do_sample": args.do_sample,
+        "presence_penalty": args.presence_penalty,
+        "frequency_penalty": args.frequency_penalty,
+        "penalty_decay": args.penalty_decay,
         "temperature": args.temperature,
         "top_k": args.top_k,
         "top_p": args.top_p,
@@ -184,6 +190,9 @@ def validate_results(summary: dict, args) -> None:
         "completion_length",
         "prefill_chunk_size",
         "do_sample",
+        "presence_penalty",
+        "frequency_penalty",
+        "penalty_decay",
         "temperature",
         "top_k",
         "top_p",
@@ -214,6 +223,9 @@ def parse_args():
     parser.add_argument("--completion-length", type=int, default=128)
     parser.add_argument("--prefill-chunk-size", type=int)
     parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--presence-penalty", type=float, default=0.0)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
+    parser.add_argument("--penalty-decay", type=float, default=0.996)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=0.9)

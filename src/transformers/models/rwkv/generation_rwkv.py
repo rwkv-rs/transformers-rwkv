@@ -211,6 +211,9 @@ class _RwkvDecodeGraph:
         self.batch_size = batch_size
         self.max_new_tokens = max_new_tokens
         self.do_sample = generation_config.do_sample
+        self.presence_penalty = getattr(generation_config, "presence_penalty", 0.0)
+        self.frequency_penalty = getattr(generation_config, "frequency_penalty", 0.0)
+        self.penalty_decay = getattr(generation_config, "penalty_decay", 0.996)
         self.temperature = generation_config.temperature if generation_config.temperature is not None else 1.0
         self.top_k = generation_config.top_k if generation_config.top_k not in (None, 0) else -1
         self.top_p = generation_config.top_p if generation_config.top_p is not None else 1.0
@@ -232,6 +235,9 @@ class _RwkvDecodeGraph:
         self.stop_suffix = torch.full((batch_size, suffix_length), self.vocab_size, dtype=torch.long, device=device)
         self.slot_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
         self.sampling_states = flash_rwkv2.setup_sampling_states(0, batch_size) if self.do_sample else None
+        self.penalties = (
+            torch.zeros((batch_size, self.vocab_size), dtype=torch.float32, device=device) if self.do_sample else None
+        )
         for criteria in self.stop_string_criteria:
             criteria(self.stop_suffix, None)
 
@@ -257,6 +263,7 @@ class _RwkvDecodeGraph:
         self.state.copy_(state_snapshot)
         if sampling_snapshot is not None:
             self.sampling_states.copy_(sampling_snapshot)
+            self.penalties.zero_()
         self.input_ids.zero_()
         self.completion.fill_(self.pad_token_id)
         self.completion_index.zero_()
@@ -280,10 +287,14 @@ class _RwkvDecodeGraph:
         ).view(self.batch_size, model.vocab_size)
         self.logits = logits.float().contiguous()
         if self.do_sample:
-            sampled_tokens = self.flash_rwkv2.infer_sampling_temperature_topk_topp_forward_varlen(
+            sampled_tokens = self.flash_rwkv2.infer_sampling_six_parameter_forward_varlen(
                 self.logits,
+                self.penalties,
                 self.sampling_states,
                 self.slot_indices,
+                presence_penalty=self.presence_penalty,
+                frequency_penalty=self.frequency_penalty,
+                penalty_decay=self.penalty_decay,
                 temperature=self.temperature,
                 top_k=self.top_k,
                 top_p=self.top_p,
@@ -320,6 +331,7 @@ class _RwkvDecodeGraph:
         self.stop_suffix[:, -suffix.shape[1] :].copy_(suffix)
         if self.sampling_states is not None:
             self.sampling_states.copy_(self.flash_rwkv2.setup_sampling_states(seed, self.batch_size))
+            self.penalties.zero_()
 
     def replay(self) -> None:
         self.graph.replay()
@@ -390,7 +402,7 @@ class _RwkvGenerationModelRunner:
             )
         )
         if generation_config.do_sample:
-            operators.extend(("infer_sampling_temperature_topk_topp_forward_varlen", "setup_sampling_states"))
+            operators.extend(("infer_sampling_six_parameter_forward_varlen", "setup_sampling_states"))
         flash_rwkv2 = load_flash_rwkv2(tuple(operators), model.lm_head.weight, "CUDA graph generation")
         self.state = _RwkvGraphState(
             model.config,
@@ -523,7 +535,7 @@ class RwkvGenerationMixin(GenerationMixin):
                 expected.append(TopPLogitsWarper)
         if [type(processor) for processor in logits_processor] != expected:
             raise ValueError(
-                "RWKV-7 CUDA graph generation supports only temperature, top-k, and top-p sampling; "
+                "RWKV-7 CUDA graph generation supports only Rapid-Sampling and its six parameters; "
                 "custom logits processors are not supported."
             )
 
@@ -613,6 +625,9 @@ class RwkvGenerationMixin(GenerationMixin):
             max_length,
             generation_config.prefill_chunk_size,
             generation_config.do_sample,
+            getattr(generation_config, "presence_penalty", 0.0),
+            getattr(generation_config, "frequency_penalty", 0.0),
+            getattr(generation_config, "penalty_decay", 0.996),
             generation_config.temperature,
             generation_config.top_k,
             generation_config.top_p,

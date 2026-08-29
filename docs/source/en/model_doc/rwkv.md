@@ -24,7 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 CUDA provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a9`; it intentionally has no CPU or FLA execution fallback. Install
+This integration requires CUDA and `FlashRWKV2==0.1.0a11`; it intentionally has no CPU or FLA execution fallback. Install
 the RWKV dependencies with:
 
 ```bash
@@ -41,7 +41,7 @@ Converted checkpoints use standard `AutoModelForCausalLM`, `AutoTokenizer`, `gen
 ```python
 import torch
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
 checkpoint = "/path/to/converted-rwkv7"
@@ -52,25 +52,44 @@ model = AutoModelForCausalLM.from_pretrained(
 ).cuda().eval()
 
 messages = [{"role": "user", "content": "Explain recurrent language models briefly."}]
+tools = None
+generation_prompt = "open_think"
+config_file_name = (
+    "tools_generation_config.json"
+    if tools
+    else "fake_think_generation_config.json"
+    if generation_prompt == "fake_think"
+    else "generation_config.json"
+)
+generation_config = (
+    model.generation_config
+    if config_file_name == "generation_config.json"
+    else GenerationConfig.from_pretrained(checkpoint, config_file_name=config_file_name)
+)
 inputs = tokenizer.apply_chat_template(
     messages,
+    tools=tools,
     add_generation_prompt=True,
+    rwkv_generation_prompt=generation_prompt,
     return_dict=True,
     return_tensors="pt",
 ).to(model.device)
 
 output_ids = model.generate(
     **inputs,
+    generation_config=generation_config,
     max_new_tokens=128,
     tokenizer=tokenizer,
-    stop_strings=model.generation_config.stop_strings,
 )
 print(tokenizer.decode(output_ids[0, inputs.input_ids.shape[1] :]))
 ```
 
 The bundled Jinja template supports the RWKV bot and assistant prompt styles, tool-use conversations, and open/fake
-thinking prompts through ordinary `apply_chat_template()` keyword arguments. `GenerationConfig.stop_strings` contains
-the stop markers for all three prompt styles.
+thinking prompts through ordinary `apply_chat_template()` keyword arguments. The model repository contains three
+matching generation configurations. `generation_config.json` is the default Open Think profile. Fake Think uses
+`fake_think_generation_config.json`. Any request with tools uses `tools_generation_config.json`, which takes precedence
+over the thinking prompt and disables penalties. All three profiles use FlashRWKV2 Rapid-Sampling and contain the stop
+markers for every prompt style.
 
 ## Stateful execution
 
@@ -129,8 +148,8 @@ python temp/rwkv_pth2st.py \
   --max-shard-size 5GB
 ```
 
-The output includes the model config, generation config, sharded Safetensors, the fixed RWKV World tokenizer, and the
-single standard chat template.
+The output includes the model config, the Open Think, Fake Think, and tools generation configs, sharded Safetensors,
+the fixed RWKV World tokenizer, and the single standard chat template.
 
 ## RwkvConfig
 
