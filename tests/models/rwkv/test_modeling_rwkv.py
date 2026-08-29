@@ -79,7 +79,8 @@ class RwkvConfigTest(unittest.TestCase):
         self.assertEqual(config.a_low_rank_dim, 64)
         self.assertEqual(config.v_low_rank_dim, 64)
         self.assertEqual(config.gate_low_rank_dim, 160)
-        self.assertEqual(config.wkv_state_dtype, "float32")
+        self.assertEqual(config.wkv_mode, "fp32io16")
+        self.assertEqual(tiny_config(wkv_mode="fp16").wkv_mode, "fp16")
 
     def test_rwkv4_and_noncanonical_fields_fail_closed(self):
         invalid = (
@@ -87,7 +88,8 @@ class RwkvConfigTest(unittest.TestCase):
             {"rescale_every": 6},
             {"head_size": 128},
             {"intermediate_size": 320},
-            {"wkv_state_dtype": "float16"},
+            {"wkv_state_dtype": "float32"},
+            {"wkv_mode": "deltalog"},
             {"pad_token_id": 0},
             {"tie_word_embeddings": True},
         )
@@ -168,10 +170,10 @@ class RwkvStructureTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             model(input_ids)
 
-    def test_provider_is_pinned_to_a9_and_validates_only_requested_roots(self):
+    def test_provider_pin_and_requested_operator_validation(self):
         requirement = Requirement(deps["FlashRWKV2"])
-        self.assertEqual(str(requirement.specifier), "==0.1.0a9")
-        self.assertEqual(version("FlashRWKV2"), "0.1.0a9")
+        self.assertEqual(str(requirement.specifier), "==0.1.0a11")
+        self.assertEqual(version("FlashRWKV2"), "0.1.0a11")
         module = load_flash_rwkv2(
             (
                 "pretrain_tmix_wkv7_recurrent_bf16",
@@ -179,7 +181,7 @@ class RwkvStructureTest(unittest.TestCase):
                 "infer_tmix_wkv_prepare_forward_varlen",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a9")
+        self.assertEqual(module.__version__, "0.1.0a11")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
 
