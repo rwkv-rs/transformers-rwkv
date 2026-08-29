@@ -21,7 +21,7 @@ from pathlib import Path
 
 from packaging.requirements import Requirement
 
-from transformers import RwkvConfig, is_torch_available
+from transformers import GenerationConfig, RwkvConfig, is_torch_available
 from transformers.dependency_versions_table import deps
 from transformers.testing_utils import require_peft, require_torch
 
@@ -135,6 +135,12 @@ class RwkvStructureTest(unittest.TestCase):
         self.assertIn("model.layers.1.linear_attn.v0", keys)
         self.assertFalse(any("time_mix" in key or "receptance" in key for key in keys))
 
+    def test_generation_config_defaults_disable_rapid_sampling_penalties(self):
+        generation_config = RwkvForCausalLM(tiny_config()).generation_config
+        self.assertEqual(generation_config.presence_penalty, 0.0)
+        self.assertEqual(generation_config.frequency_penalty, 0.0)
+        self.assertEqual(generation_config.penalty_decay, 0.996)
+
     def test_initialization_matches_train_temp_formulas(self):
         torch.manual_seed(11)
         config = tiny_config()
@@ -179,6 +185,7 @@ class RwkvStructureTest(unittest.TestCase):
                 "pretrain_tmix_wkv7_recurrent_bf16",
                 "statetune_tmix_wkv7_recurrent_fp32io16",
                 "infer_tmix_wkv_prepare_forward_varlen",
+                "infer_sampling_six_parameter_forward_varlen",
             )
         )
         self.assertEqual(module.__version__, "0.1.0a11")
@@ -398,6 +405,34 @@ class RwkvConverterTest(unittest.TestCase):
         plan, dropped = self.converter.translation_plan(source)
         with self.assertRaisesRegex(ValueError, "mismatched"):
             self.converter.validate_plan(source, plan, dropped, self.converter.expected_state_dict(config))
+
+    def test_generation_configs_define_open_fake_and_tools_profiles(self):
+        expected = {
+            "generation_config.json": (0.96, 0.76, 32, 1.0, 0.1, 0.988),
+            "fake_think_generation_config.json": (1.0, 0.28, 32, 0.0, 0.0, 0.996),
+            "tools_generation_config.json": (0.96, 0.76, 32, 0.0, 0.0, 0.996),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            self.converter.save_generation_configs(tiny_config(), Path(directory))
+            for config_file_name, values in expected.items():
+                generation_config = GenerationConfig.from_pretrained(
+                    directory,
+                    config_file_name=config_file_name,
+                    local_files_only=True,
+                )
+                self.assertTrue(generation_config.do_sample)
+                self.assertEqual(
+                    (
+                        generation_config.temperature,
+                        generation_config.top_p,
+                        generation_config.top_k,
+                        generation_config.presence_penalty,
+                        generation_config.frequency_penalty,
+                        generation_config.penalty_decay,
+                    ),
+                    values,
+                )
+                self.assertEqual(generation_config.stop_strings, self.converter.STOP_STRINGS)
 
     def test_shard_writer_consumes_source_and_writes_reloadable_values(self):
         from safetensors import safe_open

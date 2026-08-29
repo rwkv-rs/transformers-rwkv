@@ -26,7 +26,7 @@ if is_torch_available():
     import torch
     import torch.nn.functional as F
 
-    from transformers import RwkvConfig, RwkvForCausalLM
+    from transformers import GenerationConfig, RwkvConfig, RwkvForCausalLM
     from transformers.generation import EosTokenCriteria, LogitsProcessor, MaxLengthCriteria, StopStringCriteria
     from transformers.modeling_outputs import CausalLMOutputWithPast
     from transformers.models.rwkv.generation_rwkv import _rwkv_prefill_lengths
@@ -273,21 +273,26 @@ class FakeFlashRwkv2:
     def setup_sampling_states(seed, num_slots):
         return torch.full((num_slots, 1), seed, dtype=torch.int64, device="cuda")
 
-    @staticmethod
-    def infer_sampling_temperature_topk_topp_forward_varlen(
+    def infer_sampling_six_parameter_forward_varlen(
+        self,
         logits,
+        penalties,
         states,
         slot_indices,
         *,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        penalty_decay=0.996,
         temperature=1.0,
         top_k=-1,
         top_p=1.0,
     ):
-        _ = slot_indices, temperature, top_p
+        _ = slot_indices, penalty_decay, temperature, top_p
         candidate_count = logits.shape[-1] if top_k == -1 else top_k
         candidates = torch.topk(logits, k=candidate_count, dim=-1).indices
         choices = torch.remainder(states[:, 0], candidate_count)
         sampled = candidates.gather(1, choices[:, None]).squeeze(1)
+        penalties[:, 0].add_(presence_penalty + frequency_penalty)
         states.add_(1)
         return sampled
 
@@ -683,19 +688,56 @@ class RwkvMockProviderTest(unittest.TestCase):
             "temperature": 0.7,
             "top_k": 8,
             "top_p": 0.9,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.1,
+            "penalty_decay": 0.988,
             "eos_token_id": None,
         }
 
         torch.manual_seed(1234)
         first = model.generate(input_ids, **sampling_kwargs)
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+        first_penalties = runtime.decode_graph.penalties.clone()
         torch.manual_seed(1234)
         second = model.generate(input_ids, **sampling_kwargs)
+        torch.testing.assert_close(runtime.decode_graph.penalties, first_penalties)
         torch.manual_seed(4321)
         third = model.generate(input_ids, **sampling_kwargs)
 
         torch.testing.assert_close(second, first)
         self.assertFalse(torch.equal(third, first))
         self.assertEqual(len(model._rwkv_generation_graphs), 1)
+        self.assertEqual(
+            (
+                runtime.decode_graph.presence_penalty,
+                runtime.decode_graph.frequency_penalty,
+                runtime.decode_graph.penalty_decay,
+                runtime.decode_graph.temperature,
+                runtime.decode_graph.top_k,
+                runtime.decode_graph.top_p,
+            ),
+            (1.0, 0.1, 0.988, 0.7, 8, 0.9),
+        )
+
+        disabled_config = GenerationConfig(
+            do_sample=True,
+            temperature=0.7,
+            top_k=8,
+            top_p=0.9,
+            eos_token_id=None,
+        )
+        model.generate(input_ids, generation_config=disabled_config, max_new_tokens=4)
+        disabled_runtime = list(model._rwkv_generation_graphs.values())[1]
+        self.assertEqual(len(model._rwkv_generation_graphs), 2)
+        self.assertEqual(
+            (
+                disabled_runtime.decode_graph.presence_penalty,
+                disabled_runtime.decode_graph.frequency_penalty,
+                disabled_runtime.decode_graph.penalty_decay,
+            ),
+            (0.0, 0.0, 0.996),
+        )
+        self.assertEqual(torch.count_nonzero(disabled_runtime.decode_graph.penalties).item(), 0)
 
     @require_torch_gpu
     def test_cuda_graph_standard_stopping_criteria_override_config(self):
@@ -914,7 +956,7 @@ class RwkvMockProviderTest(unittest.TestCase):
             ),
             mock.patch.object(
                 self.fake,
-                "infer_sampling_temperature_topk_topp_forward_varlen",
+                "infer_sampling_six_parameter_forward_varlen",
                 side_effect=AssertionError("state-only inference must skip sampling"),
             ),
         ):

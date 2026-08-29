@@ -1143,6 +1143,9 @@ class RwkvModel(RwkvPreTrainedModel):
 class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
     def __init__(self, config: RwkvConfig):
         super().__init__(config)
+        self.generation_config.presence_penalty = 0.0
+        self.generation_config.frequency_penalty = 0.0
+        self.generation_config.penalty_decay = 0.996
         self.model = RwkvModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
