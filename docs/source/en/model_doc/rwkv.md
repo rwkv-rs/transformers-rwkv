@@ -24,7 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 CUDA provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a11`; it intentionally has no CPU or FLA execution fallback. Install
+This integration requires CUDA and `FlashRWKV2==0.1.0a12`; it intentionally has no CPU or FLA execution fallback. Install
 the RWKV dependencies with:
 
 ```bash

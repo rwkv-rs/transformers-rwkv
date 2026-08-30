@@ -178,8 +178,8 @@ class RwkvStructureTest(unittest.TestCase):
 
     def test_provider_pin_and_requested_operator_validation(self):
         requirement = Requirement(deps["FlashRWKV2"])
-        self.assertEqual(str(requirement.specifier), "==0.1.0a11")
-        self.assertEqual(version("FlashRWKV2"), "0.1.0a11")
+        self.assertEqual(str(requirement.specifier), "==0.1.0a12")
+        self.assertEqual(version("FlashRWKV2"), "0.1.0a12")
         module = load_flash_rwkv2(
             (
                 "pretrain_tmix_wkv7_recurrent_bf16",
@@ -188,7 +188,7 @@ class RwkvStructureTest(unittest.TestCase):
                 "infer_sampling_six_parameter_forward_varlen",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a11")
+        self.assertEqual(module.__version__, "0.1.0a12")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
 
