@@ -70,7 +70,7 @@ if stale_egg_info.exists():
 # 1. all dependencies should be listed here with their version requirements if any
 # 2. once modified, run: `make fix-repo` to update src/transformers/dependency_versions_table.py
 _deps = [
-    "FlashRWKV2==0.1.0a12",
+    "FlashRWKV2==0.1.0a13",
     "Pillow>=10.0.1,<=15.0",
     "accelerate>=1.1.0",
     "av",
