@@ -72,7 +72,7 @@ data_version: 数据版本, 如 g1a, g1b... (The further back in the alphabet, t
 param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(often used in the infer test), 13.3b
 (1) https://huggingface.co/BlinkDL/rwkv7-g1/tree/main -- 权威权重 Release 源 (update every month)
 (2) https://huggingface.co/BlinkDL/temp-latest-training-models/tree/main -- 权威权重 Test 源 (不定期update)
-转换为 safetensor 格式后应固化于 `rwkv-sha-pro6000x8` 的 `~/Weights/RWKV/hf` 目录, 并推送到对应仓库.
+转换为 Safetensors 格式后应首先固化于 `rwkv-szx-4090x4-ip129` 的 `~/Weights/RWKV/hf/<checkpoint-name>/` 目录, 并推送到对应仓库. 已验真的完整转换产物还应镜像到 NAS 的 `/mnt/nas-model/<data_version>/hf/<checkpoint-name>/` 目录; 写入 NAS 时使用同级临时目录, 核对文件清单、大小及 `PROVENANCE.md` 中全部 Safetensors shard SHA256 后再原子改名. 禁止覆盖 NAS 上已有的同名 checkpoint 目录.
 
 ## Env
 使用 uv 管理本机和远端专属环境 ./.venv, 严禁使用其它环境, 避免环境污染问题。
