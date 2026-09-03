@@ -1,0 +1,12 @@
+# Copy this file to /home/caizus/.config/rwkv-weight-publisher/environment,
+# set HF_TOKEN to a token with write access only to rwkv-rs/rwkv7-g1-st,
+# and keep the installed file mode at 0600.
+HF_TOKEN=
+http_proxy=http://127.0.0.1:7890
+https_proxy=http://127.0.0.1:7890
+HTTP_PROXY=http://127.0.0.1:7890
+HTTPS_PROXY=http://127.0.0.1:7890
+no_proxy=localhost,127.0.0.1
+NO_PROXY=localhost,127.0.0.1
+HF_HUB_ETAG_TIMEOUT=30
+HF_HUB_DOWNLOAD_TIMEOUT=120
