@@ -1,0 +1,11 @@
+[Unit]
+Description=Check hourly for canonical RWKV-7 weight releases
+
+[Timer]
+OnCalendar=*-*-* *:17:00
+RandomizedDelaySec=5m
+Persistent=true
+Unit=rwkv-weight-publisher.service
+
+[Install]
+WantedBy=timers.target
