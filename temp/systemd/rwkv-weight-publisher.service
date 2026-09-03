@@ -1,0 +1,22 @@
+[Unit]
+Description=Publish canonical RWKV-7 weights to Hugging Face Hub
+After=network-online.target mihomo-caizus.service
+Wants=network-online.target
+Requires=mihomo-caizus.service
+
+[Service]
+Type=oneshot
+User=caizus
+Group=caizus
+WorkingDirectory=/home/caizus/Projects/MachineLearning/transformers-rwkv
+EnvironmentFile=/home/caizus/.config/rwkv-weight-publisher/environment
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/caizus/Projects/MachineLearning/transformers-rwkv/.venv/bin/python temp/publish_rwkv7_weights.py
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=infinity
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
