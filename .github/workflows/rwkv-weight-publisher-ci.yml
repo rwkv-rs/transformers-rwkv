@@ -6,6 +6,7 @@ on:
       - ".github/workflows/rwkv-weight-publisher-ci.yml"
       - "temp/publish_rwkv7_weights.py"
       - "temp/rwkv_pth2st.py"
+      - "temp/rwkv-weight-publisher-requirements.txt"
       - "temp/systemd/**"
       - "tests/models/rwkv/test_rwkv_weight_publisher.py"
   push:
@@ -15,6 +16,7 @@ on:
       - ".github/workflows/rwkv-weight-publisher-ci.yml"
       - "temp/publish_rwkv7_weights.py"
       - "temp/rwkv_pth2st.py"
+      - "temp/rwkv-weight-publisher-requirements.txt"
       - "temp/systemd/**"
       - "tests/models/rwkv/test_rwkv_weight_publisher.py"
 
