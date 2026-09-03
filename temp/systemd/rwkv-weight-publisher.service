@@ -11,6 +11,7 @@ Group=caizus
 WorkingDirectory=/home/caizus/Projects/MachineLearning/transformers-rwkv
 EnvironmentFile=/home/caizus/.config/rwkv-weight-publisher/environment
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/caizus/Projects/MachineLearning/transformers-rwkv/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/home/caizus/Projects/MachineLearning/transformers-rwkv/.venv/bin/python temp/publish_rwkv7_weights.py
 Nice=10
 IOSchedulingClass=idle
