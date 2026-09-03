@@ -1,0 +1,17 @@
+[Unit]
+Description=caizus mihomo proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=caizus
+Group=caizus
+ExecStart=/home/caizus/clashctl/bin/mihomo -d /home/caizus/clashctl/resources -f /home/caizus/clashctl/resources/runtime.yaml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
