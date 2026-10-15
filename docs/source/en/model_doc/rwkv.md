@@ -135,6 +135,23 @@ invalidates these non-persistent layouts and restores the canonical parameter. F
 batch/sequence shape and its [`RwkvCache`] on the capture stream before capture; cache state tensors retain fixed
 addresses during eval updates.
 
+## LoRA and NoRA training
+
+BF16 training supports one active PEFT LoRA or NoRA adapter with zero dropout on
+`r_proj`, `k_proj`, `v_proj`, `o_proj`, ChannelMix `key` / `value`, and `lm_head`.
+FlashRWKV2 receives the original adapter parameters and PEFT scaling. For NoRA,
+it computes column normalization and its gradient inside the training kernels;
+PEFT continues to own adapter state, disabling, saving, loading, and merging.
+NoRA requires the Joluck/NoRA PEFT fork (`use_nora=True`); `use_nora="init"`
+retains ordinary LoRA behavior after initialization.
+
+For a different output position in each sample, pass `logits_to_keep` as a
+`LongTensor` of shape `[batch_size, positions]`. RWKV gathers hidden states
+before the vocabulary projection. A 1D tensor continues to select the same
+positions for every sample. For example, right-padded next-token scoring uses
+`logits_to_keep=(lengths - 1)[:, None]` and reads `outputs.logits[:, 0]`.
+Merge adapters before FP16 inference when adapting ChannelMix or the output head.
+
 ## Converting a canonical checkpoint
 
 The converter accepts canonical BlinkDL release keys only. It drops block 0's unused value-residual tensors, plans
