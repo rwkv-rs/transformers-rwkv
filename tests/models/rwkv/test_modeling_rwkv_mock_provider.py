@@ -102,6 +102,63 @@ class RecordingStreamer:
 
 class FakeFlashRwkv2:
     @staticmethod
+    def pretrain_head_linear_bf16(x, weight, *, lora_a=None, lora_b=None, lora_scale=1.0, use_nora=False):
+        output = F.linear(x, weight)
+        if lora_a is not None:
+            if use_nora:
+                lora_a = lora_a.float() / (lora_a.float().norm(dim=0, keepdim=True) + 1e-6)
+            output = output + F.linear(F.linear(x, lora_a.to(x.dtype)), lora_b.to(x.dtype)) * lora_scale
+        return output
+
+    def pretrain_tmix_wkv_prepare_bf16(
+        self,
+        xr,
+        xw,
+        xk,
+        xv,
+        xa,
+        xg,
+        r_weight,
+        k_weight,
+        v_weight,
+        w0,
+        w1,
+        w2,
+        a0,
+        a1,
+        a2,
+        g1,
+        g2,
+        k_k,
+        k_a,
+        *,
+        v_first=None,
+        v0=None,
+        v1=None,
+        v2=None,
+        head_size=64,
+        **adapters,
+    ):
+        r, k, v = (
+            self.pretrain_head_linear_bf16(
+                x,
+                weight,
+                lora_a=adapters.get(f"{name}_lora_a"),
+                lora_b=adapters.get(f"{name}_lora_b"),
+                lora_scale=adapters.get(f"{name}_lora_scale", 1.0),
+                use_nora=adapters.get(f"{name}_use_nora", False),
+            )
+            for name, x, weight in (("receptance", xr, r_weight), ("key", xk, k_weight), ("value", xv, v_weight))
+        )
+        if v_first is None:
+            v_first = v
+        else:
+            v = self.pretrain_tmix_vres_gate_bf16(v, v_first, v0, (xv @ v1) @ v2)
+        a_gate = self.pretrain_tmix_a_gate_bf16(a0, (xa @ a1) @ a2)
+        k, a, b = self.pretrain_tmix_kk_pre_bf16(k, k_k, a_gate, k_a, head_size=head_size)
+        return r, w0 + torch.tanh(xw @ w1) @ w2, k, v, a, b, torch.sigmoid(xg @ g1) @ g2, v_first
+
+    @staticmethod
     def _mix(x, initial, parameters):
         previous = torch.cat((initial[:, None], x[:, :-1]), dim=1)
         delta = previous - x
@@ -201,8 +258,24 @@ class FakeFlashRwkv2:
         boundaries = initial_state[:, None].expand(-1, sequence_chunk_offsets[1].item(), -1, -1, -1)
         return output, final_state, boundaries.reshape(-1, heads, head_size, head_size), torch.zeros_like(value)
 
-    @staticmethod
-    def pretrain_tmix_readout_bf16(x, r, k, v, residual_scale, weight, bias, g, *, head_size=64):
+    def pretrain_tmix_readout_bf16(
+        self,
+        x,
+        r,
+        k,
+        v,
+        residual_scale,
+        weight,
+        bias,
+        g,
+        *,
+        head_size=64,
+        output_weight=None,
+        output_lora_a=None,
+        output_lora_b=None,
+        output_lora_scale=1.0,
+        output_use_nora=False,
+    ):
         batch_size, sequence_length, channels = x.shape
         heads = channels // head_size
         normalized = F.group_norm(x.view(-1, channels), heads, weight, bias, 64e-5).view_as(x)
@@ -214,18 +287,35 @@ class FakeFlashRwkv2:
             ).sum(dim=-1, keepdim=True)
             * v.view(batch_size, sequence_length, heads, head_size)
         ).view_as(x)
-        return ((normalized + residual) * g).contiguous()
+        output = ((normalized + residual) * g).contiguous()
+        if output_weight is not None:
+            output = self.pretrain_head_linear_bf16(
+                output,
+                output_weight,
+                lora_a=output_lora_a,
+                lora_b=output_lora_b,
+                lora_scale=output_lora_scale,
+                use_nora=output_use_nora,
+            )
+        return output
 
-    @staticmethod
-    def pretrain_cmix_bf16(x, x_k, key_weight, value_weight):
-        previous = torch.cat((torch.zeros_like(x[:, :1]), x[:, :-1]), dim=1)
-        mixed = x + (previous - x) * x_k
-        return F.linear(F.relu(F.linear(mixed, key_weight)).square(), value_weight)
+    def pretrain_cmix_bf16(self, x, x_k, key_weight, value_weight, **adapters):
+        return self.statetune_cmix_bf16(x, torch.zeros_like(x[:, 0]), x_k, key_weight, value_weight, **adapters)[0]
 
-    def statetune_cmix_bf16(self, x, initial, x_k, key_weight, value_weight):
+    def statetune_cmix_bf16(self, x, initial, x_k, key_weight, value_weight, **adapters):
         previous = torch.cat((initial[:, None], x[:, :-1]), dim=1)
-        mixed = x + (previous - x) * x_k
-        output = F.linear(F.relu(F.linear(mixed, key_weight)).square(), value_weight)
+        output = x + (previous - x) * x_k
+        for name, weight in (("key", key_weight), ("value", value_weight)):
+            output = self.pretrain_head_linear_bf16(
+                output,
+                weight,
+                lora_a=adapters.get(f"{name}_lora_a"),
+                lora_b=adapters.get(f"{name}_lora_b"),
+                lora_scale=adapters.get(f"{name}_lora_scale", 1.0),
+                use_nora=adapters.get(f"{name}_use_nora", False),
+            )
+            if name == "key":
+                output = F.relu(output).square()
         return output, x[:, -1].contiguous()
 
     @staticmethod
@@ -590,6 +680,21 @@ class RwkvMockProviderTest(unittest.TestCase):
         self.assertIsNotNone(model.model.layers[0].linear_attn.o_proj.weight.grad)
         tuple_output = model(input_ids, logits_to_keep=2, return_dict=False)
         self.assertEqual(tuple_output[0].shape, (2, 2, self.config.vocab_size))
+
+    def test_per_sample_logits_select_hidden_states_before_head(self):
+        model = RwkvForCausalLM(self.config).to(dtype=torch.bfloat16).train()
+        input_ids = torch.randint(0, self.config.vocab_size, (2, 7))
+        positions = torch.tensor([[2], [6]])
+        full = model(input_ids, use_cache=False).logits
+        with mock.patch.object(
+            self.fake, "pretrain_head_linear_bf16", wraps=self.fake.pretrain_head_linear_bf16
+        ) as head:
+            selected = model(input_ids, use_cache=False, logits_to_keep=positions).logits
+        # The last call is the vocabulary head; projection helpers also use this reference implementation.
+        self.assertEqual(head.call_args.args[0].shape, (2, 1, self.config.hidden_size))
+        torch.testing.assert_close(selected[:, 0], full[torch.arange(2), positions[:, 0]])
+        selected.float().square().mean().backward()
+        self.assertIsNotNone(model.lm_head.weight.grad)
 
     def test_graph_prefill_consumes_every_prompt_token_except_the_last_once(self):
         self.assertEqual(_rwkv_prefill_lengths(1, None), ())
