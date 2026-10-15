@@ -58,23 +58,21 @@ def load_flash_rwkv2(
 
 
 def flash_rwkv2_linear_spec(
-    projection: nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, float]:
-    """Resolve a bias-free Linear and at most one active, unmerged vanilla PEFT LoRA adapter."""
+    projection: nn.Module, *, training: bool = False
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, float, bool]:
+    """Resolve a bias-free projection, preserving raw NoRA parameters for fused training."""
     if isinstance(projection, nn.Linear):
         if projection.bias is not None:
-            raise RuntimeError("RWKV-7 FlashRWKV2 inference projections do not support a base bias.")
-        return projection.weight.contiguous(), None, None, 1.0
+            raise RuntimeError("RWKV-7 FlashRWKV2 projections do not support a base bias.")
+        return projection.weight.contiguous(), None, None, 1.0, False
 
     try:
         from peft.tuners.lora import LoraLayer
     except ImportError as error:
-        raise RuntimeError(
-            "RWKV-7 FlashRWKV2 inference only supports torch.nn.Linear or PEFT LoraLayer projections."
-        ) from error
+        raise RuntimeError("RWKV-7 FlashRWKV2 only supports torch.nn.Linear or PEFT LoraLayer projections.") from error
     if not isinstance(projection, LoraLayer):
         raise RuntimeError(
-            "RWKV-7 FlashRWKV2 inference only supports torch.nn.Linear or PEFT LoraLayer projections; "
+            "RWKV-7 FlashRWKV2 only supports torch.nn.Linear or PEFT LoraLayer projections; "
             f"got {type(projection).__name__}."
         )
 
@@ -82,13 +80,13 @@ def flash_rwkv2_linear_spec(
     if not isinstance(base_layer, nn.Linear) or base_layer.bias is not None:
         raise RuntimeError("RWKV-7 FlashRWKV2 LoRA requires a bias-free torch.nn.Linear base layer.")
     if projection.fan_in_fan_out:
-        raise RuntimeError("RWKV-7 FlashRWKV2 LoRA inference requires fan_in_fan_out=False.")
+        raise RuntimeError("RWKV-7 FlashRWKV2 LoRA requires fan_in_fan_out=False.")
     if projection.disable_adapters:
         if projection.merged:
             raise RuntimeError("Unmerge the LoRA projection before disabling adapters for RWKV-7 inference.")
-        return base_layer.weight.contiguous(), None, None, 1.0
+        return base_layer.weight.contiguous(), None, None, 1.0, False
     if projection.merged:
-        return base_layer.weight.contiguous(), None, None, 1.0
+        return base_layer.weight.contiguous(), None, None, 1.0, False
 
     active_adapters = projection.active_adapters
     if isinstance(active_adapters, str):
@@ -101,30 +99,39 @@ def flash_rwkv2_linear_spec(
             continue
         if adapter_name in variants or use_dora.get(adapter_name, False):
             raise RuntimeError(
-                "RWKV-7 FlashRWKV2 inference supports vanilla LoRA only; "
+                "RWKV-7 FlashRWKV2 supports LoRA and NoRA only; "
                 f"adapter {adapter_name!r} must be merged before inference."
             )
         adapter_a = projection.lora_A[adapter_name]
         adapter_b = projection.lora_B[adapter_name]
         if adapter_b.bias is not None:
             raise RuntimeError(
-                "RWKV-7 FlashRWKV2 inference does not support lora_bias; "
+                "RWKV-7 FlashRWKV2 does not support lora_bias; "
                 f"adapter {adapter_name!r} must be merged before inference."
             )
         dropout = projection.lora_dropout[adapter_name]
         if projection.training and getattr(dropout, "p", 0.0) != 0.0:
             raise RuntimeError("Unmerged LoRA dropout is only supported in eval mode.")
-        active.append((adapter_a, adapter_b, float(projection.scaling[adapter_name])))
+        active.append(
+            (
+                adapter_a,
+                adapter_b,
+                float(projection.scaling[adapter_name]),
+                getattr(projection, "use_nora", {}).get(adapter_name) is True,
+            )
+        )
 
     if not active:
-        return base_layer.weight.contiguous(), None, None, 1.0
+        return base_layer.weight.contiguous(), None, None, 1.0, False
     if len(active) != 1:
         raise RuntimeError(
-            "RWKV-7 FlashRWKV2 inference supports exactly one active vanilla LoRA adapter; "
-            "merge multiple adapters before inference."
+            "RWKV-7 FlashRWKV2 supports exactly one active LoRA adapter; merge multiple adapters before inference."
         )
-    adapter_a, adapter_b, scale = active[0]
-    return base_layer.weight.contiguous(), adapter_a.weight.contiguous(), adapter_b.weight.contiguous(), scale
+    adapter_a, adapter_b, scale, use_nora = active[0]
+    weight_a = adapter_a.weight
+    if use_nora and not training:
+        weight_a = (weight_a.float() / (weight_a.float().norm(dim=0, keepdim=True) + 1e-6)).to(weight_a.dtype)
+    return base_layer.weight.contiguous(), weight_a.contiguous(), adapter_b.weight.contiguous(), scale, use_nora
 
 
 __all__ = ["flash_rwkv2_linear_spec", "load_flash_rwkv2"]
