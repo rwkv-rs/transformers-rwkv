@@ -23,7 +23,7 @@ from packaging.requirements import Requirement
 
 from transformers import GenerationConfig, RwkvConfig, is_torch_available
 from transformers.dependency_versions_table import deps
-from transformers.testing_utils import require_peft, require_torch
+from transformers.testing_utils import require_peft, require_torch, require_torch_gpu
 
 from ...test_configuration_common import ConfigTester
 
@@ -194,7 +194,7 @@ class RwkvStructureTest(unittest.TestCase):
 
     def test_plain_linear_spec_and_bias_failure(self):
         projection = torch.nn.Linear(8, 8, bias=False)
-        weight, lora_a, lora_b, scale = flash_rwkv2_linear_spec(projection)
+        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(projection)
         self.assertIs(weight, projection.weight)
         self.assertIsNone(lora_a)
         self.assertIsNone(lora_b)
@@ -211,17 +211,17 @@ class RwkvStructureTest(unittest.TestCase):
             LoraConfig(r=4, lora_alpha=8, target_modules=["r_proj"]),
         )
         projection = model.base_model.model.model.layers[0].linear_attn.r_proj
-        weight, lora_a, lora_b, scale = flash_rwkv2_linear_spec(projection)
+        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(projection)
         self.assertIs(weight, projection.get_base_layer().weight)
         self.assertIs(lora_a, projection.lora_A["default"].weight)
         self.assertIs(lora_b, projection.lora_B["default"].weight)
         self.assertEqual(scale, 2.0)
 
         model.disable_adapter_layers()
-        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0))
+        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0, False))
         model.enable_adapter_layers()
         model.merge_adapter()
-        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0))
+        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0, False))
         model.unmerge_adapter()
 
         model.add_adapter("second", LoraConfig(r=4, lora_alpha=4, target_modules=["r_proj"]))
@@ -234,8 +234,75 @@ class RwkvStructureTest(unittest.TestCase):
             LoraConfig(r=4, lora_alpha=8, use_dora=True, target_modules=["r_proj"]),
         )
         dora_projection = dora_model.base_model.model.model.layers[0].linear_attn.r_proj
-        with self.assertRaisesRegex(RuntimeError, "vanilla LoRA"):
+        with self.assertRaisesRegex(RuntimeError, "LoRA and NoRA"):
             flash_rwkv2_linear_spec(dora_projection)
+
+
+@require_torch_gpu
+@require_peft
+class RwkvNoRATrainingTest(unittest.TestCase):
+    def test_native_checkpoint_gradients_adapter_reload_and_merge(self):
+        import copy
+
+        from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+
+        if "use_nora" not in LoraConfig.__dataclass_fields__:
+            self.skipTest("requires Joluck/NoRA")
+        torch.manual_seed(113)
+        base = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
+        # Nonzero output and gate matrices make every adapted projection observable.
+        with torch.no_grad():
+            for parameter in base.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        restored_base = copy.deepcopy(base)
+        ids = torch.randint(1, base.config.vocab_size, (2, 16), device="cuda")
+        positions = torch.tensor([[7], [15]], device="cuda")
+        with torch.no_grad():
+            reference = base(ids, use_cache=False, logits_to_keep=positions).logits
+        model = get_peft_model(
+            base,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=16,
+                lora_alpha=16,
+                lora_dropout=0.0,
+                use_nora=True,
+                target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
+            ),
+        )
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.normal_(std=0.01)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=1e-3)
+        logits = model(ids, use_cache=False, logits_to_keep=positions).logits
+        logits.float().square().mean().backward()
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                self.assertIsNotNone(parameter.grad, name)
+                self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                self.assertGreater(parameter.grad.float().norm().item(), 0, name)
+            else:
+                self.assertIsNone(parameter.grad, name)
+        optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            adapted = model(ids, use_cache=False, logits_to_keep=positions).logits
+            with model.disable_adapter():
+                disabled = model(ids, use_cache=False, logits_to_keep=positions).logits
+            torch.testing.assert_close(disabled, reference, atol=0, rtol=0)
+            full = model(ids, use_cache=False).logits
+            torch.testing.assert_close(adapted[:, 0], full[torch.arange(2, device="cuda"), positions[:, 0]])
+            with tempfile.TemporaryDirectory() as directory:
+                model.save_pretrained(directory)
+                restored = PeftModel.from_pretrained(restored_base, directory).eval()
+                actual = restored(ids, use_cache=False, logits_to_keep=positions).logits
+                torch.testing.assert_close(actual, adapted, atol=0, rtol=0)
+                merged = restored.merge_and_unload(safe_merge=True)
+                actual = merged(ids, use_cache=False, logits_to_keep=positions).logits
+                torch.testing.assert_close(actual.float(), adapted.float(), atol=0.04, rtol=0.04)
 
 
 @require_torch
