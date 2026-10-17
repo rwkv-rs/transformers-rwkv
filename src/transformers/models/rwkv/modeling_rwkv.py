@@ -223,6 +223,7 @@ class RwkvCache(Cache):
         wkv_state: torch.Tensor,
         decay_bias: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
+        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         state_key = wkv_state.data_ptr()
@@ -243,6 +244,7 @@ class RwkvCache(Cache):
             decay_bias=decay_bias,
             max_seqlen=max_seqlen,
             validated_metadata=ticket,
+            **({"output_dtype": output_dtype} if output_dtype is not None else {}),
         )
 
     def training_metadata(
@@ -675,6 +677,7 @@ class RwkvAttention(nn.Module):
             wkv_state,
             self.w0,
             inference_metadata,
+            output_dtype=torch.float32 if self.config.wkv_output_dtype == "float32" else None,
         )
         o_weight, o_lora_a, o_lora_b, o_lora_scale, _ = flash_rwkv2_linear_spec(self.o_proj)
         output = flash_rwkv2.infer_tmix_readout_forward_varlen(
