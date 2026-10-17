@@ -34,6 +34,14 @@ pip install "transformers[rwkv]"
 Training uses BF16 model tensors. Inference uses FP16 model tensors, except for the BF16 embedding/LN0 fusion and FP32
 WKV states. Inputs in one batch must have equal length because RWKV-7 does not use a padding token.
 
+For frozen FP16 teachers with WKV values outside the FP16 range, set `wkv_output_dtype="float32"` in
+`from_pretrained()` or [`RwkvConfig`]. With a FlashRWKV2 build supporting `output_dtype=torch.float32` and mixed-dtype
+readout, WKV output stays FP32 through head normalization; the fused readout casts the prelinear result to FP16 before
+the output projection. Model weights and other inference tensors keep their existing dtypes. This applies to ordinary
+forward calls, cached continuation, and CUDA graph generation, and requires `wkv_mode="fp32io16"` (the default).
+The default `wkv_output_dtype=None` preserves the existing inference behavior. BF16 training and evaluation keep their
+existing BF16 contract regardless of this setting.
+
 ## Inference
 
 Converted checkpoints use standard `AutoModelForCausalLM`, `AutoTokenizer`, `generate()`, and [`RwkvCache`] APIs.
