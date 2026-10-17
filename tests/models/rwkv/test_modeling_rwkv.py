@@ -90,6 +90,8 @@ class RwkvConfigTest(unittest.TestCase):
             {"intermediate_size": 320},
             {"wkv_state_dtype": "float32"},
             {"wkv_mode": "deltalog"},
+            {"wkv_output_dtype": "float16"},
+            {"wkv_output_dtype": "float32", "wkv_mode": "fp16"},
             {"pad_token_id": 0},
             {"tie_word_embeddings": True},
         )
@@ -175,6 +177,40 @@ class RwkvStructureTest(unittest.TestCase):
             model(input_ids, past_key_values=DynamicCache())
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             model(input_ids)
+
+    @require_torch_gpu
+    def test_float32_wkv_output_inference_and_generation(self):
+        torch.manual_seed(101)
+        config = tiny_config()
+        model = RwkvForCausalLM(config).half().eval().cuda().requires_grad_(False)
+        input_ids = torch.randint(1, config.vocab_size, (2, 7), device="cuda")
+        initial_cache = RwkvCache(config)
+        initial_cache.layer_states(0, torch.zeros(2, 1, config.hidden_size, dtype=torch.float16, device="cuda"))
+        initial_cache.layers[0].recurrent_states[0].normal_(std=1e7)
+        overflow = model(input_ids, past_key_values=initial_cache.clone()).logits
+        self.assertFalse(torch.isfinite(overflow).all())
+
+        config.wkv_output_dtype = "float32"
+        full = model(input_ids, past_key_values=initial_cache.clone()).logits
+        chunk_cache = initial_cache.clone()
+        first = model(input_ids[:, :-1], past_key_values=chunk_cache).logits
+        last = model(input_ids[:, -1:], past_key_values=chunk_cache).logits
+        self.assertTrue(torch.isfinite(full).all())
+        self.assertTrue(torch.isfinite(first).all())
+        self.assertTrue(torch.isfinite(last).all())
+        torch.testing.assert_close(torch.cat((first, last), dim=1), full, atol=2e-3, rtol=2e-3)
+
+        for graph_count, output_dtype in enumerate((None, "float32"), start=1):
+            config.wkv_output_dtype = output_dtype
+            generated = model.generate(
+                input_ids, max_new_tokens=3, prefill_chunk_size=2, do_sample=False, eos_token_id=None
+            )
+            repeated = model.generate(
+                input_ids, max_new_tokens=3, prefill_chunk_size=2, do_sample=False, eos_token_id=None
+            )
+            self.assertEqual(generated.shape, (2, 10))
+            torch.testing.assert_close(repeated, generated)
+            self.assertEqual(len(model._rwkv_generation_graphs), graph_count)
 
     def test_provider_pin_and_requested_operator_validation(self):
         requirement = Requirement(deps["FlashRWKV2"])

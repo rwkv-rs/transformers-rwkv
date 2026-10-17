@@ -35,6 +35,9 @@ class RwkvConfig(PreTrainedConfig):
         Epsilon used by the head-wise normalization in TimeMix.
     wkv_mode (`str`, *optional*, defaults to `"fp32io16"`):
         WKV state mode used by CUDA-graph generation. Public [`RwkvCache`] state remains float32.
+    wkv_output_dtype (`str`, *optional*):
+        Set to `"float32"` to keep inference WKV output in FP32 through head normalization, while other TimeMix tensors
+        remain FP16. Requires `wkv_mode="fp32io16"`. Defaults to the input dtype and does not affect BF16 training.
     decay_low_rank_dim (`int`, *optional*):
         Rank of the time-decay projection. Inferred from `hidden_size` when omitted.
     a_low_rank_dim (`int`, *optional*):
@@ -64,6 +67,7 @@ class RwkvConfig(PreTrainedConfig):
     tie_word_embeddings: bool = False
     use_cache: bool = True
     wkv_mode: str = "fp32io16"
+    wkv_output_dtype: str | None = None
     decay_low_rank_dim: int | None = None
     a_low_rank_dim: int | None = None
     v_low_rank_dim: int | None = None
@@ -125,6 +129,10 @@ class RwkvConfig(PreTrainedConfig):
             raise ValueError("RWKV-7 normalization epsilons must be positive.")
         if self.wkv_mode not in {"fp32io16", "fp16"}:
             raise ValueError(f"`wkv_mode` must be one of {{'fp32io16', 'fp16'}}, got {self.wkv_mode!r}.")
+        if self.wkv_output_dtype not in {None, "float32"}:
+            raise ValueError(f"`wkv_output_dtype` must be None or 'float32', got {self.wkv_output_dtype!r}.")
+        if self.wkv_output_dtype == "float32" and self.wkv_mode != "fp32io16":
+            raise ValueError('`wkv_output_dtype="float32"` requires `wkv_mode="fp32io16"`.')
         ranks = {
             "decay_low_rank_dim": self.decay_low_rank_dim,
             "a_low_rank_dim": self.a_low_rank_dim,
