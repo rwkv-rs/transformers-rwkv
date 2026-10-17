@@ -181,7 +181,7 @@ class RwkvStructureTest(unittest.TestCase):
     @require_torch_gpu
     def test_float32_wkv_output_inference_and_generation(self):
         torch.manual_seed(101)
-        config = tiny_config()
+        config = tiny_config(hidden_size=1024, intermediate_size=4096)
         model = RwkvForCausalLM(config).half().eval().cuda().requires_grad_(False)
         input_ids = torch.randint(1, config.vocab_size, (2, 7), device="cuda")
         initial_cache = RwkvCache(config)
