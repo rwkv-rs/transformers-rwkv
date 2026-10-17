@@ -117,6 +117,7 @@ class _RwkvGraphState:
         recurrent_state,
         decay_bias: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
+        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         recurrent_forward = getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{self.wkv_mode}_forward_varlen")
@@ -133,6 +134,7 @@ class _RwkvGraphState:
             decay_bias=decay_bias,
             max_seqlen=max_seqlen,
             validated_metadata=ticket,
+            **({"output_dtype": output_dtype} if output_dtype is not None else {}),
         )
 
     def clone(self) -> tuple:
@@ -646,6 +648,7 @@ class RwkvGenerationMixin(GenerationMixin):
         stop_string_criteria: tuple[StopStringCriteria, ...],
         tokenizer,
         wkv_mode: str,
+        wkv_output_dtype: str | None,
     ) -> tuple:
         eos_key = None if eos_token_ids is None else tuple(eos_token_ids.tolist())
         pad_token_id = generation_config._pad_token_tensor
@@ -670,10 +673,11 @@ class RwkvGenerationMixin(GenerationMixin):
             eos_key,
             stop_key,
             wkv_mode,
+            wkv_output_dtype,
         )
 
     def _sample(
-        self,
+        self: RwkvForCausalLM,
         input_ids: torch.LongTensor,
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
@@ -698,6 +702,7 @@ class RwkvGenerationMixin(GenerationMixin):
             stop_string_criteria,
             model_kwargs.get("tokenizer"),
             self._rwkv_wkv_mode,
+            self.config.wkv_output_dtype,
         )
         with torch.cuda.device(input_ids.device):
             cache = self._get_rwkv_generation_cache()
