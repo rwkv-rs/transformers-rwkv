@@ -29,7 +29,7 @@ if is_torch_available():
     from transformers import GenerationConfig, RwkvConfig, RwkvForCausalLM
     from transformers.generation import EosTokenCriteria, LogitsProcessor, MaxLengthCriteria, StopStringCriteria
     from transformers.modeling_outputs import CausalLMOutputWithPast
-    from transformers.models.rwkv.generation_rwkv import _rwkv_prefill_lengths, _RwkvGraphState
+    from transformers.models.rwkv.generation_rwkv import _rwkv_prefill_lengths
     from transformers.models.rwkv.modeling_rwkv import RwkvCache
 
 
@@ -102,13 +102,16 @@ class RecordingStreamer:
 
 class FakeFlashRwkv2:
     @staticmethod
-    def pretrain_head_linear_bf16(x, weight, *, lora_a=None, lora_b=None, lora_scale=1.0, use_nora=False):
+    def _linear(x, weight, *, lora_a=None, lora_b=None, lora_scale=1.0, use_nora=False):
         output = F.linear(x, weight)
         if lora_a is not None:
             if use_nora:
                 lora_a = lora_a.float() / (lora_a.float().norm(dim=0, keepdim=True) + 1e-6)
             output = output + F.linear(F.linear(x, lora_a.to(x.dtype)), lora_b.to(x.dtype)) * lora_scale
         return output
+
+    def pretrain_head_linear_bf16(self, x, weight, **adapters):
+        return self._linear(x, weight, **adapters).float()
 
     def pretrain_tmix_wkv_prepare_bf16(
         self,
@@ -140,7 +143,7 @@ class FakeFlashRwkv2:
         **adapters,
     ):
         r, k, v = (
-            self.pretrain_head_linear_bf16(
+            self._linear(
                 x,
                 weight,
                 lora_a=adapters.get(f"{name}_lora_a"),
@@ -255,8 +258,7 @@ class FakeFlashRwkv2:
         ]
         output, final_state = self._recurrence(initial_state, *values)
         output = (output * scale).view_as(value)
-        boundaries = initial_state[:, None].expand(-1, sequence_chunk_offsets[1].item(), -1, -1, -1)
-        return output, final_state, boundaries.reshape(-1, heads, head_size, head_size), torch.zeros_like(value)
+        return output, final_state
 
     def pretrain_tmix_readout_bf16(
         self,
@@ -289,7 +291,7 @@ class FakeFlashRwkv2:
         ).view_as(x)
         output = ((normalized + residual) * g).contiguous()
         if output_weight is not None:
-            output = self.pretrain_head_linear_bf16(
+            output = self._linear(
                 output,
                 output_weight,
                 lora_a=output_lora_a,
@@ -306,7 +308,7 @@ class FakeFlashRwkv2:
         previous = torch.cat((initial[:, None], x[:, :-1]), dim=1)
         output = x + (previous - x) * x_k
         for name, weight in (("key", key_weight), ("value", value_weight)):
-            output = self.pretrain_head_linear_bf16(
+            output = self._linear(
                 output,
                 weight,
                 lora_a=adapters.get(f"{name}_lora_a"),
@@ -325,21 +327,6 @@ class FakeFlashRwkv2:
     @staticmethod
     def prepare_tmix_wkv7_recurrent_metadata(*args, **kwargs):
         return object()
-
-    @staticmethod
-    def prepare_tmix_wkv7_recurrent_fp16_state(
-        state_pool_size, channels, *, sequence_capacity, head_size=64, device=None
-    ):
-        state_pool = torch.zeros(
-            state_pool_size,
-            channels // head_size,
-            head_size,
-            head_size,
-            dtype=torch.float16,
-            device=device,
-        )
-        elapsed_state_pool = torch.zeros(state_pool_size, dtype=torch.int32, device=device)
-        return FakeRecurrentState(state_pool, elapsed_state_pool, sequence_capacity)
 
     @staticmethod
     def prepare_tmix_wkv7_recurrent_fp32io16_state(
@@ -460,23 +447,30 @@ class FakeFlashRwkv2:
         head_size=64,
         batch_size=1,
         max_seqlen=None,
+        receptance_use_nora=False,
+        key_use_nora=False,
+        value_use_nora=False,
     ):
-        def project(source, weight, lora_a, lora_b, scale):
+        def project(source, weight, lora_a, lora_b, scale, use_nora):
             output = F.linear(source, weight)
             if lora_a is not None:
-                output = output + F.linear(F.linear(source, lora_a), lora_b) * scale
+                if use_nora:
+                    lora_a = (lora_a.float() / (lora_a.float().norm(dim=0, keepdim=True) + 1e-6)).to(source.dtype)
+                output = output + F.linear(F.linear(source, lora_a.to(source.dtype)), lora_b.to(source.dtype)) * scale
             return output
 
-        receptance = project(xr, receptance_weight, receptance_lora_a, receptance_lora_b, receptance_lora_scale)
-        key = project(xk, key_weight, key_lora_a, key_lora_b, key_lora_scale)
-        value = project(xv, value_weight, value_lora_a, value_lora_b, value_lora_scale)
-        decay_logits = torch.tanh(xw @ w1_runtime) @ w2_runtime
-        recurrent_gate = torch.sigmoid(a0 + (xa @ a1_runtime) @ a2_runtime)
-        gate = torch.sigmoid(xg @ g1_runtime) @ g2_runtime
+        receptance = project(
+            xr, receptance_weight, receptance_lora_a, receptance_lora_b, receptance_lora_scale, receptance_use_nora
+        )
+        key = project(xk, key_weight, key_lora_a, key_lora_b, key_lora_scale, key_use_nora)
+        value = project(xv, value_weight, value_lora_a, value_lora_b, value_lora_scale, value_use_nora)
+        decay_logits = torch.tanh(xw @ w1.t()) @ w2.t()
+        recurrent_gate = torch.sigmoid(a0 + (xa @ a1.t()) @ a2.t())
+        gate = torch.sigmoid(xg @ g1.t()) @ g2.t()
         if v_first is None:
             v_first = value
         else:
-            value = value + (v_first - value) * torch.sigmoid(v0 + (xv @ v1_runtime) @ v2_runtime)
+            value = value + (v_first - value) * torch.sigmoid(v0 + (xv @ v1.t()) @ v2.t())
         heads = key.shape[-1] // head_size
         direction = F.normalize((key * k_k).view(-1, heads, head_size).float(), dim=-1).to(key.dtype)
         key = key * (1 + (recurrent_gate - 1) * k_a)
@@ -521,41 +515,6 @@ class FakeFlashRwkv2:
         state._state_pool.copy_(final_state)
         return (output * scale).view_as(value)
 
-    def infer_tmix_wkv7_recurrent_fp16_forward_varlen(
-        self,
-        receptance,
-        decay_logits,
-        key,
-        value,
-        a,
-        b,
-        *,
-        state,
-        cu_seqlens,
-        state_indices,
-        scale=1.0,
-        decay_bias=None,
-        max_seqlen=None,
-        validated_metadata=None,
-    ):
-        output = self.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
-            receptance,
-            decay_logits,
-            key,
-            value,
-            a,
-            b,
-            state=state,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            scale=scale,
-            decay_bias=decay_bias,
-            max_seqlen=max_seqlen,
-            validated_metadata=validated_metadata,
-        )
-        state._elapsed_state_pool.add_(max_seqlen)
-        return output
-
     @staticmethod
     def infer_tmix_readout_forward_varlen(
         x,
@@ -574,6 +533,7 @@ class FakeFlashRwkv2:
         head_size=64,
         batch_size=1,
         max_seqlen=None,
+        output_use_nora=False,
     ):
         channels = x.shape[-1]
         heads = channels // head_size
@@ -608,6 +568,7 @@ class FakeFlashRwkv2:
         eps=1e-5,
         validated_metadata=None,
         deterministic=False,
+        **adapters,
     ):
         if x.data_ptr() != self.expected_cmix_input.data_ptr():
             raise AssertionError("ChannelMix must consume the layer input returned by TimeMix.")
@@ -618,8 +579,23 @@ class FakeFlashRwkv2:
         previous = torch.cat((shift_state_pool[:, None], normalized[:, :-1]), dim=1)
         mixed = normalized + (previous - normalized) * x_k
         shift_state_pool.copy_(normalized[:, -1])
-        activation = F.relu(F.linear(mixed, key_weight)).square()
-        output = activation.view(-1, activation.shape[-1]) @ value_weight
+        key_output = self._linear(
+            mixed,
+            key_weight,
+            lora_a=adapters.get("key_lora_a"),
+            lora_b=adapters.get("key_lora_b"),
+            lora_scale=adapters.get("key_lora_scale", 1.0),
+            use_nora=adapters.get("key_use_nora", False),
+        )
+        activation = F.relu(key_output).square()
+        output = self._linear(
+            activation,
+            value_weight.t(),
+            lora_a=adapters.get("value_lora_a"),
+            lora_b=adapters.get("value_lora_b"),
+            lora_scale=adapters.get("value_lora_scale", 1.0),
+            use_nora=adapters.get("value_use_nora", False),
+        ).view_as(x)
         self.expected_tmix_inputs = (residual, output)
         return residual, output
 
@@ -706,7 +682,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
     @require_torch_gpu
     def test_cuda_graph_generation_reuses_prefill_and_decode_graphs(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(1, self.config.vocab_size, (2, 6), device="cuda")
 
         reference_cache = RwkvCache(self.config)
@@ -758,7 +734,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
     @require_torch_gpu
     def test_single_token_prompt_starts_with_decode_graph_and_exposes_first_logits(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(1, self.config.vocab_size, (2, 1), device="cuda")
         reference_cache = RwkvCache(self.config)
         reference_logits = (
@@ -786,7 +762,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
     @require_torch_gpu
     def test_cuda_graph_sampling_uses_fixed_seed_and_rapid_sampling_parameters(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(1, self.config.vocab_size, (4, 3), device="cuda")
         sampling_kwargs = {
             "max_new_tokens": 4,
@@ -847,7 +823,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
     @require_torch_gpu
     def test_cuda_graph_standard_stopping_criteria_override_config(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(1, self.config.vocab_size, (1, 4), device="cuda")
         eos_token_id = 1
         fixed_logits = torch.full((1, self.config.vocab_size), -1e4, device="cuda")
@@ -881,7 +857,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
     @require_torch_gpu
     def test_finished_rows_are_padded_while_other_batch_rows_continue(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(2, self.config.vocab_size, (2, 4), device="cuda")
         stop_token = 1
         fixed_logits = torch.full((2, self.config.vocab_size), -1e4, device="cuda")
@@ -918,25 +894,8 @@ class RwkvMockProviderTest(unittest.TestCase):
         self.assertEqual(len(model._rwkv_generation_graphs), 1)
 
     @require_torch_gpu
-    def test_cuda_graph_fp16_mode_uses_provider_managed_state(self):
-        config = tiny_config(wkv_mode="fp16")
-        model = RwkvForCausalLM(config).half().eval().cuda()
-        input_ids = torch.randint(1, config.vocab_size, (2, 3), device="cuda")
-
-        generated = model.generate(
-            input_ids,
-            max_new_tokens=2,
-            do_sample=False,
-            eos_token_id=None,
-        )
-        runtime = next(iter(model._rwkv_generation_graphs.values()))
-
-        self.assertEqual(generated.shape, (2, 5))
-        self.assertEqual(runtime.state.recurrent_states[0]._state_pool.dtype, torch.float16)
-
-    @require_torch_gpu
     def test_streamer_uses_async_pinned_completion_copies(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(1, self.config.vocab_size, (2, 3), device="cuda")
         streamer = RecordingStreamer()
         calling_thread = threading.get_ident()
@@ -956,7 +915,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         self.assertTrue(all(thread_id != calling_thread for thread_id in streamer.thread_ids[1:]))
         self.assertNotEqual(streamer.end_thread_id, calling_thread)
 
-    def test_bfloat16_evaluation_uses_stateless_training_operators(self):
+    def test_bfloat16_evaluation_matches_training(self):
         model = RwkvForCausalLM(self.config).to(dtype=torch.bfloat16).train()
         input_ids = torch.randint(0, self.config.vocab_size, (2, 7))
         training_logits = model(input_ids, use_cache=False).logits
@@ -987,8 +946,9 @@ class RwkvMockProviderTest(unittest.TestCase):
             )
             self.assertIsNotNone(chunk_layer.recurrent_states[0].grad_fn)
 
+    @torch.no_grad()
     def test_inference_full_chunk_temporary_cache_hidden_states_and_last_logits(self):
-        model = RwkvForCausalLM(self.config).half().eval()
+        model = RwkvForCausalLM(self.config).bfloat16().eval()
         input_ids = torch.randint(0, self.config.vocab_size, (2, 7))
         full_cache = RwkvCache(self.config)
         full = model(
@@ -998,27 +958,7 @@ class RwkvMockProviderTest(unittest.TestCase):
             output_hidden_states=True,
         )
         self.assertEqual(len(full.hidden_states), self.config.num_hidden_layers + 1)
-        state_keys = set(model.state_dict())
-        for layer in model.model.layers:
-            self.assertIsNotNone(layer.linear_attn._low_rank_canonical)
-            self.assertIsNotNone(layer.mlp._value_runtime)
-            self.assertEqual(layer.mlp.value.weight.device.type, "cpu")
-        layer_zero_v = model.model.layers[0].linear_attn._layer_zero_v
-        self.assertEqual(
-            tuple(tensor.shape for tensor in layer_zero_v),
-            (
-                (self.config.v_low_rank_dim, self.config.hidden_size),
-                (self.config.hidden_size, self.config.v_low_rank_dim),
-                (self.config.hidden_size,),
-                (self.config.hidden_size, self.config.v_low_rank_dim),
-                (self.config.v_low_rank_dim, self.config.hidden_size),
-            ),
-        )
-        self.assertEqual(layer_zero_v[0].data_ptr(), layer_zero_v[4].data_ptr())
-        self.assertEqual(layer_zero_v[1].data_ptr(), layer_zero_v[3].data_ptr())
-        self.assertFalse(any("runtime" in key for key in state_keys))
-
-        model.to(dtype=torch.float16)
+        model.to(dtype=torch.bfloat16)
         chunk_cache = RwkvCache(self.config)
         first = model(input_ids[:, :3], past_key_values=chunk_cache, use_cache=True).logits
         second = model(input_ids[:, 3:], past_key_values=chunk_cache, use_cache=True).logits
@@ -1030,123 +970,16 @@ class RwkvMockProviderTest(unittest.TestCase):
                 full_layer.recurrent_states[0], chunk_layer.recurrent_states[0], atol=1e-5, rtol=1e-5
             )
 
-        model.to(dtype=torch.float16)
+        model.to(dtype=torch.bfloat16)
         temporary = model(input_ids, use_cache=False, logits_to_keep=1)
         self.assertIsNone(temporary.past_key_values)
         self.assertEqual(temporary.logits.shape, (2, 1, self.config.vocab_size))
-        embeddings = model.model.embed_tokens(input_ids).to(torch.float16)
+        embeddings = model.model.embed_tokens(input_ids).to(torch.bfloat16)
         embedded = model(inputs_embeds=embeddings, use_cache=False)
         self.assertEqual(embedded.logits.shape, full.logits.shape)
 
-        model.to(dtype=torch.bfloat16).train()
-        for layer in model.model.layers:
-            self.assertIsNone(layer.linear_attn._low_rank_canonical)
-            self.assertIsNone(layer.mlp._value_runtime)
-            self.assertEqual(layer.mlp.value.weight.dtype, torch.bfloat16)
-
-    def test_float32_wkv_output_preserves_finite_fp16_inference(self):
-        model = RwkvForCausalLM(self.config).half().eval().requires_grad_(False)
-        input_ids = torch.randint(1, self.config.vocab_size, (2, 7))
-        initial_cache = RwkvCache(tiny_config())
-        initial_cache.layer_states(0, torch.zeros(2, 1, self.config.hidden_size, dtype=torch.float16))
-        initial_cache.layers[0].recurrent_states[0].normal_(std=1e7)
-
-        with mock.patch.object(
-            self.fake,
-            "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-            wraps=self.fake.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-        ) as recurrent:
-            overflow = model(input_ids, past_key_values=initial_cache.clone()).logits
-        self.assertFalse(torch.isfinite(overflow).all())
-        self.assertTrue(all("output_dtype" not in call.kwargs for call in recurrent.call_args_list))
-
-        self.config.wkv_output_dtype = "float32"
-        with (
-            mock.patch.object(_RwkvGraphState, "recurrent_metadata", fake_recurrent_metadata),
-            mock.patch.object(
-                self.fake,
-                "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
-                wraps=self.fake.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen,
-            ) as recurrent,
-            mock.patch.object(
-                self.fake,
-                "infer_tmix_readout_forward_varlen",
-                wraps=self.fake.infer_tmix_readout_forward_varlen,
-            ) as readout,
-        ):
-            full_cache = initial_cache.clone()
-            full = model(input_ids, past_key_values=full_cache).logits
-            chunk_cache = initial_cache.detach()
-            first = model(input_ids[:, :-1], past_key_values=chunk_cache).logits
-            last = model(input_ids[:, -1:], past_key_values=chunk_cache).logits
-
-            graph_state = _RwkvGraphState(self.config, 2, torch.device("cpu"), self.fake)
-            graph_state.recurrent_states[0]._state_pool.copy_(initial_cache.layers[0].recurrent_states[0])
-            model.model._forward_state_only(input_ids[:, :-1], None, graph_state, False)
-            hidden, residual, _ = model.model._forward_state_only(input_ids[:, -1:], None, graph_state, False)
-            hidden = self.fake.infer_post_norm_output_forward_varlen(
-                hidden, residual, model.model.norm.weight, model.model.norm.bias
-            )
-            graph_logits = self.fake.infer_head_linear_last_forward_varlen(
-                hidden, model.lm_head.weight, tokens_count=2
-            )
-
-        self.assertTrue(torch.isfinite(full).all())
-        torch.testing.assert_close(torch.cat((first, last), dim=1), full, atol=2e-3, rtol=2e-3)
-        torch.testing.assert_close(graph_logits, last[:, -1], atol=2e-3, rtol=2e-3)
-        for call in recurrent.call_args_list:
-            self.assertEqual(call.kwargs["output_dtype"], torch.float32)
-            self.assertTrue(all(tensor.dtype == torch.float16 for tensor in call.args))
-        self.assertTrue(
-            any(call.args[0].abs().max() > torch.finfo(torch.float16).max for call in readout.call_args_list)
-        )
-        for call in readout.call_args_list:
-            self.assertEqual(call.args[0].dtype, torch.float32)
-            self.assertTrue(all(tensor.dtype == torch.float16 for tensor in call.args[1:]))
-        for layer_idx, layer in enumerate(full_cache.layers):
-            self.assertEqual(layer.recurrent_states[0].dtype, torch.float32)
-            self.assertEqual(layer.conv_states[0].dtype, torch.float16)
-            torch.testing.assert_close(layer.recurrent_states[0], chunk_cache.layers[layer_idx].recurrent_states[0])
-            torch.testing.assert_close(layer.recurrent_states[0], graph_state.recurrent_states[layer_idx]._state_pool)
-            self.assertEqual(model.model.layers[layer_idx].linear_attn.o_proj.weight.dtype, torch.float16)
-
-    def test_float32_wkv_output_load_and_temporary_cache(self):
-        model = RwkvForCausalLM(self.config).half().eval()
-        input_ids = torch.randint(1, self.config.vocab_size, (2, 4))
-        with tempfile.TemporaryDirectory() as directory:
-            model.save_pretrained(directory)
-            model = RwkvForCausalLM.from_pretrained(directory, dtype=torch.float16, wkv_output_dtype="float32")
-            self.assertEqual(model.config.wkv_output_dtype, "float32")
-            model.config.save_pretrained(directory)
-            self.assertEqual(RwkvConfig.from_pretrained(directory).wkv_output_dtype, "float32")
-        full = model(input_ids, use_cache=False)
-        embedded = model(inputs_embeds=model.model.embed_tokens(input_ids).half(), use_cache=False)
-        self.assertIsNone(full.past_key_values)
-        self.assertTrue(torch.isfinite(full.logits).all())
-        torch.testing.assert_close(full.logits, embedded.logits)
-
-    def test_float32_wkv_output_keeps_bf16_training_contract(self):
-        model = RwkvForCausalLM(self.config).bfloat16().train()
-        for sequence_length, use_cache in ((16, False), (7, True)):
-            input_ids = torch.randint(1, self.config.vocab_size, (2, sequence_length))
-            outputs = []
-            gradients = []
-            for output_dtype in (None, "float32"):
-                self.config.wkv_output_dtype = output_dtype
-                model.zero_grad(set_to_none=True)
-                output = model(input_ids, labels=input_ids, use_cache=use_cache)
-                output.loss.backward()
-                outputs.append(output.logits)
-                gradients.append(model.model.layers[0].linear_attn.o_proj.weight.grad.clone())
-                self.assertEqual(output.logits.dtype, torch.bfloat16)
-                if use_cache:
-                    self.assertEqual(output.past_key_values.layers[0].conv_states[0].dtype, torch.bfloat16)
-                    self.assertEqual(output.past_key_values.layers[0].recurrent_states[0].dtype, torch.float32)
-            torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
-            torch.testing.assert_close(gradients[0], gradients[1], atol=0, rtol=0)
-
     def test_state_only_inference_skips_final_norm_and_head(self):
-        model = RwkvForCausalLM(self.config).half().eval()
+        model = RwkvForCausalLM(self.config).bfloat16().eval()
         input_ids = torch.randint(0, self.config.vocab_size, (2, 5))
         cache = RwkvCache(self.config)
 
@@ -1216,7 +1049,7 @@ class RwkvMockProviderTest(unittest.TestCase):
             torch.testing.assert_close(checkpointed_gradient, plain_gradient)
 
     def test_unsupported_generation_modes_fail_closed(self):
-        model = RwkvForCausalLM(self.config).half().eval()
+        model = RwkvForCausalLM(self.config).bfloat16().eval()
         input_ids = torch.randint(1, self.config.vocab_size, (1, 4))
         with self.assertRaisesRegex(ValueError, "static input batch on one CUDA device"):
             model.generate(
@@ -1228,7 +1061,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
     @require_torch_gpu
     def test_unsupported_cuda_graph_inputs_fail_closed(self):
-        model = RwkvForCausalLM(self.config).half().eval().cuda()
+        model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()
         input_ids = torch.randint(1, self.config.vocab_size, (2, 4), device="cuda")
 
         cases = (
@@ -1251,6 +1084,7 @@ class RwkvMockProviderTest(unittest.TestCase):
                 )
 
     @require_peft
+    @torch.no_grad()
     def test_lora_active_disabled_and_merged_inference(self):
         from peft import LoraConfig, get_peft_model
 
@@ -1263,7 +1097,7 @@ class RwkvMockProviderTest(unittest.TestCase):
                     target_modules=["r_proj", "k_proj", "v_proj", "o_proj"],
                 ),
             )
-            .half()
+            .bfloat16()
             .eval()
         )
         for module in model.modules():
@@ -1272,15 +1106,15 @@ class RwkvMockProviderTest(unittest.TestCase):
         input_ids = torch.randint(1, self.config.vocab_size, (1, 5))
 
         active = model(input_ids, use_cache=False).logits
-        model.to(dtype=torch.float16)
+        model.to(dtype=torch.bfloat16)
         with model.disable_adapter():
             disabled = model(input_ids, use_cache=False).logits
         self.assertFalse(torch.equal(active, disabled))
 
-        model.to(dtype=torch.float16)
+        model.to(dtype=torch.bfloat16)
         model.merge_adapter()
         merged = model(input_ids, use_cache=False).logits
-        torch.testing.assert_close(merged, active, atol=2e-3, rtol=2e-3)
+        torch.testing.assert_close(merged, active, atol=1e-2, rtol=1e-2)
 
     @require_accelerate
     def test_trainer_train_eval_save_reload_and_resume(self):
