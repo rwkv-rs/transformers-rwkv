@@ -34,7 +34,8 @@ class RwkvConfig(PreTrainedConfig):
     group_norm_epsilon (`float`, *optional*, defaults to 0.00064):
         Epsilon used by the head-wise normalization in TimeMix.
     wkv_mode (`str`, *optional*, defaults to `"fp32io16"`):
-        WKV state mode used by CUDA-graph generation. Public [`RwkvCache`] state remains float32.
+        Inference WKV state precision: `"fp32io16"` keeps FP32 state and matches training; `"fp16"` rounds
+        state to FP16 after each token. Both use BF16 token IO and FP32 arithmetic. Training always uses FP32 state.
     decay_low_rank_dim (`int`, *optional*):
         Rank of the time-decay projection. Inferred from `hidden_size` when omitted.
     a_low_rank_dim (`int`, *optional*):
@@ -123,8 +124,8 @@ class RwkvConfig(PreTrainedConfig):
             raise ValueError(f"`context_length` must be positive, got {self.context_length}.")
         if self.layer_norm_epsilon <= 0 or self.group_norm_epsilon <= 0:
             raise ValueError("RWKV-7 normalization epsilons must be positive.")
-        if self.wkv_mode != "fp32io16":
-            raise ValueError(f"`wkv_mode` must be 'fp32io16', got {self.wkv_mode!r}.")
+        if self.wkv_mode not in ("fp32io16", "fp16"):
+            raise ValueError(f"`wkv_mode` must be 'fp32io16' or 'fp16', got {self.wkv_mode!r}.")
         ranks = {
             "decay_low_rank_dim": self.decay_low_rank_dim,
             "a_low_rank_dim": self.a_low_rank_dim,

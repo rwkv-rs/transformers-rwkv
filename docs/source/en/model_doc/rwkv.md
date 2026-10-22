@@ -31,9 +31,16 @@ the RWKV dependencies with:
 pip install "transformers[rwkv]"
 ```
 
-Training, prefill, and decode use BF16 model tensors and activations with FP32 accumulation. WKV states and
+Training, prefill, and decode use BF16 model tensors and activations with FP32 accumulation. By default, WKV states and
 head logits are FP32. The provider shares projection, normalization, and recurrence arithmetic across these paths.
 Inputs in one batch must have equal length because RWKV-7 does not use a padding token.
+
+The default `wkv_mode="fp32io16"` matches training bitwise. Set `model.config.wkv_mode = "fp16"` before inference
+to use optional FP16 WKV state in both ordinary forward and CUDA Graph generation. This keeps BF16 token IO and
+FP32 arithmetic, but rounds the recurrent state to FP16 after every token; it does not promise bitwise equality with
+the FP32 training trajectory. Training, including StateTune and recurrent training, always keeps FP32 state regardless
+of this inference option. Create a fresh cache when changing state precision or returning from FP16-state inference
+to training. The benchmark exposes the same option as `--wkv-mode fp16`.
 
 ## Inference
 
@@ -95,7 +102,8 @@ markers for every prompt style.
 ## Stateful execution
 
 Pass the returned `past_key_values` back to the model to continue a stream. [`RwkvCache`] stores two token-shift vectors
-and one FP32 WKV matrix per layer. It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
+and one WKV matrix per layer: FP32 for training and default inference, or FP16 for `wkv_mode="fp16"` inference.
+It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
 
 ```python
 from transformers import RwkvCache

@@ -43,9 +43,7 @@ _TRAIN_ATTENTION_OPERATORS = (
 _INFER_ATTENTION_OPERATORS = (
     "infer_tmix_postnorm_tokenshift_forward_varlen",
     "infer_tmix_readout_forward_varlen",
-    "infer_tmix_wkv7_recurrent_fp32io16_forward_varlen",
     "infer_tmix_wkv_prepare_forward_varlen",
-    "prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor",
 )
 _TRAIN_FEED_FORWARD_OPERATORS = ("pretrain_cmix_bf16", "statetune_cmix_bf16")
 _INFER_FEED_FORWARD_OPERATORS = ("infer_cmix_forward_varlen",)
@@ -63,7 +61,7 @@ def _validate_attention_mask(attention_mask: torch.Tensor | None, batch_size: in
 
 
 class RwkvCache(Cache):
-    """RWKV-7 recurrent cache with two token shifts and one FP32 WKV state per layer."""
+    """RWKV-7 recurrent cache with two token shifts and one WKV state per layer, FP32 by default."""
 
     _chunk_length = 16
 
@@ -107,7 +105,7 @@ class RwkvCache(Cache):
         self._training_metadata.clear()
 
     def layer_states(
-        self, layer_idx: int, hidden_states: torch.Tensor
+        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer = self.layers[layer_idx]
         batch_size, _, hidden_size = hidden_states.shape
@@ -118,12 +116,13 @@ class RwkvCache(Cache):
             self.config.head_size,
             self.config.head_size,
         )
+        state_dtype = torch.float16 if not training and self.config.wkv_mode == "fp16" else torch.float32
 
         if not layer.is_conv_states_initialized[0]:
             template = hidden_states[:, -1].unsqueeze(-1)
             layer.lazy_initialization(conv_states=template, state_idx=0, conv_kernel_size=1)
         if not layer.is_recurrent_states_initialized[0]:
-            template = torch.empty(expected_wkv_shape, dtype=torch.float32, device=hidden_states.device)
+            template = torch.empty(expected_wkv_shape, dtype=state_dtype, device=hidden_states.device)
             layer.lazy_initialization(recurrent_states=template, state_idx=0)
         if not layer.is_conv_states_initialized[1]:
             template = hidden_states[:, -1].unsqueeze(-1)
@@ -136,10 +135,11 @@ class RwkvCache(Cache):
             raise ValueError(
                 f"RWKV-7 cache batch/hidden shape does not match this input: expected {expected_shift_shape}."
             )
-        if wkv_state.shape != expected_wkv_shape or wkv_state.dtype != torch.float32:
+        if wkv_state.shape != expected_wkv_shape or wkv_state.dtype != state_dtype:
             raise ValueError(
-                f"RWKV-7 WKV cache must have shape {expected_wkv_shape} and dtype float32; "
-                f"got shape={tuple(wkv_state.shape)}, dtype={wkv_state.dtype}."
+                f"RWKV-7 WKV cache must have shape {expected_wkv_shape} and dtype {state_dtype}; "
+                f"got shape={tuple(wkv_state.shape)}, dtype={wkv_state.dtype}. "
+                "Create a new cache when changing state precision or switching from FP16-state inference to training."
             )
         return attention_shift.squeeze(-1), wkv_state, feed_forward_shift.squeeze(-1)
 
@@ -228,9 +228,13 @@ class RwkvCache(Cache):
         state_key = wkv_state.data_ptr()
         recurrent_state = self._inference_recurrent_states.get(state_key)
         if recurrent_state is None:
-            recurrent_state = flash_rwkv2.prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(wkv_state)
+            prepare_state = getattr(
+                flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.config.wkv_mode}_state_from_tensor"
+            )
+            recurrent_state = prepare_state(wkv_state)
             self._inference_recurrent_states[state_key] = recurrent_state
-        return flash_rwkv2.infer_tmix_wkv7_recurrent_fp32io16_forward_varlen(
+        recurrent_forward = getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{self.config.wkv_mode}_forward_varlen")
+        return recurrent_forward(
             receptance,
             decay_logits,
             key,
@@ -549,7 +553,15 @@ class RwkvAttention(nn.Module):
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
         cache_params: RwkvCache | _RwkvGraphState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flash_rwkv2 = load_flash_rwkv2(_INFER_ATTENTION_OPERATORS, hidden_states, "inference")
+        flash_rwkv2 = load_flash_rwkv2(
+            _INFER_ATTENTION_OPERATORS
+            + (
+                f"infer_tmix_wkv7_recurrent_{self.config.wkv_mode}_forward_varlen",
+                f"prepare_tmix_wkv7_recurrent_{self.config.wkv_mode}_state_from_tensor",
+            ),
+            hidden_states,
+            "inference",
+        )
         if hidden_states.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
             raise TypeError("RWKV-7 inference requires bfloat16 hidden and residual tensors.")
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
@@ -978,7 +990,12 @@ class RwkvModel(RwkvPreTrainedModel):
         v_first = None
         for layer_idx, decoder_layer in enumerate(self.layers):
             state_reference = hidden_states.view(batch_size, sequence_length, -1)
-            attention_shift, wkv_state, feed_forward_shift = cache_params.layer_states(layer_idx, state_reference)
+            if isinstance(cache_params, RwkvCache):
+                attention_shift, wkv_state, feed_forward_shift = cache_params.layer_states(
+                    layer_idx, state_reference, training=False
+                )
+            else:
+                attention_shift, wkv_state, feed_forward_shift = cache_params.layer_states(layer_idx, state_reference)
             hidden_states, residual, v_first, _, _ = decoder_layer(
                 hidden_states,
                 residual,
