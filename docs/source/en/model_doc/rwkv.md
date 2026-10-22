@@ -21,26 +21,19 @@ rendered properly in your Markdown viewer.
 
 RWKV-7 is a recurrent language model whose TimeMix layers update a fixed-size matrix state instead of retaining a
 key/value tensor for every earlier token. The implementation follows the canonical RWKV-LM training equations and uses
-the FlashRWKV2 CUDA provider for both training and inference. The former RWKV-4 implementation and its state/output
+the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a14`; it intentionally has no CPU or FLA execution fallback. Install
+This integration requires CUDA and `FlashRWKV2==0.1.0a16`; it intentionally has no CPU or FLA execution fallback. Install
 the RWKV dependencies with:
 
 ```bash
 pip install "transformers[rwkv]"
 ```
 
-Training uses BF16 model tensors. Inference uses FP16 model tensors, except for the BF16 embedding/LN0 fusion and FP32
-WKV states. Inputs in one batch must have equal length because RWKV-7 does not use a padding token.
-
-For frozen FP16 teachers with WKV values outside the FP16 range, set `wkv_output_dtype="float32"` in
-`from_pretrained()` or [`RwkvConfig`]. With a FlashRWKV2 build supporting `output_dtype=torch.float32` and mixed-dtype
-readout, WKV output stays FP32 through head normalization; the fused readout casts the prelinear result to FP16 before
-the output projection. Model weights and other inference tensors keep their existing dtypes. This applies to ordinary
-forward calls, cached continuation, and CUDA graph generation, and requires `wkv_mode="fp32io16"` (the default).
-The default `wkv_output_dtype=None` preserves the existing inference behavior. BF16 training and evaluation keep their
-existing BF16 contract regardless of this setting.
+Training, prefill, and decode use BF16 model tensors and activations with FP32 accumulation. WKV states and
+head logits are FP32. The provider shares projection, normalization, and recurrence arithmetic across these paths.
+Inputs in one batch must have equal length because RWKV-7 does not use a padding token.
 
 ## Inference
 
@@ -56,7 +49,7 @@ checkpoint = "/path/to/converted-rwkv7"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 model = AutoModelForCausalLM.from_pretrained(
     checkpoint,
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ).cuda().eval()
 
 messages = [{"role": "user", "content": "Explain recurrent language models briefly."}]
@@ -118,7 +111,7 @@ backpropagation segment.
 
 ## Training
 
-Move the complete model back to BF16 before training. Stateless training uses the canonical FlashRWKV2 pretraining
+Load the complete model in BF16 before training. Stateless training uses the canonical FlashRWKV2 pretraining
 operators for sequence lengths divisible by 16; other non-empty chunks use the differentiable zero-initial-state
 StateTune path.
 
@@ -133,15 +126,14 @@ checkpointed decoder layer, so gradient checkpointing does not apply the state t
 
 ## LoRA and CUDA Graphs
 
-During FP16 inference, FlashRWKV2 accepts one active, unmerged vanilla PEFT LoRA adapter on each TimeMix R/K/V/O
-projection. Disabled and merged adapters are also supported. Merge adapters that use multiple active branches, DoRA,
-variants, bias, or ChannelMix targets before inference; unsupported layouts fail before a kernel launch.
+BF16 inference supports one active PEFT LoRA or NoRA adapter on TimeMix R/K/V/O, ChannelMix key/value, and the
+output head. Disabled and merged adapters are also supported. The provider receives raw adapter parameters and applies
+NoRA normalization on each forward. Merge adapters with multiple active branches, DoRA, other variants, or bias.
 
-Inference runtime layouts are created automatically by the first warmup forward. That warmup also moves the canonical
-ChannelMix value weight to CPU after creating its transposed runtime layout. Calling `.to(...)` or loading a state dict
-invalidates these non-persistent layouts and restores the canonical parameter. For CUDA Graph decode, warm up the fixed
-batch/sequence shape and its [`RwkvCache`] on the capture stream before capture; cache state tensors retain fixed
-addresses during eval updates.
+Training uses differentiable operators whenever gradients are enabled. Use `model.eval()` with `torch.no_grad()` for
+recurrent inference. CUDA Graph generation does this automatically. Weight transpose views refer to the canonical
+parameters directly; no runtime weight copies or CPU offload are needed. Warm up fixed batch/sequence shapes and their
+[`RwkvCache`] on the capture stream before capture so metadata and state addresses are ready.
 
 ## LoRA and NoRA training
 
@@ -158,7 +150,6 @@ For a different output position in each sample, pass `logits_to_keep` as a
 before the vocabulary projection. A 1D tensor continues to select the same
 positions for every sample. For example, right-padded next-token scoring uses
 `logits_to_keep=(lengths - 1)[:, None]` and reads `outputs.logits[:, 0]`.
-Merge adapters before FP16 inference when adapting ChannelMix or the output head.
 
 ## Converting a canonical checkpoint
 

@@ -34,7 +34,7 @@ from ...generation import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from ...integrations.flash_rwkv2 import load_flash_rwkv2
+from ...integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
 from .configuration_rwkv import RwkvConfig
 
 
@@ -63,7 +63,7 @@ class _RwkvGraphState:
     ) -> None:
         shift_shape = (config.num_hidden_layers, batch_size, config.hidden_size)
         self.wkv_mode = config.wkv_mode
-        self.attention_shift = torch.zeros(shift_shape, dtype=torch.float16, device=device)
+        self.attention_shift = torch.zeros(shift_shape, dtype=torch.bfloat16, device=device)
         self.feed_forward_shift = torch.zeros_like(self.attention_shift)
         prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.wkv_mode}_state")
         self.recurrent_states = [
@@ -117,7 +117,6 @@ class _RwkvGraphState:
         recurrent_state,
         decay_bias: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
-        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         recurrent_forward = getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{self.wkv_mode}_forward_varlen")
@@ -134,7 +133,6 @@ class _RwkvGraphState:
             decay_bias=decay_bias,
             max_seqlen=max_seqlen,
             validated_metadata=ticket,
-            **({"output_dtype": output_dtype} if output_dtype is not None else {}),
         )
 
     def clone(self) -> tuple:
@@ -282,10 +280,14 @@ class _RwkvDecodeGraph:
             model.model.norm.bias,
             eps=model.config.layer_norm_epsilon,
         )
-        logits = self.flash_rwkv2.infer_head_linear_last_forward_varlen(
+        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(model.lm_head)
+        logits = self.flash_rwkv2.pretrain_head_linear_bf16(
             hidden_states,
-            model.lm_head.weight,
-            tokens_count=self.batch_size,
+            weight,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scale=scale,
+            use_nora=use_nora,
         ).view(self.batch_size, model.vocab_size)
         self.logits = logits.float().contiguous()
         if self.do_sample:
@@ -392,7 +394,7 @@ class _RwkvGenerationModelRunner:
         self.prefill_lengths = _rwkv_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
         max_new_tokens = max_length - prompt_length
         operators = [
-            "infer_head_linear_last_forward_varlen",
+            "pretrain_head_linear_bf16",
             "infer_post_norm_output_forward_varlen",
             "prepare_tmix_wkv7_recurrent_metadata",
         ]
@@ -587,8 +589,8 @@ class RwkvGenerationMixin(GenerationMixin):
     ) -> tuple[int, torch.Tensor | None, tuple[StopStringCriteria, ...]]:
         if input_ids.device.type != "cuda" or self.lm_head.weight.device != input_ids.device:
             raise ValueError("RWKV-7 generation requires the model and a static input batch on one CUDA device.")
-        if self.training or self.lm_head.weight.dtype != torch.float16:
-            raise ValueError("RWKV-7 generation requires an eval-mode float16 model.")
+        if self.training or self.lm_head.weight.dtype != torch.bfloat16:
+            raise ValueError("RWKV-7 generation requires an eval-mode bfloat16 model.")
         attention_mask = model_kwargs.get("attention_mask")
         if attention_mask is not None and (
             attention_mask.shape != input_ids.shape or not bool(torch.all(attention_mask != 0))
@@ -648,7 +650,6 @@ class RwkvGenerationMixin(GenerationMixin):
         stop_string_criteria: tuple[StopStringCriteria, ...],
         tokenizer,
         wkv_mode: str,
-        wkv_output_dtype: str | None,
     ) -> tuple:
         eos_key = None if eos_token_ids is None else tuple(eos_token_ids.tolist())
         pad_token_id = generation_config._pad_token_tensor
@@ -673,7 +674,6 @@ class RwkvGenerationMixin(GenerationMixin):
             eos_key,
             stop_key,
             wkv_mode,
-            wkv_output_dtype,
         )
 
     def _sample(
@@ -702,7 +702,6 @@ class RwkvGenerationMixin(GenerationMixin):
             stop_string_criteria,
             model_kwargs.get("tokenizer"),
             self._rwkv_wkv_mode,
-            self.config.wkv_output_dtype,
         )
         with torch.cuda.device(input_ids.device):
             cache = self._get_rwkv_generation_cache()

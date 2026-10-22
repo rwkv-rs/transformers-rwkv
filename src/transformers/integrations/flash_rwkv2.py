@@ -58,7 +58,7 @@ def load_flash_rwkv2(
 
 
 def flash_rwkv2_linear_spec(
-    projection: nn.Module, *, training: bool = False
+    projection: nn.Module,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, float, bool]:
     """Resolve a bias-free projection, preserving raw NoRA parameters for fused training."""
     if isinstance(projection, nn.Linear):
@@ -129,8 +129,6 @@ def flash_rwkv2_linear_spec(
         )
     adapter_a, adapter_b, scale, use_nora = active[0]
     weight_a = adapter_a.weight
-    if use_nora and not training:
-        weight_a = (weight_a.float() / (weight_a.float().norm(dim=0, keepdim=True) + 1e-6)).to(weight_a.dtype)
     return base_layer.weight.contiguous(), weight_a.contiguous(), adapter_b.weight.contiguous(), scale, use_nora
 
 
