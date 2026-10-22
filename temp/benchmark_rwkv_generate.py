@@ -254,8 +254,8 @@ def main() -> None:
             )
             outputs.append(json.loads(output.read_text()))
     summary = median_results(outputs)
-    validate_results(summary, args)
     print(json.dumps(summary, indent=2, sort_keys=True))
+    validate_results(summary, args)
 
 
 if __name__ == "__main__":
