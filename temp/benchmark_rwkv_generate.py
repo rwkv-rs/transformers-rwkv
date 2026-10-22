@@ -217,7 +217,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--wkv-mode", choices=("fp32io16",), default="fp32io16")
+    parser.add_argument("--wkv-mode", choices=("fp32io16", "fp16"), default="fp32io16")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--prompt-length", type=int, default=1024)
     parser.add_argument("--completion-length", type=int, default=128)
