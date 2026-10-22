@@ -251,6 +251,7 @@ def main() -> None:
             subprocess.run(
                 [sys.executable, __file__, *sys.argv[1:], "--worker-output", str(output)],
                 check=True,
+                stdout=sys.stderr,
             )
             outputs.append(json.loads(output.read_text()))
     summary = median_results(outputs)
