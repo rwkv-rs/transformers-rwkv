@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import itertools
 import json
 import tempfile
 import unittest
@@ -89,7 +90,6 @@ class RwkvConfigTest(unittest.TestCase):
             {"intermediate_size": 320},
             {"wkv_state_dtype": "float32"},
             {"wkv_mode": "deltalog"},
-            {"wkv_mode": "fp16"},
             {"pad_token_id": 0},
             {"tie_word_embeddings": True},
         )
@@ -240,6 +240,62 @@ class RwkvStructureTest(unittest.TestCase):
 
 @require_torch_gpu
 class RwkvBF16ProviderTest(unittest.TestCase):
+    def test_fp16_state_inference_preserves_fp32_training(self):
+        torch.manual_seed(117)
+        model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 16), device="cuda")
+        reference = model(ids, labels=ids, use_cache=True)
+        parameters = tuple(model.parameters())
+        gradients = torch.autograd.grad(reference.loss, parameters)
+        model.config.wkv_mode = "fp16"
+        training = model(ids, labels=ids, use_cache=True)
+        torch.testing.assert_close(training.logits, reference.logits, atol=0, rtol=0)
+        for actual, expected in zip(torch.autograd.grad(training.loss, parameters), gradients, strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        for actual, expected in zip(training.past_key_values.layers, reference.past_key_values.layers, strict=True):
+            self.assertEqual(actual.recurrent_states[0].dtype, torch.float32)
+            torch.testing.assert_close(actual.recurrent_states[0], expected.recurrent_states[0], atol=0, rtol=0)
+        model.eval()
+        # Grad-enabled evaluation still uses differentiable FP32-state operators.
+        evaluated = model(ids, use_cache=True)
+        torch.testing.assert_close(evaluated.logits, reference.logits, atol=0, rtol=0)
+        self.assertEqual(evaluated.past_key_values.layers[0].recurrent_states[0].dtype, torch.float32)
+        with torch.no_grad():
+            full = model(ids, use_cache=True)
+            self.assertEqual(full.logits.dtype, torch.float32)
+            cache = RwkvCache(model.config)
+            chunks = [model(ids[:, :7], past_key_values=cache).logits]
+            for position in range(7, ids.shape[1]):
+                chunks.append(model(ids[:, position : position + 1], past_key_values=cache).logits)
+            torch.testing.assert_close(torch.cat(chunks, dim=1), full.logits, atol=0, rtol=0)
+            single = model(ids[:1], use_cache=True)
+            torch.testing.assert_close(single.logits, full.logits[:1], atol=0, rtol=0)
+            for whole, chunked, one in zip(
+                full.past_key_values.layers, cache.layers, single.past_key_values.layers, strict=True
+            ):
+                self.assertEqual(whole.recurrent_states[0].dtype, torch.float16)
+                torch.testing.assert_close(chunked.recurrent_states[0], whole.recurrent_states[0], atol=0, rtol=0)
+                torch.testing.assert_close(one.recurrent_states[0], whole.recurrent_states[0][:1], atol=0, rtol=0)
+                for key in (0, 1):
+                    self.assertEqual(whole.conv_states[key].dtype, torch.bfloat16)
+                    torch.testing.assert_close(chunked.conv_states[key], whole.conv_states[key], atol=0, rtol=0)
+            copied = cache.detach()
+            copied.batch_repeat_interleave(2)
+            copied.reorder_cache(torch.tensor([3, 0], device="cuda"))
+            next_ids = ids[[1, 0], :1]
+            actual = model(next_ids, past_key_values=copied).logits
+            expected = model(ids[:, :1], past_key_values=cache).logits[[1, 0]]
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            copied.reset()
+            torch.testing.assert_close(model(ids, past_key_values=copied).logits, full.logits, atol=0, rtol=0)
+        model.train()
+        with self.assertRaisesRegex(ValueError, "dtype torch.float32"):
+            model(ids[:, :1], past_key_values=full.past_key_values)
+
     def test_training_prefill_decode_batch_state_and_optimizer(self):
         import flashrwkv2
 
@@ -308,17 +364,38 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 if parameter.ndim >= 2:
                     parameter.normal_(std=0.03)
         ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
-        cache = RwkvCache(model.config)
-        token = model(ids, past_key_values=cache, logits_to_keep=1).logits[:, -1].argmax(-1)
-        completion = [token]
-        for _ in range(2):
-            token = model(token[:, None], past_key_values=cache).logits[:, -1].argmax(-1)
-            completion.append(token)
-        expected = torch.cat((ids, torch.stack(completion, dim=1)), dim=1)
-        for _ in range(2):
-            actual = model.generate(ids, max_new_tokens=3, prefill_chunk_size=3, do_sample=False, eos_token_id=None)
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        self.assertEqual(len(model._rwkv_generation_graphs), 1)
+        for mode in ("fp32io16", "fp16"):
+            model.config.wkv_mode = mode
+            cache = RwkvCache(model.config)
+            logits = model(ids, past_key_values=cache, logits_to_keep=1).logits[:, -1]
+            token = logits.argmax(-1)
+            completion = [token]
+            for _ in range(2):
+                logits = model(token[:, None], past_key_values=cache).logits[:, -1]
+                token = logits.argmax(-1)
+                completion.append(token)
+            expected = torch.cat((ids, torch.stack(completion, dim=1)), dim=1)
+            for _ in range(2):
+                actual = model.generate(
+                    ids, max_new_tokens=3, prefill_chunk_size=3, do_sample=False, eos_token_id=None
+                )
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                runtime = next(reversed(model._rwkv_generation_graphs.values()))
+                torch.testing.assert_close(runtime.decode_graph.logits, logits, atol=0, rtol=0)
+                for layer_idx, layer in enumerate(cache.layers):
+                    torch.testing.assert_close(
+                        runtime.state.recurrent_states[layer_idx]._state_pool,
+                        layer.recurrent_states[0],
+                        atol=0,
+                        rtol=0,
+                    )
+                    torch.testing.assert_close(
+                        runtime.state.attention_shift[layer_idx], layer.conv_states[0].squeeze(-1), atol=0, rtol=0
+                    )
+                    torch.testing.assert_close(
+                        runtime.state.feed_forward_shift[layer_idx], layer.conv_states[1].squeeze(-1), atol=0, rtol=0
+                    )
+        self.assertEqual(len(model._rwkv_generation_graphs), 2)
 
 
 @require_torch_gpu
@@ -331,9 +408,9 @@ class RwkvNoRATrainingTest(unittest.TestCase):
 
         if "use_nora" not in LoraConfig.__dataclass_fields__:
             self.skipTest("requires Joluck/NoRA")
-        for use_nora in (False, True):
+        for use_nora, wkv_mode in itertools.product((False, True), ("fp32io16", "fp16")):
             torch.manual_seed(113)
-            base = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
+            base = RwkvForCausalLM(tiny_config(wkv_mode=wkv_mode)).to(device="cuda", dtype=torch.bfloat16).eval()
             # Nonzero output and gate matrices make every adapted projection observable.
             with torch.no_grad():
                 for parameter in base.parameters():
@@ -355,6 +432,7 @@ class RwkvNoRATrainingTest(unittest.TestCase):
                     target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
                 ),
             )
+            model.train()
             with torch.no_grad():
                 for name, parameter in model.named_parameters():
                     if "lora_B" in name:
@@ -376,7 +454,8 @@ class RwkvNoRATrainingTest(unittest.TestCase):
             model.eval()
             with torch.no_grad():
                 adapted = model(ids, use_cache=False, logits_to_keep=positions).logits
-                torch.testing.assert_close(adapted, trained, atol=0, rtol=0)
+                if wkv_mode == "fp32io16":
+                    torch.testing.assert_close(adapted, trained, atol=0, rtol=0)
                 cache = RwkvCache(model.config)
                 first = model(ids[:, :7], past_key_values=cache, use_cache=True).logits
                 last = model(ids[:, 7:], past_key_values=cache, use_cache=True).logits
