@@ -80,7 +80,6 @@ class RwkvConfigTest(unittest.TestCase):
         self.assertEqual(config.v_low_rank_dim, 64)
         self.assertEqual(config.gate_low_rank_dim, 160)
         self.assertEqual(config.wkv_mode, "fp32io16")
-        self.assertEqual(tiny_config(wkv_mode="fp16").wkv_mode, "fp16")
 
     def test_rwkv4_and_noncanonical_fields_fail_closed(self):
         invalid = (
@@ -90,8 +89,7 @@ class RwkvConfigTest(unittest.TestCase):
             {"intermediate_size": 320},
             {"wkv_state_dtype": "float32"},
             {"wkv_mode": "deltalog"},
-            {"wkv_output_dtype": "float16"},
-            {"wkv_output_dtype": "float32", "wkv_mode": "fp16"},
+            {"wkv_mode": "fp16"},
             {"pad_token_id": 0},
             {"tie_word_embeddings": True},
         )
@@ -169,7 +167,7 @@ class RwkvStructureTest(unittest.TestCase):
         self.assertLessEqual(float(model.model.embed_tokens.weight.detach().abs().max()), 1e-4)
 
     def test_cpu_mask_and_cache_boundaries_fail_closed(self):
-        model = RwkvModel(tiny_config()).half().eval()
+        model = RwkvModel(tiny_config()).bfloat16().eval()
         input_ids = torch.tensor([[1, 2]])
         with self.assertRaisesRegex(ValueError, "padding or ragged"):
             model(input_ids, attention_mask=torch.tensor([[1, 0]]))
@@ -178,44 +176,10 @@ class RwkvStructureTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             model(input_ids)
 
-    @require_torch_gpu
-    def test_float32_wkv_output_inference_and_generation(self):
-        torch.manual_seed(101)
-        config = tiny_config(hidden_size=1024, intermediate_size=4096)
-        model = RwkvForCausalLM(config).half().eval().cuda().requires_grad_(False)
-        input_ids = torch.randint(1, config.vocab_size, (2, 7), device="cuda")
-        initial_cache = RwkvCache(config)
-        initial_cache.layer_states(0, torch.zeros(2, 1, config.hidden_size, dtype=torch.float16, device="cuda"))
-        initial_cache.layers[0].recurrent_states[0].normal_(std=1e7)
-        overflow = model(input_ids, past_key_values=initial_cache.clone()).logits
-        self.assertFalse(torch.isfinite(overflow).all())
-
-        config.wkv_output_dtype = "float32"
-        full = model(input_ids, past_key_values=initial_cache.clone()).logits
-        chunk_cache = initial_cache.clone()
-        first = model(input_ids[:, :-1], past_key_values=chunk_cache).logits
-        last = model(input_ids[:, -1:], past_key_values=chunk_cache).logits
-        self.assertTrue(torch.isfinite(full).all())
-        self.assertTrue(torch.isfinite(first).all())
-        self.assertTrue(torch.isfinite(last).all())
-        torch.testing.assert_close(torch.cat((first, last), dim=1), full, atol=2e-3, rtol=2e-3)
-
-        for graph_count, output_dtype in enumerate((None, "float32"), start=1):
-            config.wkv_output_dtype = output_dtype
-            generated = model.generate(
-                input_ids, max_new_tokens=3, prefill_chunk_size=2, do_sample=False, eos_token_id=None
-            )
-            repeated = model.generate(
-                input_ids, max_new_tokens=3, prefill_chunk_size=2, do_sample=False, eos_token_id=None
-            )
-            self.assertEqual(generated.shape, (2, 10))
-            torch.testing.assert_close(repeated, generated)
-            self.assertEqual(len(model._rwkv_generation_graphs), graph_count)
-
     def test_provider_pin_and_requested_operator_validation(self):
         requirement = Requirement(deps["FlashRWKV2"])
-        self.assertEqual(str(requirement.specifier), "==0.1.0a15")
-        self.assertEqual(version("FlashRWKV2"), "0.1.0a15")
+        self.assertEqual(str(requirement.specifier), "==0.1.0a16")
+        self.assertEqual(version("FlashRWKV2"), "0.1.0a16")
         module = load_flash_rwkv2(
             (
                 "pretrain_tmix_wkv7_recurrent_bf16",
@@ -224,7 +188,7 @@ class RwkvStructureTest(unittest.TestCase):
                 "infer_sampling_six_parameter_forward_varlen",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a15")
+        self.assertEqual(module.__version__, "0.1.0a16")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
 
@@ -272,6 +236,84 @@ class RwkvStructureTest(unittest.TestCase):
         dora_projection = dora_model.base_model.model.model.layers[0].linear_attn.r_proj
         with self.assertRaisesRegex(RuntimeError, "LoRA and NoRA"):
             flash_rwkv2_linear_spec(dora_projection)
+
+
+@require_torch_gpu
+class RwkvBF16ProviderTest(unittest.TestCase):
+    def test_training_prefill_decode_batch_state_and_optimizer(self):
+        import flashrwkv2
+
+        torch.manual_seed(115)
+        model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 16), device="cuda")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        for step in range(2):
+            model.train()
+            training = model(ids, labels=ids, use_cache=False)
+            self.assertEqual(training.logits.dtype, torch.float32)
+            self.assertEqual(training.loss.dtype, torch.float32)
+            training_cache = RwkvCache(model.config)
+            stateful = model(ids, past_key_values=training_cache, use_cache=True)
+            torch.testing.assert_close(stateful.logits, training.logits, atol=0, rtol=0)
+            model.eval()
+            with torch.no_grad():
+                full_cache = RwkvCache(model.config)
+                full = model(ids, past_key_values=full_cache, use_cache=True).logits
+                torch.testing.assert_close(full, training.logits, atol=0, rtol=0)
+                chunk_cache = RwkvCache(model.config)
+                chunks = [model(ids[:, :7], past_key_values=chunk_cache).logits]
+                for position in range(7, ids.shape[1]):
+                    chunks.append(model(ids[:, position : position + 1], past_key_values=chunk_cache).logits)
+                torch.testing.assert_close(torch.cat(chunks, dim=1), full, atol=0, rtol=0)
+                single = model(ids[:1], use_cache=False).logits
+                torch.testing.assert_close(single, full[:1], atol=0, rtol=0)
+                targets = ids.contiguous()
+                expected_logprobs = flashrwkv2.head_logprobs(full, targets)
+                actual_logprobs = flashrwkv2.head_logprobs(torch.cat(chunks, dim=1).contiguous(), targets)
+                self.assertEqual(actual_logprobs.dtype, torch.float32)
+                torch.testing.assert_close(actual_logprobs, expected_logprobs, atol=0, rtol=0)
+                for trained, whole, chunked in zip(
+                    training_cache.layers, full_cache.layers, chunk_cache.layers, strict=True
+                ):
+                    for key in (0, 1):
+                        self.assertEqual(whole.conv_states[key].dtype, torch.bfloat16)
+                        torch.testing.assert_close(trained.conv_states[key], whole.conv_states[key], atol=0, rtol=0)
+                        torch.testing.assert_close(chunked.conv_states[key], whole.conv_states[key], atol=0, rtol=0)
+                    self.assertEqual(whole.recurrent_states[0].dtype, torch.float32)
+                    torch.testing.assert_close(trained.recurrent_states[0], whole.recurrent_states[0], atol=0, rtol=0)
+                    torch.testing.assert_close(chunked.recurrent_states[0], whole.recurrent_states[0], atol=0, rtol=0)
+            if step == 0:
+                training.loss.backward()
+                for name, parameter in model.named_parameters():
+                    self.assertIsNotNone(parameter.grad, name)
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+    @torch.no_grad()
+    def test_cuda_graph_generation_matches_eager_bf16(self):
+        torch.manual_seed(116)
+        model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16).eval()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+        cache = RwkvCache(model.config)
+        token = model(ids, past_key_values=cache, logits_to_keep=1).logits[:, -1].argmax(-1)
+        completion = [token]
+        for _ in range(2):
+            token = model(token[:, None], past_key_values=cache).logits[:, -1].argmax(-1)
+            completion.append(token)
+        expected = torch.cat((ids, torch.stack(completion, dim=1)), dim=1)
+        for _ in range(2):
+            actual = model.generate(ids, max_new_tokens=3, prefill_chunk_size=3, do_sample=False, eos_token_id=None)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertEqual(len(model._rwkv_generation_graphs), 1)
 
 
 @require_torch_gpu

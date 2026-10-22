@@ -240,7 +240,7 @@ def gpu_smoke(output: Path) -> str:
     model = RwkvForCausalLM.from_pretrained(
         output,
         local_files_only=True,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device_map={"": device},
     ).eval()
     tokens = tokenizer("The future of open source AI is", return_tensors="pt", add_special_tokens=False).input_ids.to(

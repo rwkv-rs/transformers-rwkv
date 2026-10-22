@@ -79,7 +79,7 @@ def benchmark_worker(args) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = RwkvForCausalLM.from_pretrained(
         args.model,
-        dtype=torch.float16,
+        dtype=torch.bfloat16,
         device_map={"": args.device},
     ).eval()
     model.config.wkv_mode = args.wkv_mode
