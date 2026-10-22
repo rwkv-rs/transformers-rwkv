@@ -603,14 +603,6 @@ class FakeFlashRwkv2:
     def infer_post_norm_output_forward_varlen(x, residual, weight, bias, *, eps=1e-5):
         return F.layer_norm(x + residual, (x.shape[-1],), weight, bias, eps)
 
-    @staticmethod
-    def infer_head_linear_all_forward_varlen(x, weight):
-        return F.linear(x, weight)
-
-    @staticmethod
-    def infer_head_linear_last_forward_varlen(x, weight, *, tokens_count):
-        return F.linear(x, weight)
-
 
 def fake_recurrent_metadata(self, flash_rwkv2, batch_size, sequence_length, device):
     cu_seqlens = torch.arange(0, (batch_size + 1) * sequence_length, sequence_length, dtype=torch.int32)
@@ -829,7 +821,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         fixed_logits = torch.full((1, self.config.vocab_size), -1e4, device="cuda")
         fixed_logits[:, eos_token_id] = 1
 
-        with mock.patch.object(self.fake, "infer_head_linear_last_forward_varlen", return_value=fixed_logits):
+        with mock.patch.object(self.fake, "pretrain_head_linear_bf16", return_value=fixed_logits):
             generated = model.generate(
                 input_ids,
                 max_new_tokens=5,
@@ -845,7 +837,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         self.assertFalse(runtime.decode_graph.unfinished.item())
 
         model._rwkv_generation_graphs.clear()
-        with mock.patch.object(self.fake, "infer_head_linear_last_forward_varlen", return_value=fixed_logits):
+        with mock.patch.object(self.fake, "pretrain_head_linear_bf16", return_value=fixed_logits):
             generated = model.generate(
                 input_ids,
                 max_new_tokens=5,
@@ -867,7 +859,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         first_criteria = single_token_stop_criteria(self.config.vocab_size, stop_token)
         second_criteria = single_token_stop_criteria(self.config.vocab_size, stop_token)
         tokenizer = object()
-        with mock.patch.object(self.fake, "infer_head_linear_last_forward_varlen", return_value=fixed_logits):
+        with mock.patch.object(self.fake, "pretrain_head_linear_bf16", return_value=fixed_logits):
             generated = model.generate(
                 input_ids,
                 max_new_tokens=4,
@@ -991,7 +983,7 @@ class RwkvMockProviderTest(unittest.TestCase):
             ),
             mock.patch.object(
                 self.fake,
-                "infer_head_linear_last_forward_varlen",
+                "pretrain_head_linear_bf16",
                 side_effect=AssertionError("state-only inference must skip the LM head"),
             ),
             mock.patch.object(
