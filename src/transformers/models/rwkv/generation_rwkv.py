@@ -706,6 +706,7 @@ class RwkvGenerationMixin(GenerationMixin):
         key += tuple(
             (
                 name,
+                module.get_base_layer().weight.data_ptr(),
                 module.disable_adapters,
                 tuple(module.active_adapters),
                 tuple(module.merged_adapters),
