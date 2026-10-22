@@ -400,6 +400,15 @@ class RwkvNoRATrainingTest(unittest.TestCase):
                     restored = PeftModel.from_pretrained(restored_base, directory).eval()
                     actual = restored(ids, use_cache=False, logits_to_keep=positions).logits
                     torch.testing.assert_close(actual, adapted, atol=0, rtol=0)
+                    restored.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+                    restored.merge_adapter(safe_merge=True)
+                    merged_logits = restored(ids, use_cache=False, logits_to_keep=1).logits
+                    merged_tokens = restored.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+                    torch.testing.assert_close(merged_tokens[:, -1], merged_logits[:, -1].argmax(-1))
+                    restored.unmerge_adapter()
+                    unmerged_logits = restored(ids, use_cache=False, logits_to_keep=1).logits
+                    unmerged_tokens = restored.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+                    torch.testing.assert_close(unmerged_tokens[:, -1], unmerged_logits[:, -1].argmax(-1))
                     merged = restored.merge_and_unload(safe_merge=True)
                     actual = merged(ids, use_cache=False, logits_to_keep=positions).logits
                     torch.testing.assert_close(actual.float(), adapted.float(), atol=0.04, rtol=0.04)
