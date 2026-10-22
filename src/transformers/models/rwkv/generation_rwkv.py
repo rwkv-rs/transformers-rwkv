@@ -703,6 +703,26 @@ class RwkvGenerationMixin(GenerationMixin):
             model_kwargs.get("tokenizer"),
             self._rwkv_wkv_mode,
         )
+        key += tuple(
+            (
+                name,
+                module.disable_adapters,
+                tuple(module.active_adapters),
+                tuple(module.merged_adapters),
+                tuple(
+                    (
+                        adapter,
+                        branch.weight.data_ptr(),
+                        module.lora_B[adapter].weight.data_ptr(),
+                        module.scaling[adapter],
+                        getattr(module, "use_nora", {}).get(adapter, False),
+                    )
+                    for adapter, branch in module.lora_A.items()
+                ),
+            )
+            for name, module in self.named_modules()
+            if hasattr(module, "lora_A")
+        )
         with torch.cuda.device(input_ids.device):
             cache = self._get_rwkv_generation_cache()
             runner = cache.get(key)

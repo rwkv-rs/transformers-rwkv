@@ -257,7 +257,7 @@ class RwkvBF16ProviderTest(unittest.TestCase):
             self.assertEqual(training.logits.dtype, torch.float32)
             self.assertEqual(training.loss.dtype, torch.float32)
             training_cache = RwkvCache(model.config)
-            stateful = model(ids, past_key_values=training_cache, use_cache=True)
+            stateful = model(ids, labels=ids, past_key_values=training_cache, use_cache=True)
             torch.testing.assert_close(stateful.logits, training.logits, atol=0, rtol=0)
             model.eval()
             with torch.no_grad():
@@ -287,6 +287,11 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                     torch.testing.assert_close(trained.recurrent_states[0], whole.recurrent_states[0], atol=0, rtol=0)
                     torch.testing.assert_close(chunked.recurrent_states[0], whole.recurrent_states[0], atol=0, rtol=0)
             if step == 0:
+                parameters = tuple(model.parameters())
+                expected_gradients = torch.autograd.grad(training.loss, parameters, retain_graph=True)
+                stateful_gradients = torch.autograd.grad(stateful.loss, parameters)
+                for expected_gradient, stateful_gradient in zip(expected_gradients, stateful_gradients, strict=True):
+                    torch.testing.assert_close(stateful_gradient, expected_gradient, atol=1e-4, rtol=0.02)
                 training.loss.backward()
                 for name, parameter in model.named_parameters():
                     self.assertIsNotNone(parameter.grad, name)
@@ -319,68 +324,85 @@ class RwkvBF16ProviderTest(unittest.TestCase):
 @require_torch_gpu
 @require_peft
 class RwkvNoRATrainingTest(unittest.TestCase):
-    def test_native_checkpoint_gradients_adapter_reload_and_merge(self):
+    def test_lora_nora_checkpoint_gradients_adapter_reload_and_merge(self):
         import copy
 
         from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
         if "use_nora" not in LoraConfig.__dataclass_fields__:
             self.skipTest("requires Joluck/NoRA")
-        torch.manual_seed(113)
-        base = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
-        # Nonzero output and gate matrices make every adapted projection observable.
-        with torch.no_grad():
-            for parameter in base.parameters():
-                if parameter.ndim >= 2:
-                    parameter.normal_(std=0.03)
-        restored_base = copy.deepcopy(base)
-        ids = torch.randint(1, base.config.vocab_size, (2, 16), device="cuda")
-        positions = torch.tensor([[7], [15]], device="cuda")
-        with torch.no_grad():
-            reference = base(ids, use_cache=False, logits_to_keep=positions).logits
-        model = get_peft_model(
-            base,
-            LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=16,
-                lora_alpha=16,
-                lora_dropout=0.0,
-                use_nora=True,
-                target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
-            ),
-        )
-        with torch.no_grad():
+        for use_nora in (False, True):
+            torch.manual_seed(113)
+            base = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
+            # Nonzero output and gate matrices make every adapted projection observable.
+            with torch.no_grad():
+                for parameter in base.parameters():
+                    if parameter.ndim >= 2:
+                        parameter.normal_(std=0.03)
+            restored_base = copy.deepcopy(base)
+            ids = torch.randint(1, base.config.vocab_size, (2, 16), device="cuda")
+            positions = torch.tensor([[7], [15]], device="cuda")
+            with torch.no_grad():
+                reference = base(ids, use_cache=False, logits_to_keep=positions).logits
+            model = get_peft_model(
+                base,
+                LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=16,
+                    lora_alpha=16,
+                    lora_dropout=0.0,
+                    use_nora=use_nora,
+                    target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
+                ),
+            )
+            with torch.no_grad():
+                for name, parameter in model.named_parameters():
+                    if "lora_B" in name:
+                        parameter.normal_(std=0.01)
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=1e-3)
+            logits = model(ids, use_cache=False, logits_to_keep=positions).logits
+            logits.float().square().mean().backward()
             for name, parameter in model.named_parameters():
-                if "lora_B" in name:
-                    parameter.normal_(std=0.01)
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=1e-3)
-        logits = model(ids, use_cache=False, logits_to_keep=positions).logits
-        logits.float().square().mean().backward()
-        for name, parameter in model.named_parameters():
-            if parameter.requires_grad:
-                self.assertIsNotNone(parameter.grad, name)
-                self.assertTrue(torch.isfinite(parameter.grad).all(), name)
-                self.assertGreater(parameter.grad.float().norm().item(), 0, name)
-            else:
-                self.assertIsNone(parameter.grad, name)
-        optimizer.step()
-        model.eval()
-        with torch.no_grad():
-            adapted = model(ids, use_cache=False, logits_to_keep=positions).logits
-            with model.disable_adapter():
-                disabled = model(ids, use_cache=False, logits_to_keep=positions).logits
-            torch.testing.assert_close(disabled, reference, atol=0, rtol=0)
-            full = model(ids, use_cache=False).logits
-            torch.testing.assert_close(adapted[:, 0], full[torch.arange(2, device="cuda"), positions[:, 0]])
-            with tempfile.TemporaryDirectory() as directory:
-                model.save_pretrained(directory)
-                restored = PeftModel.from_pretrained(restored_base, directory).eval()
-                actual = restored(ids, use_cache=False, logits_to_keep=positions).logits
-                torch.testing.assert_close(actual, adapted, atol=0, rtol=0)
-                merged = restored.merge_and_unload(safe_merge=True)
-                actual = merged(ids, use_cache=False, logits_to_keep=positions).logits
-                torch.testing.assert_close(actual.float(), adapted.float(), atol=0.04, rtol=0.04)
+                if parameter.requires_grad:
+                    self.assertIsNotNone(parameter.grad, name)
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                    self.assertGreater(parameter.grad.float().norm().item(), 0, name)
+                else:
+                    self.assertIsNone(parameter.grad, name)
+            optimizer.step()
+            with torch.no_grad():
+                trained = model(ids, use_cache=False, logits_to_keep=positions).logits
+            model.eval()
+            with torch.no_grad():
+                adapted = model(ids, use_cache=False, logits_to_keep=positions).logits
+                torch.testing.assert_close(adapted, trained, atol=0, rtol=0)
+                cache = RwkvCache(model.config)
+                first = model(ids[:, :7], past_key_values=cache, use_cache=True).logits
+                last = model(ids[:, 7:], past_key_values=cache, use_cache=True).logits
+                full = model(ids, use_cache=False).logits
+                torch.testing.assert_close(torch.cat((first, last), dim=1), full, atol=0, rtol=0)
+                generated = model.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+                torch.testing.assert_close(generated[:, -1], full[:, -1].argmax(-1))
+                with model.disable_adapter():
+                    disabled = model(ids, use_cache=False, logits_to_keep=positions).logits
+                    disabled_full = model(ids, use_cache=False).logits
+                    disabled_generated = model.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+                    torch.testing.assert_close(disabled_generated[:, -1], disabled_full[:, -1].argmax(-1))
+                repeated = model.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+                torch.testing.assert_close(repeated, generated)
+                self.assertEqual(len(model.base_model.model._rwkv_generation_graphs), 2)
+                torch.testing.assert_close(disabled, reference, atol=0, rtol=0)
+                full = model(ids, use_cache=False).logits
+                torch.testing.assert_close(adapted[:, 0], full[torch.arange(2, device="cuda"), positions[:, 0]])
+                with tempfile.TemporaryDirectory() as directory:
+                    model.save_pretrained(directory)
+                    restored = PeftModel.from_pretrained(restored_base, directory).eval()
+                    actual = restored(ids, use_cache=False, logits_to_keep=positions).logits
+                    torch.testing.assert_close(actual, adapted, atol=0, rtol=0)
+                    merged = restored.merge_and_unload(safe_merge=True)
+                    actual = merged(ids, use_cache=False, logits_to_keep=positions).logits
+                    torch.testing.assert_close(actual.float(), adapted.float(), atol=0.04, rtol=0.04)
 
 
 @require_torch
