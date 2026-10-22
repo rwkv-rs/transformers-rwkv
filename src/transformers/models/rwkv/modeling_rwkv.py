@@ -223,7 +223,6 @@ class RwkvCache(Cache):
         wkv_state: torch.Tensor,
         decay_bias: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
-        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         state_key = wkv_state.data_ptr()
@@ -244,7 +243,6 @@ class RwkvCache(Cache):
             decay_bias=decay_bias,
             max_seqlen=max_seqlen,
             validated_metadata=ticket,
-            **({"output_dtype": output_dtype} if output_dtype is not None else {}),
         )
 
     def training_metadata(
@@ -405,51 +403,6 @@ class RwkvAttention(nn.Module):
             affine=True,
         )
 
-        self._low_rank_canonical: tuple[torch.Tensor, ...] | None = None
-        self._layer_zero_v: tuple[torch.Tensor, ...] | None = None
-        self.register_load_state_dict_post_hook(self._clear_runtime_hook)
-
-    def _clear_runtime_hook(self, module, incompatible_keys) -> None:
-        self._clear_runtime()
-
-    def _clear_runtime(self) -> None:
-        self._low_rank_canonical = None
-        self._layer_zero_v = None
-
-    def _apply(self, fn, recurse=True):
-        self._clear_runtime()
-        return super()._apply(fn, recurse=recurse)
-
-    def _inference_low_rank_weights(self) -> tuple[torch.Tensor, ...]:
-        if self._low_rank_canonical is None:
-            canonical = [
-                self.w1.t().contiguous(),
-                self.a1.t().contiguous(),
-                self.g1.t().contiguous(),
-            ]
-            if self.layer_idx == 0:
-                rank = self.config.v_low_rank_dim
-                v1 = torch.zeros(rank, self.hidden_size, dtype=self.w1.dtype, device=self.w1.device)
-                v2 = torch.zeros(self.hidden_size, rank, dtype=self.w1.dtype, device=self.w1.device)
-                v0 = torch.zeros(self.hidden_size, dtype=self.w1.dtype, device=self.w1.device)
-                v1_runtime = v2
-                v2_runtime = v1
-                self._layer_zero_v = (v1, v2, v0, v1_runtime, v2_runtime)
-            else:
-                v1 = self.v1.t().contiguous()
-                v2 = self.v2.t().contiguous()
-            canonical.extend(
-                (
-                    v1,
-                    self.w2.t().contiguous(),
-                    self.a2.t().contiguous(),
-                    self.g2.t().contiguous(),
-                    v2,
-                )
-            )
-            self._low_rank_canonical = tuple(canonical)
-        return self._low_rank_canonical
-
     def _training_forward(
         self,
         hidden_states: torch.Tensor,
@@ -479,9 +432,9 @@ class RwkvAttention(nn.Module):
                 self.x_g,
             )
 
-        r_weight, r_a, r_b, r_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj, training=True)
-        k_weight, k_a, k_b, k_scale, k_nora = flash_rwkv2_linear_spec(self.k_proj, training=True)
-        v_weight, v_a, v_b, v_scale, v_nora = flash_rwkv2_linear_spec(self.v_proj, training=True)
+        r_weight, r_a, r_b, r_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj)
+        k_weight, k_a, k_b, k_scale, k_nora = flash_rwkv2_linear_spec(self.k_proj)
+        v_weight, v_a, v_b, v_scale, v_nora = flash_rwkv2_linear_spec(self.v_proj)
         if self.layer_idx != 0 and v_first is None:
             raise ValueError("RWKV-7 layers after layer 0 require the first layer's value residual.")
         receptance, decay_logits, key, value, negative_direction, scaled_direction, gate, v_first = (
@@ -551,7 +504,7 @@ class RwkvAttention(nn.Module):
                     device=hidden_states.device,
                 )
             sequence_chunk_offsets, chunk_token_starts, chunk_token_ends = training_metadata
-            recurrent_output, final_wkv_state, _, _ = flash_rwkv2.statetune_tmix_wkv7_recurrent_fp32io16(
+            recurrent_output, final_wkv_state = flash_rwkv2.statetune_tmix_wkv7_recurrent_fp32io16(
                 wkv_state,
                 sequence_chunk_offsets,
                 chunk_token_starts,
@@ -566,7 +519,7 @@ class RwkvAttention(nn.Module):
             recurrent_output = recurrent_output.view(batch_size, sequence_length, self.hidden_size)
             next_wkv_state = final_wkv_state if stateful else None
 
-        o_weight, o_a, o_b, o_scale, o_nora = flash_rwkv2_linear_spec(self.o_proj, training=True)
+        o_weight, o_a, o_b, o_scale, o_nora = flash_rwkv2_linear_spec(self.o_proj)
         output = flash_rwkv2.pretrain_tmix_readout_bf16(
             recurrent_output.contiguous(),
             receptance,
@@ -597,8 +550,8 @@ class RwkvAttention(nn.Module):
         cache_params: RwkvCache | _RwkvGraphState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flash_rwkv2 = load_flash_rwkv2(_INFER_ATTENTION_OPERATORS, hidden_states, "inference")
-        if hidden_states.dtype != torch.float16 or residual.dtype != torch.float16:
-            raise TypeError("RWKV-7 inference requires float16 hidden and residual tensors.")
+        if hidden_states.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
+            raise TypeError("RWKV-7 inference requires bfloat16 hidden and residual tensors.")
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         residual, xr, xw, xk, xv, xa, xg = flash_rwkv2.infer_tmix_postnorm_tokenshift_forward_varlen(
             hidden_states.contiguous(),
@@ -619,14 +572,9 @@ class RwkvAttention(nn.Module):
             validated_metadata=ticket,
         )
 
-        r_weight, r_lora_a, r_lora_b, r_lora_scale, _ = flash_rwkv2_linear_spec(self.r_proj)
-        k_weight, k_lora_a, k_lora_b, k_lora_scale, _ = flash_rwkv2_linear_spec(self.k_proj)
-        v_weight, v_lora_a, v_lora_b, v_lora_scale, _ = flash_rwkv2_linear_spec(self.v_proj)
-        low_rank = self._inference_low_rank_weights()
-        if self.layer_idx == 0:
-            _, _, v0, v1_runtime, v2_runtime = self._layer_zero_v
-        else:
-            v0, v1_runtime, v2_runtime = self.v0, self.v1, self.v2
+        r_weight, r_lora_a, r_lora_b, r_lora_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj)
+        k_weight, k_lora_a, k_lora_b, k_lora_scale, k_nora = flash_rwkv2_linear_spec(self.k_proj)
+        v_weight, v_lora_a, v_lora_b, v_lora_scale, v_nora = flash_rwkv2_linear_spec(self.v_proj)
         receptance, decay_logits, key, value, recurrent_a, recurrent_b, gate, v_first = (
             flash_rwkv2.infer_tmix_wkv_prepare_forward_varlen(
                 xr,
@@ -638,29 +586,31 @@ class RwkvAttention(nn.Module):
                 r_weight,
                 k_weight,
                 v_weight,
-                *low_rank,
-                v0,
+                self.w1.t(),
+                self.a1.t(),
+                self.g1.t(),
+                self.v1.t() if self.layer_idx != 0 else None,
+                self.w2.t(),
+                self.a2.t(),
+                self.g2.t(),
+                self.v2.t() if self.layer_idx != 0 else None,
+                self.v0 if self.layer_idx != 0 else None,
                 self.k_k,
                 self.a0,
                 self.k_a,
                 v_first=v_first,
-                w1_runtime=self.w1,
-                a1_runtime=self.a1,
-                g1_runtime=self.g1,
-                v1_runtime=v1_runtime,
-                w2_runtime=self.w2,
-                a2_runtime=self.a2,
-                g2_runtime=self.g2,
-                v2_runtime=v2_runtime,
                 receptance_lora_a=r_lora_a,
                 receptance_lora_b=r_lora_b,
                 receptance_lora_scale=r_lora_scale,
+                receptance_use_nora=r_nora,
                 key_lora_a=k_lora_a,
                 key_lora_b=k_lora_b,
                 key_lora_scale=k_lora_scale,
+                key_use_nora=k_nora,
                 value_lora_a=v_lora_a,
                 value_lora_b=v_lora_b,
                 value_lora_scale=v_lora_scale,
+                value_use_nora=v_nora,
                 head_size=self.head_size,
                 batch_size=state_indices.numel(),
                 max_seqlen=max_seqlen,
@@ -677,9 +627,8 @@ class RwkvAttention(nn.Module):
             wkv_state,
             self.w0,
             inference_metadata,
-            output_dtype=torch.float32 if self.config.wkv_output_dtype == "float32" else None,
         )
-        o_weight, o_lora_a, o_lora_b, o_lora_scale, _ = flash_rwkv2_linear_spec(self.o_proj)
+        o_weight, o_lora_a, o_lora_b, o_lora_scale, o_nora = flash_rwkv2_linear_spec(self.o_proj)
         output = flash_rwkv2.infer_tmix_readout_forward_varlen(
             recurrent_output.view(-1, self.hidden_size),
             receptance,
@@ -693,6 +642,7 @@ class RwkvAttention(nn.Module):
             output_lora_a=o_lora_a,
             output_lora_b=o_lora_b,
             output_lora_scale=o_lora_scale,
+            output_use_nora=o_nora,
             head_size=self.head_size,
             batch_size=state_indices.numel(),
             max_seqlen=max_seqlen,
@@ -737,18 +687,6 @@ class RwkvFeedForward(nn.Module):
         self.x_k = nn.Parameter(torch.empty(config.hidden_size))
         self.key = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.value = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self._value_runtime: torch.Tensor | None = None
-        self.register_load_state_dict_post_hook(self._clear_runtime_hook)
-
-    def _clear_runtime_hook(self, module, incompatible_keys) -> None:
-        base_layer = self.value.get_base_layer() if hasattr(self.value, "get_base_layer") else self.value
-        if base_layer.weight.device != self.key.weight.device or base_layer.weight.dtype != self.key.weight.dtype:
-            base_layer.weight.data = base_layer.weight.data.to(self.key.weight.device, dtype=self.key.weight.dtype)
-        self._value_runtime = None
-
-    def _apply(self, fn, recurse=True):
-        self._value_runtime = None
-        return super()._apply(fn, recurse=recurse)
 
     def _training_forward(
         self, hidden_states: torch.Tensor, feed_forward_shift: torch.Tensor | None
@@ -756,10 +694,8 @@ class RwkvFeedForward(nn.Module):
         flash_rwkv2 = load_flash_rwkv2(_TRAIN_FEED_FORWARD_OPERATORS, hidden_states, "training")
         if hidden_states.dtype != torch.bfloat16:
             raise TypeError(f"RWKV-7 training requires bfloat16 hidden states, got {hidden_states.dtype}.")
-        if self._value_runtime is not None:
-            self._value_runtime = None
-        key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key, training=True)
-        value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value, training=True)
+        key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
+        value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
         adapter_kwargs = {
             "key_lora_a": key_a,
             "key_lora_b": key_b,
@@ -786,16 +722,6 @@ class RwkvFeedForward(nn.Module):
             **adapter_kwargs,
         )
 
-    def _inference_value_weight(self) -> torch.Tensor:
-        if self._value_runtime is None:
-            value_weight, value_lora_a, value_lora_b, _, _ = flash_rwkv2_linear_spec(self.value)
-            if value_lora_a is not None or value_lora_b is not None:
-                raise RuntimeError("Merge ChannelMix value LoRA adapters before RWKV-7 inference.")
-            self._value_runtime = value_weight.t().contiguous()
-            base_layer = self.value.get_base_layer() if hasattr(self.value, "get_base_layer") else self.value
-            base_layer.weight.data = base_layer.weight.data.cpu()
-        return self._value_runtime
-
     def _inference_forward(
         self,
         hidden_states: torch.Tensor,
@@ -805,9 +731,8 @@ class RwkvFeedForward(nn.Module):
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         flash_rwkv2 = load_flash_rwkv2(_INFER_FEED_FORWARD_OPERATORS, hidden_states, "inference")
-        key_weight, key_lora_a, key_lora_b, _, _ = flash_rwkv2_linear_spec(self.key)
-        if key_lora_a is not None or key_lora_b is not None:
-            raise RuntimeError("Merge ChannelMix key LoRA adapters before RWKV-7 inference.")
+        key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
+        value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         hidden_states, residual = flash_rwkv2.infer_cmix_forward_varlen(
             hidden_states.contiguous(),
@@ -816,14 +741,21 @@ class RwkvFeedForward(nn.Module):
             layer_norm.bias,
             self.x_k,
             key_weight,
-            self._inference_value_weight(),
+            value_weight.t(),
             shift_state_pool=feed_forward_shift,
             cu_seqlens=cu_seqlens,
             state_indices=state_indices,
             max_seqlen=max_seqlen,
             eps=self.config.layer_norm_epsilon,
             validated_metadata=ticket,
-            deterministic=torch.are_deterministic_algorithms_enabled(),
+            key_lora_a=key_a,
+            key_lora_b=key_b,
+            key_lora_scale=key_scale,
+            key_use_nora=key_nora,
+            value_lora_a=value_a,
+            value_lora_b=value_b,
+            value_lora_scale=value_scale,
+            value_use_nora=value_nora,
         )
         return hidden_states, residual
 
@@ -863,8 +795,14 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
         cache_params: RwkvCache | _RwkvGraphState | None = None,
     ):
         if hidden_states.ndim == 3:
+            flash_rwkv2 = load_flash_rwkv2("infer_embedding_ln0_forward_varlen", hidden_states, "training")
             attention_output, v_first, next_attention_shift, next_wkv_state = self.linear_attn(
-                self.input_layernorm(hidden_states).contiguous(),
+                flash_rwkv2.infer_embedding_ln0_forward_varlen(
+                    hidden_states,
+                    self.input_layernorm.weight,
+                    self.input_layernorm.bias,
+                    eps=self.input_layernorm.eps,
+                ),
                 v_first,
                 attention_shift,
                 wkv_state,
@@ -872,7 +810,13 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
             )
             hidden_states = hidden_states + attention_output
             feed_forward_output, next_feed_forward_shift = self.mlp(
-                self.post_attention_layernorm(hidden_states).contiguous(), feed_forward_shift
+                flash_rwkv2.infer_embedding_ln0_forward_varlen(
+                    hidden_states,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.bias,
+                    eps=self.post_attention_layernorm.eps,
+                ),
+                feed_forward_shift,
             )
             hidden_states = hidden_states + feed_forward_output
             return hidden_states, v_first, next_attention_shift, next_wkv_state, next_feed_forward_shift
@@ -996,13 +940,6 @@ class RwkvModel(RwkvPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    def _prepare_inference_embedding(self) -> None:
-        if self.embed_tokens.weight.dtype != torch.bfloat16:
-            self.embed_tokens.weight.data = self.embed_tokens.weight.data.to(dtype=torch.bfloat16)
-        if self.embedding_norm.weight.dtype != torch.bfloat16:
-            self.embedding_norm.weight.data = self.embedding_norm.weight.data.to(dtype=torch.bfloat16)
-            self.embedding_norm.bias.data = self.embedding_norm.bias.data.to(dtype=torch.bfloat16)
-
     def _forward_state_only(
         self,
         input_ids: torch.LongTensor | None,
@@ -1015,10 +952,9 @@ class RwkvModel(RwkvPreTrainedModel):
         else:
             batch_size, sequence_length = inputs_embeds.shape[:2]
 
-        self._prepare_inference_embedding()
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16).reshape(-1, self.config.hidden_size).contiguous()
+        inputs_embeds = inputs_embeds.reshape(-1, self.config.hidden_size).contiguous()
         flash_rwkv2 = load_flash_rwkv2(
             ("infer_embedding_ln0_forward_varlen", "prepare_tmix_wkv7_recurrent_metadata"),
             inputs_embeds,
@@ -1029,7 +965,7 @@ class RwkvModel(RwkvPreTrainedModel):
             self.embedding_norm.weight,
             self.embedding_norm.bias,
             eps=self.config.layer_norm_epsilon,
-        ).to(dtype=torch.float16)
+        )
         residual = torch.zeros_like(hidden_states)
         inference_metadata = cache_params.recurrent_metadata(
             flash_rwkv2, batch_size, sequence_length, hidden_states.device
@@ -1083,16 +1019,9 @@ class RwkvModel(RwkvPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
         if past_key_values is not None and type(past_key_values) is not RwkvCache:
             raise TypeError(f"RWKV-7 accepts only RwkvCache, got {type(past_key_values).__name__}.")
-        training_path = self.norm.weight.dtype == torch.bfloat16
-        if self.training and not training_path:
-            raise TypeError(
-                f"RWKV-7 training requires the model in bfloat16, got model dtype {self.norm.weight.dtype}."
-            )
-        if not training_path and self.norm.weight.dtype != torch.float16:
-            raise TypeError(
-                "RWKV-7 execution requires a bfloat16 model for training/evaluation or a float16 model for "
-                f"inference, got model dtype {self.norm.weight.dtype}."
-            )
+        training_path = self.training or torch.is_grad_enabled()
+        if self.norm.weight.dtype != torch.bfloat16:
+            raise TypeError(f"RWKV-7 execution requires a bfloat16 model, got {self.norm.weight.dtype}.")
         if use_cache is None:
             use_cache = past_key_values is not None or (not training_path and self.config.use_cache)
         output_hidden_states = (
@@ -1119,7 +1048,13 @@ class RwkvModel(RwkvPreTrainedModel):
                 inputs_embeds = self.embed_tokens(input_ids)
             if inputs_embeds.dtype != torch.bfloat16:
                 raise TypeError(f"RWKV-7 training requires bfloat16 embeddings, got {inputs_embeds.dtype}.")
-            hidden_states = self.embedding_norm(inputs_embeds).contiguous()
+            flash_rwkv2 = load_flash_rwkv2("infer_embedding_ln0_forward_varlen", inputs_embeds, "training")
+            hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
+                inputs_embeds,
+                self.embedding_norm.weight,
+                self.embedding_norm.bias,
+                eps=self.config.layer_norm_epsilon,
+            )
             all_hidden_states = () if output_hidden_states else None
             if output_hidden_states:
                 all_hidden_states += (hidden_states.view(batch_size, sequence_length, -1),)
@@ -1162,7 +1097,9 @@ class RwkvModel(RwkvPreTrainedModel):
 
             if cache_params is not None:
                 cache_params.advance(sequence_length, batch_size, hidden_states.device)
-            hidden_states = self.norm(hidden_states)
+            hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
+                hidden_states, self.norm.weight, self.norm.bias, eps=self.config.layer_norm_epsilon
+            )
         else:
             hidden_states, residual, all_hidden_states = self._forward_state_only(
                 input_ids, inputs_embeds, cache_params, output_hidden_states
@@ -1263,30 +1200,12 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
             selected = hidden_states[:, logits_to_keep, :]
             if selected.ndim == 2:
                 selected = selected.unsqueeze(1)
-        batch_size, selected_length, hidden_size = selected.shape
         selected = selected.contiguous()
-        if hidden_states.dtype == torch.bfloat16:
-            flash_rwkv2 = load_flash_rwkv2("pretrain_head_linear_bf16", selected, "training")
-            weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(self.lm_head, training=True)
-            logits = flash_rwkv2.pretrain_head_linear_bf16(
-                selected, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
-            )
-        else:
-            selected = selected.reshape(-1, hidden_size)
-            operators = (
-                "infer_head_linear_last_forward_varlen"
-                if isinstance(logits_to_keep, int) and logits_to_keep == 1
-                else "infer_head_linear_all_forward_varlen"
-            )
-            flash_rwkv2 = load_flash_rwkv2(operators, selected, "inference")
-            weight, lora_a, _, _, _ = flash_rwkv2_linear_spec(self.lm_head)
-            if lora_a is not None:
-                raise RuntimeError("Merge Head LoRA adapters before RWKV-7 inference.")
-            if operators == "infer_head_linear_last_forward_varlen":
-                logits = flash_rwkv2.infer_head_linear_last_forward_varlen(selected, weight, tokens_count=batch_size)
-            else:
-                logits = flash_rwkv2.infer_head_linear_all_forward_varlen(selected, weight)
-            logits = logits.view(batch_size, selected_length, self.vocab_size)
+        flash_rwkv2 = load_flash_rwkv2("pretrain_head_linear_bf16", selected, "head projection")
+        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(self.lm_head)
+        logits = flash_rwkv2.pretrain_head_linear_bf16(
+            selected, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
+        )
 
         loss = None
         if labels is not None:
