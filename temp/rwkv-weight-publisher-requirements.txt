@@ -1,6 +1,6 @@
 # Runtime dependencies for rwkv-weight-publisher.service on rwkv-szx-4090x4-ip129.
 # Install the repository itself separately with: uv pip install --python .venv/bin/python -e .
-flashrwkv2==0.1.0a14
+flashrwkv2==0.1.0a16
 huggingface-hub==1.30.0
 ninja==1.13.0
 safetensors==0.8.0
