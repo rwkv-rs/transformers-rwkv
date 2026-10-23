@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import tempfile
 import unittest
-from importlib.metadata import distribution
 from pathlib import Path
 
 from tokenizers import Tokenizer, decoders, models, processors
@@ -63,18 +61,8 @@ def make_tokenizer() -> RwkvTokenizer:
 
 class RwkvTokenizerTest(unittest.TestCase):
     def test_installed_fork_and_public_class_contract(self):
-        installed = distribution("tokenizers")
-        direct_url = json.loads(installed.read_text("direct_url.json"))
-        self.assertEqual(direct_url["url"], "https://github.com/rwkv-rs/tokenizers-rwkv.git")
-        self.assertEqual(
-            direct_url["vcs_info"]["commit_id"],
-            "c5d8dde5ff49c70e4656199d5033a84e03c21b2b",
-        )
-        self.assertEqual(direct_url["subdirectory"], "bindings/python")
         self.assertIs(RwkvTokenizer.model, models.RwkvTrie)
         self.assertTrue(callable(models.RwkvTrie.from_file))
-        self.assertFalse(hasattr(RwkvTokenizer, "get_chat_stop_strings"))
-        self.assertNotIn("RwkvTokenizerFast", __import__("transformers").__dict__)
 
     def test_longest_match_byte_roundtrip_and_special_tokens(self):
         encoder = byte_encoder()

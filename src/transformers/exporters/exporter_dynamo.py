@@ -250,7 +250,6 @@ def _patch_sdpa(original):
     "transformers.modeling_utils.is_kernels_available",
     "transformers.models.sam3_video.modeling_sam3_video.is_kernels_available",
     "transformers.models.mra.modeling_mra.is_kernels_available",
-    "transformers.models.rwkv.modeling_rwkv.is_kernels_available",
     "transformers.models.yoso.modeling_yoso.is_kernels_available",
 )
 def _patch_is_kernels_available(_original):

@@ -175,10 +175,6 @@ python temp/rwkv_pth2st.py \
 The output includes the model config, the Open Think, Fake Think, and tools generation configs, sharded Safetensors,
 the fixed RWKV World tokenizer, and the single standard chat template.
 
-## Notes
-
-- Use left padding for batched generation. See [Padding side](../llm_tutorial#padding-side).
-
 ## RwkvConfig
 
 [[autodoc]] RwkvConfig
