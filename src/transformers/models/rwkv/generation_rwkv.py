@@ -53,6 +53,49 @@ def _rwkv_prefill_lengths(prompt_length: int, chunk_size: int | None) -> tuple[i
     return (chunk_size,) * full_chunks + ((remainder,) if remainder else ())
 
 
+def _recurrent_metadata(flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device):
+    cu_seqlens = torch.arange(0, (batch_size + 1) * sequence_length, sequence_length, dtype=torch.int32, device=device)
+    state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+    ticket = flash_rwkv2.prepare_tmix_wkv7_recurrent_metadata(
+        cu_seqlens,
+        state_indices,
+        total_tokens=batch_size * sequence_length,
+        state_pool_size=batch_size,
+        max_seqlen=sequence_length,
+    )
+    return cu_seqlens, state_indices, sequence_length, ticket
+
+
+def _recurrent_forward(
+    flash_rwkv2,
+    wkv_mode: str,
+    recurrent_state,
+    receptance: torch.Tensor,
+    decay_logits: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    recurrent_a: torch.Tensor,
+    recurrent_b: torch.Tensor,
+    decay_bias: torch.Tensor,
+    inference_metadata,
+) -> torch.Tensor:
+    cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
+    return getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{wkv_mode}_forward_varlen")(
+        receptance,
+        decay_logits,
+        key,
+        value,
+        recurrent_a,
+        recurrent_b,
+        state=recurrent_state,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        decay_bias=decay_bias,
+        max_seqlen=max_seqlen,
+        validated_metadata=ticket,
+    )
+
+
 class _RwkvGraphState:
     def __init__(
         self,
@@ -84,25 +127,9 @@ class _RwkvGraphState:
     def recurrent_metadata(
         self, flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, int, object]:
-        stream = torch.cuda.current_stream(device)
-        key = (device, batch_size, sequence_length, stream.cuda_stream)
+        key = (device, batch_size, sequence_length, torch.cuda.current_stream(device).cuda_stream)
         if key not in self._inference_metadata:
-            cu_seqlens = torch.arange(
-                0,
-                (batch_size + 1) * sequence_length,
-                sequence_length,
-                dtype=torch.int32,
-                device=device,
-            )
-            state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            ticket = flash_rwkv2.prepare_tmix_wkv7_recurrent_metadata(
-                cu_seqlens,
-                state_indices,
-                total_tokens=batch_size * sequence_length,
-                state_pool_size=batch_size,
-                max_seqlen=sequence_length,
-            )
-            self._inference_metadata[key] = (cu_seqlens, state_indices, sequence_length, ticket)
+            self._inference_metadata[key] = _recurrent_metadata(flash_rwkv2, batch_size, sequence_length, device)
         return self._inference_metadata[key]
 
     def recurrent_forward(
@@ -116,23 +143,20 @@ class _RwkvGraphState:
         recurrent_b: torch.Tensor,
         recurrent_state,
         decay_bias: torch.Tensor,
-        inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
+        inference_metadata,
     ) -> torch.Tensor:
-        cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
-        recurrent_forward = getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{self.wkv_mode}_forward_varlen")
-        return recurrent_forward(
+        return _recurrent_forward(
+            flash_rwkv2,
+            self.wkv_mode,
+            recurrent_state,
             receptance,
             decay_logits,
             key,
             value,
             recurrent_a,
             recurrent_b,
-            state=recurrent_state,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            decay_bias=decay_bias,
-            max_seqlen=max_seqlen,
-            validated_metadata=ticket,
+            decay_bias,
+            inference_metadata,
         )
 
     def clone(self) -> tuple:
@@ -398,7 +422,7 @@ class _RwkvGenerationModelRunner:
             "infer_post_norm_output_forward_varlen",
             "prepare_tmix_wkv7_recurrent_metadata",
         ]
-        wkv_mode = model._rwkv_wkv_mode
+        wkv_mode = model.config.wkv_mode
         operators.extend(
             (
                 f"infer_tmix_wkv7_recurrent_{wkv_mode}_forward_varlen",
@@ -575,7 +599,7 @@ class RwkvGenerationMixin(GenerationMixin):
         if [type(processor) for processor in logits_processor] != expected:
             raise ValueError(
                 "RWKV-7 CUDA graph generation supports only Rapid-Sampling and its six parameters; "
-                "custom logits processors are not supported."
+                f"custom logits processors are not supported, got {[type(p).__name__ for p in logits_processor]}."
             )
 
     def _validate_graph_generation(
@@ -701,7 +725,7 @@ class RwkvGenerationMixin(GenerationMixin):
             eos_token_ids,
             stop_string_criteria,
             model_kwargs.get("tokenizer"),
-            self._rwkv_wkv_mode,
+            self.config.wkv_mode,
         )
         key += tuple(
             (

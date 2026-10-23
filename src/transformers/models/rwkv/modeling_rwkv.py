@@ -29,7 +29,7 @@ from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 from .configuration_rwkv import RwkvConfig
-from .generation_rwkv import RwkvGenerationMixin, _RwkvGraphState
+from .generation_rwkv import RwkvGenerationMixin, _recurrent_forward, _recurrent_metadata, _RwkvGraphState
 
 
 _TRAIN_ATTENTION_OPERATORS = (
@@ -190,25 +190,9 @@ class RwkvCache(Cache):
     def recurrent_metadata(
         self, flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, int, object]:
-        stream = torch.cuda.current_stream(device)
-        key = (device, batch_size, sequence_length, stream.cuda_stream)
+        key = (device, batch_size, sequence_length, torch.cuda.current_stream(device).cuda_stream)
         if key not in self._inference_metadata:
-            cu_seqlens = torch.arange(
-                0,
-                (batch_size + 1) * sequence_length,
-                sequence_length,
-                dtype=torch.int32,
-                device=device,
-            )
-            state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-            ticket = flash_rwkv2.prepare_tmix_wkv7_recurrent_metadata(
-                cu_seqlens,
-                state_indices,
-                total_tokens=batch_size * sequence_length,
-                state_pool_size=batch_size,
-                max_seqlen=sequence_length,
-            )
-            self._inference_metadata[key] = (cu_seqlens, state_indices, sequence_length, ticket)
+            self._inference_metadata[key] = _recurrent_metadata(flash_rwkv2, batch_size, sequence_length, device)
         return self._inference_metadata[key]
 
     def recurrent_forward(
@@ -224,29 +208,25 @@ class RwkvCache(Cache):
         decay_bias: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
     ) -> torch.Tensor:
-        cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
-        state_key = wkv_state.data_ptr()
-        recurrent_state = self._inference_recurrent_states.get(state_key)
+        recurrent_state = self._inference_recurrent_states.get(wkv_state.data_ptr())
         if recurrent_state is None:
             prepare_state = getattr(
                 flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.config.wkv_mode}_state_from_tensor"
             )
             recurrent_state = prepare_state(wkv_state)
-            self._inference_recurrent_states[state_key] = recurrent_state
-        recurrent_forward = getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{self.config.wkv_mode}_forward_varlen")
-        return recurrent_forward(
+            self._inference_recurrent_states[wkv_state.data_ptr()] = recurrent_state
+        return _recurrent_forward(
+            flash_rwkv2,
+            self.config.wkv_mode,
+            recurrent_state,
             receptance,
             decay_logits,
             key,
             value,
             recurrent_a,
             recurrent_b,
-            state=recurrent_state,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            decay_bias=decay_bias,
-            max_seqlen=max_seqlen,
-            validated_metadata=ticket,
+            decay_bias,
+            inference_metadata,
         )
 
     def training_metadata(
@@ -1151,10 +1131,6 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.register_load_state_dict_post_hook(self._clear_generation_cache_hook)
         self.post_init()
-
-    @property
-    def _rwkv_wkv_mode(self) -> str:
-        return self.config.wkv_mode
 
     @staticmethod
     def _clear_generation_cache_hook(module, _incompatible_keys) -> None:
