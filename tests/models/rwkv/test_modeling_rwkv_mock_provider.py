@@ -102,6 +102,12 @@ class RecordingStreamer:
 
 class FakeFlashRwkv2:
     @staticmethod
+    def prepare_tuning(calls, *, mode="require", legacy_dir=None):
+        for call in calls:
+            call()
+        return {"complete": True, "counts": {"missing": 0}, "cache_root": "mock-provider", "records": []}
+
+    @staticmethod
     def _linear(x, weight, *, lora_a=None, lora_b=None, lora_scale=1.0, use_nora=False):
         output = F.linear(x, weight)
         if lora_a is not None:
@@ -692,6 +698,24 @@ class RwkvMockProviderTest(unittest.TestCase):
             reference_completion.append(reference_token)
         expected = torch.cat((input_ids, *reference_completion), dim=-1)
 
+        with (
+            mock.patch.object(
+                self.fake, "prepare_tuning", side_effect=RuntimeError("missing verified tuning profile")
+            ),
+            mock.patch("torch.cuda.graph") as capture,
+            self.assertRaisesRegex(RuntimeError, "missing verified tuning profile"),
+        ):
+            model.generate(
+                input_ids,
+                max_new_tokens=3,
+                prefill_chunk_size=2,
+                do_sample=False,
+                eos_token_id=None,
+                tuning_mode="require",
+            )
+        capture.assert_not_called()
+        self.assertEqual(len(model._rwkv_generation_graphs), 0)
+
         first = model.generate(
             input_ids,
             max_new_tokens=3,
@@ -723,6 +747,22 @@ class RwkvMockProviderTest(unittest.TestCase):
             torch.testing.assert_close(
                 runtime.state.recurrent_states[layer_idx]._state_pool, reference_layer.recurrent_states[0]
             )
+
+        with mock.patch.object(self.fake, "prepare_tuning", wraps=self.fake.prepare_tuning) as prepare:
+            prepared = model.generate(
+                input_ids,
+                max_new_tokens=3,
+                prefill_chunk_size=2,
+                do_sample=False,
+                eos_token_id=None,
+                tuning_mode="tune",
+                tuning_legacy_dir="legacy-namespace",
+            )
+        torch.testing.assert_close(prepared, expected)
+        self.assertEqual(prepare.call_count, 3)  # prefill lengths 2 and 1, then decode
+        for call in prepare.call_args_list:
+            self.assertEqual(call.kwargs, {"mode": "tune", "legacy_dir": "legacy-namespace"})
+        self.assertEqual(len(model._rwkv_generation_graphs), 2)
 
     @require_torch_gpu
     def test_single_token_prompt_starts_with_decode_graph_and_exposes_first_logits(self):
