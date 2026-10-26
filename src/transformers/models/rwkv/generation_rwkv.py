@@ -432,7 +432,6 @@ class _RwkvGenerationModelRunner:
         self.prefill_lengths = _rwkv_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
         max_new_tokens = max_length - prompt_length
         operators = [
-            "prepare_tuning",
             "pretrain_head_linear_bf16",
             "infer_post_norm_output_forward_varlen",
             "prepare_tmix_wkv7_recurrent_metadata",

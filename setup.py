@@ -70,7 +70,7 @@ if stale_egg_info.exists():
 # 1. all dependencies should be listed here with their version requirements if any
 # 2. once modified, run: `make fix-repo` to update src/transformers/dependency_versions_table.py
 _deps = [
-    "FlashRWKV2==0.1.0a16",
+    "FlashRWKV2==0.1.0a17",
     "Pillow>=10.0.1,<=15.0",
     "accelerate>=1.1.0",
     "av",
@@ -164,9 +164,6 @@ TOKENIZERS_RWKV_REQUIREMENT = (
     "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@"
     "c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python"
 )
-FLASHRWKV2_REQUIREMENT = (
-    "FlashRWKV2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@d73d0c6f058b62263c048e770e4e7a31dc5bcbf9"
-)
 
 
 def deps_list(*pkgs):
@@ -176,7 +173,7 @@ def deps_list(*pkgs):
 extras = {}
 
 extras["torch"] = deps_list("torch", "accelerate")
-extras["rwkv"] = [FLASHRWKV2_REQUIREMENT]
+extras["rwkv"] = deps_list("FlashRWKV2")
 extras["vision"] = deps_list("torchvision", "Pillow")
 extras["audio"] = deps_list("torchaudio", "librosa", "pyctcdecode", "phonemizer")
 if PYTHON_MINOR_VERSION < 13:
