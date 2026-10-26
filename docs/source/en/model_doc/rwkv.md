@@ -24,8 +24,8 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a16`; it intentionally has no CPU or FLA execution fallback. Install
-the RWKV dependencies with:
+This integration requires CUDA and `FlashRWKV2==0.1.0a17`, which provides persistent verified tuning profiles and the
+public preparation API. Install the RWKV dependencies with:
 
 ```bash
 pip install "transformers[rwkv]"
@@ -142,6 +142,35 @@ Training uses differentiable operators whenever gradients are enabled. Use `mode
 recurrent inference. CUDA Graph generation does this automatically. Weight transpose views refer to the canonical
 parameters directly; no runtime weight copies or CPU offload are needed. Warm up fixed batch/sequence shapes and their
 [`RwkvCache`] on the capture stream before capture so metadata and state addresses are ready.
+
+Generation checks FlashRWKV2 tuning coverage during each graph's real warmup. It covers the prompt prefix, each
+distinct prefill chunk length, and the one-token decode path including the output head. The default
+`tuning_mode="inspect"` reports missing configurations and warns when a graph uses untuned defaults. To prepare only
+missing configurations and then require verified coverage, use the same model, inputs, and generation settings:
+
+```python
+model.generate(**inputs, max_new_tokens=128, tokenizer=tokenizer, tuning_mode="tune")
+output_ids = model.generate(**inputs, max_new_tokens=128, tokenizer=tokenizer, tuning_mode="require")
+```
+
+`require` fails before capturing a graph whose warmup encounters a missing profile. Changing the preparation mode
+creates new graphs, so a graph captured with defaults is not reused after tuning. Warmup restores recurrent state,
+sampling state, and penalties before capture and generation.
+
+FlashRWKV2 stores verified profiles in `~/.cache/flashrwkv2`, independently of the virtual environment,
+`TORCH_HOME`, and `XDG_CACHE_HOME`. Set `FLASHRWKV2_CACHE_DIR` before importing FlashRWKV2 to relocate this cache.
+To migrate an old namespace, pass `tuning_legacy_dir="/path/to/old/namespace"` with `tuning_mode="tune"`.
+FlashRWKV2 revalidates matching profiles against the current kernels and tunes missing shapes.
+
+For ordinary forward or training preparation, call the public `flashrwkv2.prepare_tuning` with zero-argument
+callables that execute the actual workload. Training callables should include backward when preparing its kernels,
+clear gradients between runs, and use disposable or reset recurrent state. Preserve the workload's gradient mode and
+active LoRA/NoRA adapters. Preparation does not change the model's FP32 training state or head logits.
+
+`temp/benchmark_rwkv_generate.py` defaults to `--tuning-mode require`; use `--tuning-mode tune` to fill missing
+profiles before benchmarking. Its JSON records the loaded model configuration and every process's prefill/decode
+coverage report, including selected kernel configurations and cache paths. Preparation and capture time are reported
+separately from generation throughput.
 
 ## LoRA and NoRA training
 

@@ -35,12 +35,16 @@ from ...generation import (
     TopPLogitsWarper,
 )
 from ...integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
+from ...utils import logging
 from .configuration_rwkv import RwkvConfig
 
 
 if TYPE_CHECKING:
     from ...generation.streamers import BaseStreamer
     from .modeling_rwkv import RwkvForCausalLM, RwkvModel
+
+
+logger = logging.get_logger(__name__)
 
 
 def _rwkv_prefill_lengths(prompt_length: int, chunk_size: int | None) -> tuple[int, ...]:
@@ -189,6 +193,8 @@ class _RwkvPrefillGraph:
         sequence_length: int,
         capture_stream: torch.cuda.Stream,
         graph_pool,
+        flash_rwkv2,
+        generation_config: GenerationConfig,
     ) -> None:
         self.input_ids = torch.zeros(
             (batch_size, sequence_length), dtype=torch.long, device=model.embed_tokens.weight.device
@@ -198,7 +204,11 @@ class _RwkvPrefillGraph:
         generation_stream = torch.cuda.current_stream(self.input_ids.device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
-            model._forward_state_only(self.input_ids, None, state, False)
+            self.tuning_report = flash_rwkv2.prepare_tuning(
+                (lambda: model._forward_state_only(self.input_ids, None, state, False),),
+                mode=getattr(generation_config, "tuning_mode", "inspect"),
+                legacy_dir=getattr(generation_config, "tuning_legacy_dir", None),
+            )
             state.copy_(snapshot)
             with torch.cuda.graph(
                 self.graph,
@@ -271,7 +281,11 @@ class _RwkvDecodeGraph:
         generation_stream = torch.cuda.current_stream(device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
-            self._forward(model)
+            self.tuning_report = flash_rwkv2.prepare_tuning(
+                (lambda: self._forward(model),),
+                mode=getattr(generation_config, "tuning_mode", "inspect"),
+                legacy_dir=getattr(generation_config, "tuning_legacy_dir", None),
+            )
             self._restore_capture_inputs(state_snapshot, sampling_snapshot)
             with torch.cuda.graph(
                 self.graph,
@@ -448,6 +462,8 @@ class _RwkvGenerationModelRunner:
                 sequence_length,
                 capture_stream,
                 graph_pool,
+                flash_rwkv2,
+                generation_config,
             )
             for sequence_length in dict.fromkeys(self.prefill_lengths)
         }
@@ -463,6 +479,15 @@ class _RwkvGenerationModelRunner:
             graph_pool,
             flash_rwkv2,
         )
+        for graph in (*self.prefill_graphs.values(), self.decode_graph):
+            if not graph.tuning_report["complete"]:
+                logger.warning(
+                    "RWKV CUDA Graph uses %s untuned kernel configurations from %s. "
+                    "Run generate(..., tuning_mode='tune') to prepare missing profiles, then "
+                    "generate(..., tuning_mode='require') to enforce complete coverage.",
+                    graph.tuning_report["counts"]["missing"],
+                    graph.tuning_report["cache_root"],
+                )
 
     def generate(
         self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None
@@ -560,6 +585,8 @@ class RwkvGenerationMixin(GenerationMixin):
         self.generation_config.presence_penalty = getattr(self.generation_config, "presence_penalty", 0.0)
         self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
+        self.generation_config.tuning_mode = getattr(self.generation_config, "tuning_mode", "inspect")
+        self.generation_config.tuning_legacy_dir = getattr(self.generation_config, "tuning_legacy_dir", None)
 
     def _get_rwkv_generation_cache(self) -> _RwkvGenerationCache:
         cache = getattr(self, "_rwkv_generation_graphs", None)
@@ -698,6 +725,8 @@ class RwkvGenerationMixin(GenerationMixin):
             eos_key,
             stop_key,
             wkv_mode,
+            getattr(generation_config, "tuning_mode", "inspect"),
+            getattr(generation_config, "tuning_legacy_dir", None),
         )
 
     def _sample(
