@@ -165,7 +165,7 @@ TOKENIZERS_RWKV_REQUIREMENT = (
     "c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python"
 )
 FLASHRWKV2_REQUIREMENT = (
-    "FlashRWKV2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@6a5494b4e90b6efd54c1f946772296139dcafbc8"
+    "FlashRWKV2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@d73d0c6f058b62263c048e770e4e7a31dc5bcbf9"
 )
 
 
