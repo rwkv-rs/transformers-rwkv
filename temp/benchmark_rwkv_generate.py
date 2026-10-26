@@ -124,7 +124,7 @@ def benchmark_worker(args) -> dict:
             }
         )
         model._rwkv_generation_graphs.clear()
-        del input_ids, disabled_output, async_output
+        del runtime, input_ids, disabled_output, async_output
         gc.collect()
         torch.cuda.empty_cache()
 

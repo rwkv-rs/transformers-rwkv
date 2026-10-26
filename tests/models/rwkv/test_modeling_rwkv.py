@@ -165,7 +165,7 @@ class RwkvStructureTest(unittest.TestCase):
                 "get_tuning_cache_dir",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a16")
+        self.assertEqual(module.__version__, "0.1.0a17")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
 
@@ -217,6 +217,37 @@ class RwkvStructureTest(unittest.TestCase):
 
 @require_torch_gpu
 class RwkvBF16ProviderTest(unittest.TestCase):
+    @slow
+    def test_training_tuning_covers_backward_and_preserves_gradients(self):
+        import flashrwkv2
+
+        torch.manual_seed(119)
+        model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16).train()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 16), device="cuda")
+
+        def training_step():
+            model.zero_grad(set_to_none=True)
+            model(ids, labels=ids, use_cache=False).loss.backward()
+
+        training_step()
+        expected_gradients = [parameter.grad.clone() for parameter in model.parameters()]
+        forward_report = flashrwkv2.prepare_tuning((lambda: model(ids, labels=ids, use_cache=False),), mode="inspect")
+        for mode in ("tune", "require"):
+            report = flashrwkv2.prepare_tuning((training_step,), mode=mode)
+            self.assertTrue(report["complete"])
+            self.assertLess(
+                {row["path"] for row in forward_report["records"]},
+                {row["path"] for row in report["records"]},
+            )
+            if mode == "require":
+                self.assertTrue(all(row["status"] == "hit" for row in report["records"]))
+            for parameter, expected in zip(model.parameters(), expected_gradients, strict=True):
+                torch.testing.assert_close(parameter.grad, expected, atol=0, rtol=0)
+
     @slow
     @torch.no_grad()
     def test_tuning_preserves_state_and_logprobs_and_require_reuses_profiles(self):
