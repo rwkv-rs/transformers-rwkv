@@ -164,6 +164,9 @@ TOKENIZERS_RWKV_REQUIREMENT = (
     "tokenizers @ git+https://github.com/rwkv-rs/tokenizers-rwkv.git@"
     "c5d8dde5ff49c70e4656199d5033a84e03c21b2b#subdirectory=bindings/python"
 )
+FLASHRWKV2_REQUIREMENT = (
+    "FlashRWKV2 @ git+https://github.com/rwkv-rs/FlashRWKV2.git@6a5494b4e90b6efd54c1f946772296139dcafbc8"
+)
 
 
 def deps_list(*pkgs):
@@ -173,7 +176,7 @@ def deps_list(*pkgs):
 extras = {}
 
 extras["torch"] = deps_list("torch", "accelerate")
-extras["rwkv"] = deps_list("FlashRWKV2")
+extras["rwkv"] = [FLASHRWKV2_REQUIREMENT]
 extras["vision"] = deps_list("torchvision", "Pillow")
 extras["audio"] = deps_list("torchaudio", "librosa", "pyctcdecode", "phonemizer")
 if PYTHON_MINOR_VERSION < 13:

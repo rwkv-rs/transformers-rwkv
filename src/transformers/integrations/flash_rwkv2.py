@@ -47,7 +47,7 @@ def load_flash_rwkv2(
     if version != expected_version:
         raise RuntimeError(f"RWKV-7 {mode} requires {requirement}; installed version={version}, source={source}.")
 
-    required = (operators,) if isinstance(operators, str) else operators
+    required = ("prepare_tuning", *((operators,) if isinstance(operators, str) else operators))
     missing = [name for name in required if not callable(getattr(module, name, None))]
     if missing:
         raise RuntimeError(

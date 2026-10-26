@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
+import importlib.metadata
 import json
 import statistics
 import subprocess
@@ -60,6 +61,8 @@ def run_generate(model, input_ids, args, streamer=None):
         input_ids,
         max_new_tokens=args.completion_length,
         prefill_chunk_size=args.prefill_chunk_size,
+        tuning_mode=args.tuning_mode,
+        tuning_legacy_dir=args.tuning_legacy_dir,
         do_sample=args.do_sample,
         presence_penalty=args.presence_penalty,
         frequency_penalty=args.frequency_penalty,
@@ -98,6 +101,11 @@ def benchmark_worker(args) -> dict:
         _, capture_metrics = run_generate(model, input_ids, args)
         torch.cuda.synchronize()
         capture_warmup_time = time.perf_counter() - capture_started - capture_metrics["total_generation_time"]
+        runtime = next(iter(model._rwkv_generation_graphs.values()))
+        tuning_reports = {
+            "prefill": {length: graph.tuning_report for length, graph in runtime.prefill_graphs.items()},
+            "decode": runtime.decode_graph.tuning_report,
+        }
 
         disabled_output, disabled = run_generate(model, input_ids, args)
         streamer = DetokenizeStreamer(tokenizer)
@@ -108,6 +116,7 @@ def benchmark_worker(args) -> dict:
             {
                 "batch_size": batch_size,
                 "capture_warmup_time": capture_warmup_time,
+                "tuning_reports": tuning_reports,
                 "detokenize_disabled": disabled,
                 "detokenize_async": asynchronous,
                 "detokenized_tokens": streamer.tokens,
@@ -121,6 +130,12 @@ def benchmark_worker(args) -> dict:
 
     return {
         "model": str(args.model),
+        "model_config": model.config.to_dict(),
+        "flashrwkv2_version": importlib.metadata.version("FlashRWKV2"),
+        "flashrwkv2_source": json.loads(
+            importlib.metadata.distribution("FlashRWKV2").read_text("direct_url.json") or "null"
+        ),
+        "tuning_mode": args.tuning_mode,
         "device": args.device,
         "wkv_mode": args.wkv_mode,
         "prompt_length": args.prompt_length,
@@ -154,6 +169,7 @@ def median_results(runs: list[dict]) -> dict:
         batch = {
             "batch_size": batch_size,
             "capture_warmup_time": statistics.median(item["capture_warmup_time"] for item in run_batches),
+            "tuning_reports": [item["tuning_reports"] for item in run_batches],
             "output_hash": run_batches[0]["output_hash"],
         }
         for mode in ("detokenize_disabled", "detokenize_async"):
@@ -222,6 +238,10 @@ def parse_args():
     parser.add_argument("--prompt-length", type=int, default=1024)
     parser.add_argument("--completion-length", type=int, default=128)
     parser.add_argument("--prefill-chunk-size", type=int)
+    parser.add_argument("--tuning-mode", choices=("inspect", "require", "tune"), default="require")
+    parser.add_argument(
+        "--tuning-legacy-dir", help="Legacy FlashRWKV2 namespace to revalidate with --tuning-mode tune."
+    )
     parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--presence-penalty", type=float, default=0.0)
     parser.add_argument("--frequency-penalty", type=float, default=0.0)
