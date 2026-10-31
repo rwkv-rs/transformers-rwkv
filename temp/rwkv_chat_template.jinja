@@ -32,7 +32,7 @@
         {%- else -%}
             {%- if output.system or (tools and not output.parts) -%}
                 {%- set output.parts = output.parts + ['### System'] + output.system -%}
-                {%- for tool in tools | default([]) -%}
+                {%- for tool in tools or [] -%}
                     {%- set function = tool.function if tool.function is defined else tool -%}
                     {%- set output.parts = output.parts + ['### `' + function.name + '`'] -%}
                     {%- if function.description | default('') -%}
@@ -61,8 +61,9 @@
                 {%- endif -%}
                 {%- for tool_call in message.tool_calls | default([]) -%}
                     {%- set function = tool_call.function if tool_call.function is defined else tool_call -%}
-                    {%- set payload = {'name': function.name, 'arguments': function.arguments} -%}
-                    {%- set output.parts = output.parts + ['**Tool Call:**', '```json', payload | tojson(indent=2), '```'] -%}
+                    {%- set arguments = function.arguments if function.arguments is string else function.arguments | tojson -%}
+                    {%- set payload = '{"name": ' + function.name | tojson + ', "arguments": ' + arguments + '}' -%}
+                    {%- set output.parts = output.parts + ['**Tool Call:**', '```json', payload, '```'] -%}
                 {%- endfor -%}
             {%- elif message.role == 'tool' -%}
                 {%- set output.parts = output.parts + ['### Tool Output', '```json', message.content | tojson(indent=2), '```'] -%}

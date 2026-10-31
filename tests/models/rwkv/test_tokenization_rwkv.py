@@ -160,6 +160,25 @@ class RwkvTokenizerTest(unittest.TestCase):
             rendered + "></think",
         )
 
+    def test_tool_call_history_uses_instructed_format(self):
+        tokenizer = make_tokenizer()
+        expected = '**Tool Call:**\n```json\n{"name": "weather", "arguments": {"city": "Paris"}}\n```'
+        for arguments in ({"city": "Paris"}, '{"city": "Paris"}'):
+            messages = [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Paris?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "weather", "arguments": arguments}}],
+                },
+                {"role": "tool", "content": "20"},
+            ]
+            with self.subTest(arguments=type(arguments).__name__):
+                rendered = tokenizer.apply_chat_template(messages, tools=None, tokenize=False)
+                self.assertTrue(rendered.startswith("### System\nBe brief.\n### User\nParis?"))
+                self.assertIn(expected, rendered)
+
     def test_save_reload_uses_auto_tokenizer_without_remote_code(self):
         tokenizer = make_tokenizer()
         with tempfile.TemporaryDirectory() as directory:
