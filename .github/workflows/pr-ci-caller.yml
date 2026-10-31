@@ -16,11 +16,83 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
   # Read job logs, to report OOM-killed test shards to the CI dashboards.
   actions: read
 
 jobs:
+  scope:
+    runs-on: ubuntu-22.04
+    outputs:
+      rwkv_tokenizer: ${{ steps.files.outputs.rwkv_tokenizer }}
+    steps:
+      - name: Check changed files
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "rwkv-rs/transformers-rwkv" ]; then
+            echo "rwkv_tokenizer=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$PR_NUMBER" ] && [ "$BASE_REF" = main ]; then
+            timeout 60s gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" > "$RUNNER_TEMP/changed-files.json"
+          elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ] && [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            timeout 60s gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" --jq '[.files[]]' > "$RUNNER_TEMP/changed-files.json"
+          else
+            echo "rwkv_tokenizer=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if timeout 10s jq -s -e '
+            [ .[][] | .filename, (.previous_filename // empty) ] |
+            length > 0 and all(.[];
+              . == ".github/workflows/pr-ci-caller.yml" or
+              . == "docs/source/en/model_doc/rwkv.md" or
+              . == "temp/rwkv_chat_template.jinja" or
+              . == "tests/models/rwkv/test_tokenization_rwkv.py")
+          ' "$RUNNER_TEMP/changed-files.json" > /dev/null; then
+            echo "rwkv_tokenizer=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rwkv_tokenizer=false" >> "$GITHUB_OUTPUT"
+          fi
+
   pr-ci:
+    needs: scope
+    if: needs.scope.outputs.rwkv_tokenizer != 'true'
     # DON'T use commit sha here before the CI migration is finished
     uses: huggingface/transformers-ci/.github/workflows/pr-ci_dynamic_caller_example.yml@main # main
+
+  rwkv-tokenizer:
+    needs: scope
+    if: needs.scope.outputs.rwkv_tokenizer == 'true'
+    runs-on: rwkv-4090x4-ip129
+    timeout-minutes: 30
+    env:
+      TRANSFORMERS_SKIP_CHECKER_REQUIREMENTS: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Prepare main branch
+        run: |
+          if [ "$(timeout 10s git branch --show-current)" != main ]; then
+            timeout 10s git branch -f main refs/remotes/origin/main
+          fi
+      - name: Install dependencies
+        run: |
+          timeout 60s uv venv --python /usr/bin/python3
+          timeout 1200s uv pip install --index https://download.pytorch.org/whl/cpu 'torch>=2.6' torchvision Pillow
+          timeout 1200s uv pip install -e '.[quality,chat_template]' -r utils/checkers-requirements.txt pytest pytest-xdist
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Check code quality
+        run: timeout 300s make check-code-quality
+      - name: Check repository consistency
+        run: timeout 600s make check-repository-consistency
+      - name: Run tokenizer tests
+        run: timeout 120s .venv/bin/python -m pytest -p no:rerunfailures tests/models/rwkv/test_tokenization_rwkv.py -q
 

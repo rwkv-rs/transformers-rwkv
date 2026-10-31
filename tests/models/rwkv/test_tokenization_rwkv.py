@@ -103,15 +103,27 @@ class RwkvTokenizerTest(unittest.TestCase):
             ),
             "System: System\n\nUser:   indented\nquestion\n\nAssistant: first\n\nsecond",
         )
-        self.assertEqual(
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": "Hi"}],
-                tokenize=False,
-                add_generation_prompt=True,
-                rwkv_generation_prompt="fake_think",
-            ),
-            "User✿Hi✿\nBot✿<think></think",
-        )
+        for prompt_style, expected in (
+            ("bot", "User✿Hi✿\nBot✿"),
+            ("assistant", "User: Hi\n\nAssistant: "),
+            ("function_calling", "### User\nHi\n### Assistant\n"),
+        ):
+            for options, think in (
+                ({}, "<think"),
+                ({"fake_cot_mode": False}, "<think"),
+                ({"fake_cot_mode": True}, "<think></think"),
+            ):
+                with self.subTest(prompt_style=prompt_style, options=options):
+                    self.assertEqual(
+                        tokenizer.apply_chat_template(
+                            [{"role": "user", "content": "Hi"}],
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            rwkv_prompt_template=prompt_style,
+                            **options,
+                        ),
+                        expected + think,
+                    )
 
     def test_tool_chat_golden(self):
         tokenizer = make_tokenizer()
@@ -141,6 +153,12 @@ class RwkvTokenizerTest(unittest.TestCase):
         self.assertIn('"name": "weather"', rendered)
         self.assertIn('"temperature": 20', rendered)
         self.assertTrue(rendered.endswith("### Assistant\n<think"))
+        self.assertEqual(
+            tokenizer.apply_chat_template(
+                messages, tools=tools, tokenize=False, add_generation_prompt=True, fake_cot_mode=True
+            ),
+            rendered + "></think",
+        )
 
     def test_save_reload_uses_auto_tokenizer_without_remote_code(self):
         tokenizer = make_tokenizer()
@@ -158,6 +176,15 @@ class RwkvTokenizerTest(unittest.TestCase):
                     add_generation_prompt=True,
                 ),
                 "User✿hello✿\nBot✿<think",
+            )
+            self.assertEqual(
+                reloaded.apply_chat_template(
+                    [{"role": "user", "content": "hello"}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    fake_cot_mode=True,
+                ),
+                "User✿hello✿\nBot✿<think></think",
             )
 
 
