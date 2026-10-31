@@ -19,14 +19,10 @@
     {%- endif -%}
 {%- endfor -%}
 {%- set prompt_style = rwkv_prompt_template | default('bot') -%}
-{%- set generation_prompt = rwkv_generation_prompt | default('open_think') -%}
 {%- if prompt_style not in ['bot', 'assistant', 'function_calling'] -%}
     {{- raise_exception('Unsupported RWKV prompt style: ' + prompt_style) -}}
 {%- endif -%}
-{%- if generation_prompt not in ['open_think', 'fake_think'] -%}
-    {{- raise_exception('Unsupported RWKV generation prompt: ' + generation_prompt) -}}
-{%- endif -%}
-{%- set think = '<think></think' if generation_prompt == 'fake_think' else '<think' -%}
+{%- set think = '<think></think' if fake_cot_mode | default(false) else '<think' -%}
 {%- set use_tools = tools or history.has_tools or prompt_style == 'function_calling' -%}
 {%- if use_tools -%}
     {%- set output = namespace(parts=[], system=[]) -%}

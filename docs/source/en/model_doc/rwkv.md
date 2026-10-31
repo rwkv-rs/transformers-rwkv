@@ -61,12 +61,12 @@ model = AutoModelForCausalLM.from_pretrained(
 
 messages = [{"role": "user", "content": "Explain recurrent language models briefly."}]
 tools = None
-generation_prompt = "open_think"
+fake_cot_mode = False
 config_file_name = (
     "tools_generation_config.json"
     if tools
     else "fake_think_generation_config.json"
-    if generation_prompt == "fake_think"
+    if fake_cot_mode
     else "generation_config.json"
 )
 generation_config = (
@@ -78,7 +78,7 @@ inputs = tokenizer.apply_chat_template(
     messages,
     tools=tools,
     add_generation_prompt=True,
-    rwkv_generation_prompt=generation_prompt,
+    fake_cot_mode=fake_cot_mode,
     return_dict=True,
     return_tensors="pt",
 ).to(model.device)
@@ -93,11 +93,18 @@ print(tokenizer.decode(output_ids[0, inputs.input_ids.shape[1] :]))
 ```
 
 The bundled Jinja template supports the RWKV bot and assistant prompt styles, tool-use conversations, and open/fake
-thinking prompts through ordinary `apply_chat_template()` keyword arguments. The model repository contains three
-matching generation configurations. `generation_config.json` is the default Open Think profile. Fake Think uses
+thinking prompts through ordinary `apply_chat_template()` keyword arguments. `rwkv_prompt_template` selects `bot`
+(the default), `assistant`, or `function_calling`. The boolean `fake_cot_mode` defaults to `False`, appending `<think`
+to the generation prompt; `True` appends `<think></think`. Tools or tool-call history select the function-calling format.
+The model repository contains three matching generation configurations. `generation_config.json` is the default
+Open Think profile. Fake Think uses
 `fake_think_generation_config.json`. Any request with tools uses `tools_generation_config.json`, which takes precedence
 over the thinking prompt and disables penalties. All three profiles use FlashRWKV2 Rapid-Sampling and contain the stop
 markers for every prompt style.
+
+New conversions save `temp/rwkv_chat_template.jinja` as the checkpoint's `chat_template.jinja`. Existing converted
+checkpoints need that file refreshed to use `fake_cot_mode`; updating this repository does not refresh saved templates.
+The weight publisher reuses existing local artifacts and skips already published checkpoints.
 
 ## Stateful execution
 
