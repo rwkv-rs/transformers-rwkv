@@ -102,7 +102,7 @@ class RecordingStreamer:
 
 class FakeFlashRwkv2:
     @staticmethod
-    def prepare_tuning(calls, *, mode="require", legacy_dir=None):
+    def prepare_tuning(calls, *, mode="require"):
         for call in calls:
             call()
         return {"complete": True, "counts": {"missing": 0}, "cache_root": "mock-provider", "records": []}
@@ -756,12 +756,11 @@ class RwkvMockProviderTest(unittest.TestCase):
                 do_sample=False,
                 eos_token_id=None,
                 tuning_mode="tune",
-                tuning_legacy_dir="legacy-namespace",
             )
         torch.testing.assert_close(prepared, expected)
         self.assertEqual(prepare.call_count, 3)  # prefill lengths 2 and 1, then decode
         for call in prepare.call_args_list:
-            self.assertEqual(call.kwargs, {"mode": "tune", "legacy_dir": "legacy-namespace"})
+            self.assertEqual(call.kwargs, {"mode": "tune"})
         self.assertEqual(len(model._rwkv_generation_graphs), 2)
 
     @require_torch_gpu
