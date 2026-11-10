@@ -24,7 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a17`, which provides persistent verified tuning profiles and the
+This integration requires CUDA and `FlashRWKV2==0.1.0a18`, which provides fixed configurations, verified tuning profiles, and the
 public preparation API. Install the RWKV dependencies with:
 
 ```bash
@@ -164,10 +164,12 @@ output_ids = model.generate(**inputs, max_new_tokens=128, tokenizer=tokenizer, t
 creates new graphs, so a graph captured with defaults is not reused after tuning. Warmup restores recurrent state,
 sampling state, and penalties before capture and generation.
 
+On RTX 4090 (SM89/128 SM) and RTX PRO 6000 (SM120/188 SM), validated fixed configurations report `status="fixed"`
+and satisfy `require` without loading profiles or searching configurations.
+
 FlashRWKV2 stores verified profiles in `~/.cache/flashrwkv2`, independently of the virtual environment,
 `TORCH_HOME`, and `XDG_CACHE_HOME`. Set `FLASHRWKV2_CACHE_DIR` before importing FlashRWKV2 to relocate this cache.
-To migrate an old namespace, pass `tuning_legacy_dir="/path/to/old/namespace"` with `tuning_mode="tune"`.
-FlashRWKV2 revalidates matching profiles against the current kernels and tunes missing shapes.
+After upgrading FlashRWKV2, prepare the actual workload again with `tuning_mode="tune"`.
 
 For ordinary forward or training preparation, call the public `flashrwkv2.prepare_tuning` with zero-argument
 callables that execute the actual workload. Training callables should include backward when preparing its kernels,
