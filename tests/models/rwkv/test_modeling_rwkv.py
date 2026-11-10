@@ -725,7 +725,7 @@ class RwkvConverterTest(unittest.TestCase):
 
     def test_generation_configs_define_open_fake_and_tools_profiles(self):
         expected = {
-            "generation_config.json": (0.96, 0.76, 32, 1.0, 0.1, 0.988),
+            "generation_config.json": (0.96, 0.90, -1, 1.0, 0.09, 0.994),
             "fake_think_generation_config.json": (1.0, 0.28, 32, 0.0, 0.0, 0.996),
             "tools_generation_config.json": (0.96, 0.76, 32, 0.0, 0.0, 0.996),
         }
@@ -750,6 +750,10 @@ class RwkvConverterTest(unittest.TestCase):
                     values,
                 )
                 self.assertEqual(generation_config.stop_strings, self.converter.STOP_STRINGS)
+                model = RwkvForCausalLM(tiny_config())
+                processors = model._get_logits_processor(generation_config)
+                model._validate_graph_logits_processors(processors, generation_config)
+                self.assertEqual(generation_config.top_k, values[2])
 
     def test_shard_writer_consumes_source_and_writes_reloadable_values(self):
         from safetensors import safe_open

@@ -852,6 +852,9 @@ class RwkvMockProviderTest(unittest.TestCase):
         )
         self.assertEqual(torch.count_nonzero(disabled_runtime.decode_graph.penalties).item(), 0)
 
+        model.generate(input_ids, **{**sampling_kwargs, "top_k": -1})
+        self.assertEqual(list(model._rwkv_generation_graphs.values())[-1].decode_graph.top_k, -1)
+
     @require_torch_gpu
     def test_cuda_graph_standard_stopping_criteria_override_config(self):
         model = RwkvForCausalLM(self.config).bfloat16().eval().cuda()

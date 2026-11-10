@@ -608,6 +608,12 @@ class RwkvGenerationMixin(GenerationMixin):
         if generation_config.continuous_batching_config is not None:
             raise ValueError("RWKV-7 CUDA graph generation does not support continuous batching.")
 
+    def _get_logits_processor(self, generation_config, *args, **kwargs):
+        if generation_config.top_k == -1:
+            generation_config = copy.copy(generation_config)
+            generation_config.top_k = 0
+        return super()._get_logits_processor(generation_config, *args, **kwargs)
+
     @staticmethod
     def _validate_graph_logits_processors(
         logits_processor: LogitsProcessorList, generation_config: GenerationConfig
@@ -616,7 +622,7 @@ class RwkvGenerationMixin(GenerationMixin):
         if generation_config.do_sample:
             if generation_config.temperature is not None and generation_config.temperature != 1.0:
                 expected.append(TemperatureLogitsWarper)
-            if generation_config.top_k is not None and generation_config.top_k != 0:
+            if generation_config.top_k not in (None, 0, -1):
                 expected.append(TopKLogitsWarper)
             if generation_config.top_p is not None and generation_config.top_p < 1.0:
                 expected.append(TopPLogitsWarper)

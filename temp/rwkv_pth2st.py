@@ -33,11 +33,11 @@ GENERATION_CONFIGS = {
     "generation_config.json": {
         "do_sample": True,
         "temperature": 0.96,
-        "top_p": 0.76,
-        "top_k": 32,
+        "top_p": 0.90,
+        "top_k": -1,
         "presence_penalty": 1.0,
-        "frequency_penalty": 0.1,
-        "penalty_decay": 0.988,
+        "frequency_penalty": 0.09,
+        "penalty_decay": 0.994,
     },
     "fake_think_generation_config.json": {
         "do_sample": True,
