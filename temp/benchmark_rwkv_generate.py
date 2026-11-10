@@ -62,7 +62,6 @@ def run_generate(model, input_ids, args, streamer=None):
         max_new_tokens=args.completion_length,
         prefill_chunk_size=args.prefill_chunk_size,
         tuning_mode=args.tuning_mode,
-        tuning_legacy_dir=args.tuning_legacy_dir,
         do_sample=args.do_sample,
         presence_penalty=args.presence_penalty,
         frequency_penalty=args.frequency_penalty,
@@ -239,9 +238,6 @@ def parse_args():
     parser.add_argument("--completion-length", type=int, default=128)
     parser.add_argument("--prefill-chunk-size", type=int)
     parser.add_argument("--tuning-mode", choices=("inspect", "require", "tune"), default="require")
-    parser.add_argument(
-        "--tuning-legacy-dir", help="Legacy FlashRWKV2 namespace to revalidate with --tuning-mode tune."
-    )
     parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--presence-penalty", type=float, default=0.0)
     parser.add_argument("--frequency-penalty", type=float, default=0.0)
