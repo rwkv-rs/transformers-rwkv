@@ -39,38 +39,50 @@ Two modular traps:
 - **Other models inherit your modular file.** `modular_deepseek_vl.py` also generates `modeling_deepseek_vl_hybrid.py`. Run `make fix-repo` and check everything it rewrote; hand-editing only the generated file you had in mind leaves the rest stale and `Check repository consistency` red.
 - **`attr = AttributeError()` deletes an inherited attribute** — it is an instruction to the converter, not a bug or placeholder. `raise AttributeError("...")` in a method body does the same for a method. Substituting a "real" value silently changes behaviour (`_no_split_modules = AttributeError()` → `[]` changes how the model may be sharded). See [Removing attributes](../docs/source/en/modular_transformers.md#removing-attributes) and [Deleting unused methods](../docs/source/en/modular_transformers.md#deleting-unused-methods).
 
-## 核心目标
-Transformers 是 LLM 社区的标准库, 很早成为生态中心, 本仓库需要按照社区主流做法(参考 FLA 中对 RWKV 的**代码风格**, 以及 Transformers 中 Qwen3.5 Kimi-K3 等带有 Linear RNN Layer 的模型的**功能设计**与**代码风格**)完成 RWKV 模型的接入, 通过最简洁直接的方式替代上游仓库中 rwkv 的实现. (因为它实际上是早已过时的 rwkv4 而非我们需要支持的 rwkv7)
-代码原则: 每一个文件/类型/函数/变量都需要找到相似实现作为原型, 若该原型带有模型名则将其替换为 `RWKV` 或其它大小写变种, 否则保持同名.
-在 ./temp 目录下尽可能精简实现权重转换脚本, 对齐 FLA 中 RWKV7 的代码风格, 避免维护不必要的重命名契约.
-本仓库对 rwkv7 预训练的支持数值精度与吞吐应完全对齐**最新版本**的 RWKV-LM/blob/main/RWKV-v7/train_temp;
-本仓库对 rwkv7 推理的支持数值精度与吞吐应完全对齐**最新版本**的 Albatross, 在 ./temp 目录下尽可能精简实现自定义 bench, 需要在真实 batch_size = {1, 4, 64, 320, 512} 7.2B 生成场景下端到端完成测速, prefill速度 = prompt长度 / 首 token 延迟, decode速度 = completion长度 / (生成总耗时 - 首 token 延迟), 补充: 需要实现异步 detokenize, 这部分不应影响生成速度;
-FlashRWKV (https://github.com/rwkv-rs/FlashRWKV) 是 RWKV 社区权威算子实现仓库, 为本仓库提供高性能后端, 本仓库对算子相关内容只做导入不做开发. 如精度与推理速度因为 FlashRWKV 实现错误导致精度差/推理速度慢, 应直接与用户反馈, 无需跨越实现边界完成修复.
-为 Transformers 的支持应服务于主流研究需求: 假设存在一个用户, 创建自定义模型 Qwen2Rwkv, 要加载一个魔改的 Qwen 3.5, 所有的 GDN 换成 128 head_size的 RWKV Tmix, 所有 GQA 换成 256 head_size 的 RWKV Tmix, Norm 都用 RWKV 的 LayerNorm, emb lm_head moe 都用 Qwen 3.5 的实现, 应当做到50行代码左右实现对应功能. (暂不实现)
+## Core Objectives
 
-## 权威 RWKV7 实现
+Transformers is the standard library of the LLM community and became the center of the ecosystem very early. This repository needs to complete RWKV model integration according to mainstream community practices (refer to the **code style** for RWKV in FLA, and the **functional design** and **code style** of models with Linear RNN Layers such as Qwen3.5, Kimi-K3 in Transformers), replacing the rwkv implementation in the upstream repository in the most concise and direct way. (Because it is actually the long-outdated rwkv4 rather than the rwkv7 we need to support.)
+
+Code principle: For every file/type/function/variable, a similar implementation must be found as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name. Using branch statements without affecting existing functionality.
+
+Non-pollution principle: Keep RWKV-specific changes local to the integration. When shared code needs to change, use branch statements without affecting existing functionality or other models. Preserve existing user changes and stay within this repository's implementation boundaries.
+
+After a coding round, compare the changed code with its prototypes and refactor it without changing behavior. Inline single-use wrapper functions and remove unnecessary structures/classes used only to align or forward arguments. Remove static tests that do not constrain business behavior end to end; retain behavioral regression tests. Perform this cleanup before testing.
+
+In the ./temp directory, implement the weight conversion script as concisely as possible, align with the code style of RWKV7 in FLA, and avoid maintaining unnecessary renaming contracts.
+This repository's support for rwkv7 pretraining should fully align in numerical precision and throughput with the **latest version** of RWKV-LM/blob/main/RWKV-v7/train_temp;
+This repository's support for rwkv7 inference should fully align in numerical precision and throughput with the **latest version** of Albatross. In the ./temp directory, implement a custom bench as concisely as possible. It needs to complete end-to-end speed benchmarking under real 7.2B generation scenarios with batch_size = {1, 4, 64, 320, 512}; prefill speed = prompt length / first-token latency, decode speed = completion length / (total generation time - first-token latency). Additional note: asynchronous detokenization needs to be implemented, and this part should not affect generation speed;
+FlashRWKV (https://github.com/rwkv-rs/FlashRWKV) is the RWKV community's authoritative operator implementation repository and provides a high-performance backend for this repository. This repository only imports operator-related content and does not develop it. If precision or inference speed is poor/slow due to errors in FlashRWKV's implementation, feedback should be given directly to the user; there is no need to cross implementation boundaries to complete fixes.
+Support for Transformers should serve mainstream research needs: suppose there is a user who creates a custom model Qwen2Rwkv and wants to load a modified Qwen 3.5, with all GDN replaced by RWKV Tmix with 128 head_size, all GQA replaced by RWKV Tmix with 256 head_size, all Norm using RWKV's LayerNorm, and emb, lm_head, moe all using Qwen 3.5's implementation. It should be possible to implement the corresponding functionality in about 50 lines of code. (Not implemented for now.)
+
+## Authoritative RWKV7 Implementations
+
 (1) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/rwkv_v7_numpy.py
 (2) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/run_rwkv7_qwen35.py
-(3) https://github.com/BlinkDL/Albatross -- 权威底层推理引擎实现仓库 (cuda, for pro6000, 无调度, 无varlen)
-(4) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/train_temp -- 权威预训练实现仓库 (cuda, for h100)
-(5) https://zhiyuan1i.github.io/posts/dplr-mathematics -- Diagonal Plus Low Rank(DPLR）的数学原理：显式转移矩阵的并行计算
+(3) https://github.com/BlinkDL/Albatross -- authoritative low-level inference engine implementation repository (cuda, for pro6000, no scheduling, no varlen)
+(4) https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-v7/train_temp -- authoritative pretraining implementation repository (cuda, for h100)
+(5) https://zhiyuan1i.github.io/posts/dplr-mathematics -- mathematical principles of Diagonal Plus Low Rank (DPLR): parallel computation of explicit transition matrices
 
-## RWKV7 权重
-权重一般命名规范: {arch_version}-{data_version}-{param_size}-{release_date}-{ctx_len}.pth
-如: rwkv7-g1h-7.2b-20260710-ctx10240.pth
-arch_version: 架构版本, 如 rwkv7(default), rwkv7a(experimental, rwkv7 with DeepEmbed), rwkv7b(experimental, rwkv7 with DeepEmbedAttn)
-data_version: 数据版本, 如 g1a, g1b... (The further back in the alphabet, the better)
-param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(often used in the infer test), 13.3b
-(1) https://huggingface.co/BlinkDL/rwkv7-g1/tree/main -- 权威权重 Release 源 (update every month)
-(2) https://huggingface.co/BlinkDL/temp-latest-training-models/tree/main -- 权威权重 Test 源 (不定期update)
-转换为 Safetensors 格式后应首先固化于 `rwkv-szx-4090x4-ip129` 的 `~/Weights/RWKV/hf/<checkpoint-name>/` 目录, 并推送到对应仓库. 已验真的完整转换产物还应镜像到 NAS 的 `/mnt/nas-model/<data_version>/hf/<checkpoint-name>/` 目录; 写入 NAS 时使用同级临时目录, 核对文件清单、大小及 `PROVENANCE.md` 中全部 Safetensors shard SHA256 后再原子改名. 禁止覆盖 NAS 上已有的同名 checkpoint 目录.
+## RWKV7 Weights
+
+General weight naming convention: {arch_version}-{data_version}-{param_size}-{release_date}-{ctx_len}.pth
+e.g.: rwkv7-g1h-7.2b-20260710-ctx10240.pth
+arch_version: architecture version, e.g. rwkv7 (default), rwkv7a (experimental, rwkv7 with DeepEmbed), rwkv7b (experimental, rwkv7 with DeepEmbedAttn)
+data_version: data version, e.g. g1a, g1b... (The further back in the alphabet, the better)
+param_size: parameter size, only includes 0.1b, 0.4b, 1.5b (often used in RL), 2.9b, 7.2b (often used in the infer test), 13.3b
+(1) https://huggingface.co/BlinkDL/rwkv7-g1/tree/main -- authoritative weight Release source (updated every month)
+(2) https://huggingface.co/BlinkDL/temp-latest-training-models/tree/main -- authoritative weight Test source (updated irregularly)
+After conversion to Safetensors format, it should first be stored in the `~/Weights/RWKV/hf/<checkpoint-name>/` directory of `rwkv-szx-4090x4-ip129` and pushed to the corresponding repository. Verified complete conversion artifacts should also be mirrored to the NAS `/mnt/nas-model/<data_version>/hf/<checkpoint-name>/` directory; when writing to NAS, use a sibling temporary directory, verify the file list, sizes, and all Safetensors shard SHA256 in `PROVENANCE.md`, then atomically rename. Overwriting an existing checkpoint directory with the same name on NAS is prohibited.
 
 ## Env
-使用 uv 管理本机和远端专属环境 ./.venv, 严禁使用其它环境, 避免环境污染问题。
+
+Use uv to manage the local and remote dedicated environment ./.venv. Using other environments is strictly prohibited to avoid environment pollution issues.
 
 ## Machine for Testing and Benchmarking
+
 ```bash
 ssh rwkv-sha-pro6000x8
 cd ~/Projects/MachineLearning/transformers-rwkv
 ```
+
 use git to sync your changes instead of rsync.
