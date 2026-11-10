@@ -207,7 +207,6 @@ class _RwkvPrefillGraph:
             self.tuning_report = flash_rwkv2.prepare_tuning(
                 (lambda: model._forward_state_only(self.input_ids, None, state, False),),
                 mode=getattr(generation_config, "tuning_mode", "inspect"),
-                legacy_dir=getattr(generation_config, "tuning_legacy_dir", None),
             )
             state.copy_(snapshot)
             with torch.cuda.graph(
@@ -284,7 +283,6 @@ class _RwkvDecodeGraph:
             self.tuning_report = flash_rwkv2.prepare_tuning(
                 (lambda: self._forward(model),),
                 mode=getattr(generation_config, "tuning_mode", "inspect"),
-                legacy_dir=getattr(generation_config, "tuning_legacy_dir", None),
             )
             self._restore_capture_inputs(state_snapshot, sampling_snapshot)
             with torch.cuda.graph(
@@ -586,7 +584,6 @@ class RwkvGenerationMixin(GenerationMixin):
         self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
         self.generation_config.tuning_mode = getattr(self.generation_config, "tuning_mode", "inspect")
-        self.generation_config.tuning_legacy_dir = getattr(self.generation_config, "tuning_legacy_dir", None)
 
     def _get_rwkv_generation_cache(self) -> _RwkvGenerationCache:
         cache = getattr(self, "_rwkv_generation_graphs", None)
@@ -726,7 +723,6 @@ class RwkvGenerationMixin(GenerationMixin):
             stop_key,
             wkv_mode,
             getattr(generation_config, "tuning_mode", "inspect"),
-            getattr(generation_config, "tuning_legacy_dir", None),
         )
 
     def _sample(

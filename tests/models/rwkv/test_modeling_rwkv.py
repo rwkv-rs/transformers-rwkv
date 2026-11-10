@@ -18,6 +18,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from transformers import GenerationConfig, RwkvConfig, is_torch_available
 from transformers.testing_utils import require_peft, require_torch, require_torch_gpu, slow
@@ -165,7 +166,10 @@ class RwkvStructureTest(unittest.TestCase):
                 "get_tuning_cache_dir",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a17")
+        self.assertEqual(module.__version__, "0.1.0a18")
+        with mock.patch.object(module, "__version__", "0.1.0a17"):
+            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.1\.0a18"):
+                load_flash_rwkv2("prepare_tuning")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
 
@@ -240,11 +244,11 @@ class RwkvBF16ProviderTest(unittest.TestCase):
             report = flashrwkv2.prepare_tuning((training_step,), mode=mode)
             self.assertTrue(report["complete"])
             self.assertLess(
-                {row["path"] for row in forward_report["records"]},
-                {row["path"] for row in report["records"]},
+                {(row["owner"], json.dumps(row["key"])) for row in forward_report["records"]},
+                {(row["owner"], json.dumps(row["key"])) for row in report["records"]},
             )
             if mode == "require":
-                self.assertTrue(all(row["status"] == "hit" for row in report["records"]))
+                self.assertTrue(all(row["status"] in {"fixed", "hit"} for row in report["records"]))
             for parameter, expected in zip(model.parameters(), expected_gradients, strict=True):
                 torch.testing.assert_close(parameter.grad, expected, atol=0, rtol=0)
 
@@ -282,7 +286,7 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 self.assertTrue(graph.tuning_report["complete"])
                 self.assertGreater(len(graph.tuning_report["records"]), 0)
                 if mode == "require":
-                    self.assertTrue(all(row["status"] == "hit" for row in graph.tuning_report["records"]))
+                    self.assertTrue(all(row["status"] in {"fixed", "hit"} for row in graph.tuning_report["records"]))
             torch.testing.assert_close(runtime.decode_graph.logits, logits[:, -1], atol=0, rtol=0)
             logprobs = flashrwkv2.head_logprobs(runtime.decode_graph.logits[:, None], last_token)
             self.assertEqual(logprobs.dtype, torch.float32)
