@@ -166,9 +166,9 @@ class RwkvStructureTest(unittest.TestCase):
                 "get_tuning_cache_dir",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a18")
-        with mock.patch.object(module, "__version__", "0.1.0a17"):
-            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.1\.0a18"):
+        self.assertEqual(module.__version__, "0.1.0a19")
+        with mock.patch.object(module, "__version__", "0.1.0a18"):
+            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.1\.0a19"):
                 load_flash_rwkv2("prepare_tuning")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
