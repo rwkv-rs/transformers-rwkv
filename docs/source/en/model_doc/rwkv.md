@@ -24,7 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a18`, which provides fixed configurations, verified tuning profiles, and the
+This integration requires CUDA and `FlashRWKV2==0.1.0a19`, which provides fixed configurations, verified tuning profiles, and the
 public preparation API. Install the RWKV dependencies with:
 
 ```bash
