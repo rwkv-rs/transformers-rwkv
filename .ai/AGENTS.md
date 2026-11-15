@@ -86,3 +86,7 @@ cd ~/Projects/MachineLearning/transformers-rwkv
 ```
 
 use git to sync your changes instead of rsync.
+
+## Pull request review
+
+Before reviewing or re-reviewing a pull request, read the [pull request review guide](pr-review.md) at `.ai/pr-review.md` from the repository root and follow its rules.
