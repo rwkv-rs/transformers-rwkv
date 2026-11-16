@@ -13,8 +13,6 @@
 # limitations under the License.
 """PyTorch RWKV-7 model backed exclusively by FlashRWKV2."""
 
-from __future__ import annotations
-
 import math
 
 import torch
@@ -256,7 +254,7 @@ class RwkvCache(Cache):
             )
         return self._training_metadata[key]
 
-    def _copy(self, *, detach: bool) -> RwkvCache:
+    def _copy(self, *, detach: bool) -> "RwkvCache":
         copied = type(self)(self.config)
         copied._seen_tokens = self._seen_tokens
         if self._stream_lengths is not None:
@@ -278,10 +276,10 @@ class RwkvCache(Cache):
                 target.conv_kernel_size[state_idx] = source.conv_kernel_size[state_idx]
         return copied
 
-    def clone(self) -> RwkvCache:
+    def clone(self) -> "RwkvCache":
         return self._copy(detach=False)
 
-    def detach(self) -> RwkvCache:
+    def detach(self) -> "RwkvCache":
         return self._copy(detach=True)
 
     def reset(self, batch_indices: torch.LongTensor | None = None) -> None:
@@ -834,7 +832,6 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
 
 
 class RwkvPreTrainedModel(PreTrainedModel):
-    config_class = RwkvConfig
     config: RwkvConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -1005,7 +1002,7 @@ class RwkvModel(RwkvPreTrainedModel):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         output_hidden_states: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
@@ -1163,7 +1160,7 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
