@@ -132,8 +132,8 @@ first = model(input_ids=inputs.input_ids, past_key_values=cache, use_cache=True)
 continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache, use_cache=True)
 ```
 
-Stateful BF16 training keeps the recurrent state in the autograd graph. Call `cache.detach()` when starting a truncated
-backpropagation segment.
+Training and gradient-enabled evaluation keep the FP32 WKV state and both token shifts in the autograd graph across
+chunks. Call `cache.detach()` when starting a truncated backpropagation segment.
 
 ## Training
 

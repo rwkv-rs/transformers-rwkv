@@ -1039,7 +1039,7 @@ class RwkvModel(RwkvPreTrainedModel):
                         next_attention_shift,
                         next_wkv_state,
                         next_feed_forward_shift,
-                        training=self.training,
+                        training=True,
                     )
 
                 if output_hidden_states:

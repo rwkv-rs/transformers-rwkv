@@ -353,6 +353,23 @@ class RwkvBF16ProviderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dtype torch.float32"):
             model(ids[:, :1], past_key_values=full.past_key_values)
 
+    def test_grad_enabled_eval_backpropagates_through_fp32_cache(self):
+        torch.manual_seed(122)
+        model = RwkvForCausalLM(tiny_config(wkv_mode="fp16")).to(device="cuda", dtype=torch.bfloat16).eval()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+        cache = model(ids[:, :3], use_cache=True).past_key_values
+        layer = cache.layers[0]
+        states = (layer.conv_states[0], layer.recurrent_states[0], layer.conv_states[1])
+        self.assertEqual(states[1].dtype, torch.float32)
+        loss = model(ids[:, 3:], labels=ids[:, 3:], past_key_values=cache).loss
+        for grad in torch.autograd.grad(loss, (*states, model.model.embed_tokens.weight)):
+            self.assertTrue(grad.isfinite().all())
+            self.assertGreater(grad.count_nonzero().item(), 0)
+
     @slow
     @torch.no_grad()
     def test_fp16_deferred_state_across_decode_clone_and_beam_reorder(self):
@@ -366,7 +383,7 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 for parameter in model.parameters():
                     if parameter.ndim >= 2:
                         parameter.normal_(std=0.01)
-                ids = torch.randint(1, config.vocab_size, (16, 8), device="cuda")
+                ids = torch.randint(1, config.vocab_size, (16, 11), device="cuda")
                 cache, reference = RwkvCache(config), RwkvCache(config)
                 model(ids[:, :3], past_key_values=cache)
                 model(ids[:, :3], past_key_values=reference)
@@ -374,15 +391,16 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 self.assertEqual(handle.memory_layout["private_bytes_per_slot"], 1284 * heads)
                 self.assertEqual(handle.memory_layout["fixed_workspace_nbytes"], 0)
 
+                chunks = ids[:, 3:9].split((1, 1, 1, 2, 1), dim=1)
                 expected_logits = []
-                for pos in range(3, 6):
-                    expected_logits.append(model(ids[:, pos : pos + 1], past_key_values=reference).logits)
+                for chunk in chunks:
+                    expected_logits.append(model(chunk, past_key_values=reference).logits)
                     reference.get_recurrent_state(0)
                 with mock.patch.object(
                     type(handle), "materialize_slots_", side_effect=AssertionError("hot-path flush")
                 ):
-                    for pos, expected in enumerate(expected_logits, start=3):
-                        actual = model(ids[:, pos : pos + 1], past_key_values=cache).logits
+                    for chunk, expected in zip(chunks, expected_logits, strict=True):
+                        actual = model(chunk, past_key_values=cache).logits
                         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     self.assertIs(next(iter(cache._inference_recurrent_states.values())), handle)
 
@@ -391,14 +409,14 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                     cloned.get_recurrent_state(0), reference.get_recurrent_state(0), atol=0, rtol=0
                 )
                 for current in (cache, reference):
-                    model(ids[:, 6:7], past_key_values=current)
+                    model(ids[:, 9:10], past_key_values=current)
                 beams = torch.arange(15, -1, -1, device="cuda")
                 beams[1] = beams[0]
                 expected_state = reference.get_recurrent_state(0)[beams]
                 cache.reorder_cache(beams)
                 torch.testing.assert_close(cache.layers[0].recurrent_states[0], expected_state, atol=0, rtol=0)
-                actual = model(ids[beams, 7:], past_key_values=cache).logits
-                expected = model(ids[:, 7:], past_key_values=reference).logits
+                actual = model(ids[beams, 10:], past_key_values=cache).logits
+                expected = model(ids[:, 10:], past_key_values=reference).logits
                 torch.testing.assert_close(actual, expected[beams], atol=0, rtol=0)
 
                 generated = model.generate(
