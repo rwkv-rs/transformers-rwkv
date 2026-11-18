@@ -29,7 +29,13 @@ from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
 from .configuration_rwkv import RwkvConfig
-from .generation_rwkv import RwkvGenerationMixin, _recurrent_forward, _recurrent_metadata, _RwkvGraphState
+from .generation_rwkv import (
+    RwkvGenerationMixin,
+    _materialize_recurrent_state,
+    _recurrent_forward,
+    _recurrent_metadata,
+    _RwkvGraphState,
+)
 
 
 _TRAIN_ATTENTION_OPERATORS = (
@@ -57,17 +63,46 @@ def _validate_attention_mask(attention_mask: torch.Tensor | None, batch_size: in
         raise ValueError("RWKV-7 does not support padding or ragged batches; bucket inputs by sequence length.")
 
 
+class _RwkvCacheLayer(LinearAttentionLayer):
+    def __init__(self, inference_recurrent_states):
+        self._inference_recurrent_states = inference_recurrent_states
+        super().__init__(number_of_states=2)
+
+    def _release_recurrent_state(self):
+        if self._inference_recurrent_states:
+            pool = self._recurrent_states[0]
+            if pool is not None:
+                key = pool.data_ptr()
+                handle = self._inference_recurrent_states.get(key)
+                if handle is not None:
+                    _materialize_recurrent_state(handle, pool)
+                    del self._inference_recurrent_states[key]
+
+    @property
+    def recurrent_states(self):
+        # The inherited cache API exposes a mutable dictionary of raw tensors.
+        self._release_recurrent_state()
+        return self._recurrent_states
+
+    @recurrent_states.setter
+    def recurrent_states(self, states):
+        self._release_recurrent_state()
+        self._recurrent_states = states
+
+
 class RwkvCache(Cache):
     """RWKV-7 recurrent cache with two token shifts and one WKV state per layer, FP32 by default."""
 
     def __init__(self, config: RwkvConfig):
         config.validate_architecture()
-        super().__init__(layers=[LinearAttentionLayer(number_of_states=2) for _ in range(config.num_hidden_layers)])
+        self._inference_recurrent_states: dict[int, object] = {}
+        super().__init__(
+            layers=[_RwkvCacheLayer(self._inference_recurrent_states) for _ in range(config.num_hidden_layers)]
+        )
         self.config = config
         self._seen_tokens = 0
         self._stream_lengths: torch.Tensor | None = None
         self._inference_metadata: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, object]] = {}
-        self._inference_recurrent_states: dict[int, object] = {}
 
     @property
     def is_compileable(self) -> bool:
@@ -78,7 +113,7 @@ class RwkvCache(Cache):
         if self._stream_lengths is not None:
             return self._stream_lengths.numel()
         for layer in self.layers:
-            for state in (*layer.conv_states.values(), *layer.recurrent_states.values()):
+            for state in (*layer.conv_states.values(), *layer._recurrent_states.values()):
                 if state is not None:
                     return state.shape[0]
         return -1
@@ -93,12 +128,13 @@ class RwkvCache(Cache):
     def get_mask_sizes(self, query_length: int, layer_idx: int) -> tuple[int, int]:
         return query_length, self._seen_tokens
 
-    def _invalidate_metadata(self) -> None:
-        self._inference_metadata.clear()
-        self._inference_recurrent_states.clear()
-
     def layer_states(
         self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._layer_states(layer_idx, hidden_states, training=training, materialize=True)
+
+    def _layer_states(
+        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool, materialize: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer = self.layers[layer_idx]
         batch_size, _, hidden_size = hidden_states.shape
@@ -122,7 +158,7 @@ class RwkvCache(Cache):
             layer.lazy_initialization(conv_states=template, state_idx=1, conv_kernel_size=1)
 
         attention_shift = layer.conv_states[0]
-        wkv_state = layer.recurrent_states[0]
+        wkv_state = (layer.recurrent_states if materialize else layer._recurrent_states)[0]
         feed_forward_shift = layer.conv_states[1]
         if attention_shift.shape != expected_shift_shape or feed_forward_shift.shape != expected_shift_shape:
             raise ValueError(
@@ -280,7 +316,7 @@ class RwkvCache(Cache):
             if self._stream_lengths is not None:
                 self._stream_lengths.index_fill_(0, batch_indices.to(self._stream_lengths.device), 0)
                 self._seen_tokens = int(self._stream_lengths.max().item())
-        self._invalidate_metadata()
+        self._inference_metadata.clear()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         for layer in self.layers:
@@ -291,7 +327,7 @@ class RwkvCache(Cache):
                         getattr(layer, states_name)[state_idx] = state.repeat_interleave(repeats, dim=0)
         if self._stream_lengths is not None:
             self._stream_lengths = self._stream_lengths.repeat_interleave(repeats, dim=0)
-        self._invalidate_metadata()
+        self._inference_metadata.clear()
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
         for layer in self.layers:
@@ -303,7 +339,7 @@ class RwkvCache(Cache):
         if self._stream_lengths is not None:
             self._stream_lengths = self._stream_lengths.index_select(0, indices.to(self._stream_lengths.device))
             self._seen_tokens = int(self._stream_lengths.max().item())
-        self._invalidate_metadata()
+        self._inference_metadata.clear()
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
         self.batch_select_indices(beam_idx)
@@ -896,8 +932,8 @@ class RwkvModel(RwkvPreTrainedModel):
         for layer_idx, decoder_layer in enumerate(self.layers):
             state_reference = hidden_states.view(batch_size, sequence_length, -1)
             if isinstance(cache_params, RwkvCache):
-                attention_shift, wkv_state, feed_forward_shift = cache_params.layer_states(
-                    layer_idx, state_reference, training=False
+                attention_shift, wkv_state, feed_forward_shift = cache_params._layer_states(
+                    layer_idx, state_reference, training=False, materialize=False
                 )
             else:
                 attention_shift, wkv_state, feed_forward_shift = cache_params.layer_states(layer_idx, state_reference)

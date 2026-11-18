@@ -681,7 +681,7 @@ class RwkvMockProviderTest(unittest.TestCase):
                 runtime.state.feed_forward_shift[layer_idx], reference_layer.conv_states[1].squeeze(-1)
             )
             torch.testing.assert_close(
-                runtime.state.recurrent_states[layer_idx]._state_pool, reference_layer.recurrent_states[0]
+                runtime.state.get_recurrent_state(layer_idx), reference_layer.recurrent_states[0]
             )
 
         with mock.patch.object(self.fake, "prepare_tuning", wraps=self.fake.prepare_tuning) as prepare:

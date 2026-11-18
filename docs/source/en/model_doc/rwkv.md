@@ -112,6 +112,17 @@ Pass the returned `past_key_values` back to the model to continue a stream. [`Rw
 and one WKV matrix per layer: FP32 for training and default inference, or FP16 for `wkv_mode="fp16"` inference.
 It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
 
+For FP16 serving with head size 64 and 40 or 64 heads, FlashRWKV2 can defer writing a single-token update to the
+bound WKV tensor. Eager inference and CUDA Graph replay keep the provider handle across steps. Cache reads
+(`cache.get_recurrent_state(layer_idx)` or `cache.layers[layer_idx].recurrent_states[0]`), raw copies, and beam
+reordering materialize the pending update before exposing or moving the tensor. Read the state again after advancing
+the cache, or clone it to keep a snapshot. CUDA Graph warmup and restore copy the state through the handle.
+
+Budget 1,284 extra bytes per slot per head per layer for these FP16 pools (five 64-element FP32 vectors and one
+int32 phase). This is 51,360 bytes per slot at 40 heads or 82,176 at 64 heads, independent of pool capacity.
+The fixed workspace is zero. FP32 state, including training and gradient-enabled evaluation, and other FP16
+geometries use zero private log bytes.
+
 ```python
 from transformers import RwkvCache
 

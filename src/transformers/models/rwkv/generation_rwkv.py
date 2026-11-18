@@ -100,6 +100,12 @@ def _recurrent_forward(
     )
 
 
+def _materialize_recurrent_state(handle, pool: torch.Tensor) -> None:
+    if pool.dtype == torch.float16 and handle.memory_layout["private_bytes_per_slot"]:
+        slots = torch.arange(pool.shape[0], dtype=torch.int32, device=pool.device)
+        handle.materialize_slots_(slots)
+
+
 class _RwkvGraphState:
     def __init__(
         self,
@@ -115,11 +121,16 @@ class _RwkvGraphState:
         prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.wkv_mode}_state_from_tensor")
         state_shape = (batch_size, config.num_attention_heads, config.head_size, config.head_size)
         state_dtype = torch.float16 if self.wkv_mode == "fp16" else torch.float32
-        self.recurrent_states = [
-            prepare_state(torch.zeros(state_shape, dtype=state_dtype, device=device))
-            for _ in range(config.num_hidden_layers)
+        self._state_pools = [
+            torch.zeros(state_shape, dtype=state_dtype, device=device) for _ in range(config.num_hidden_layers)
         ]
+        self.recurrent_states = [prepare_state(pool) for pool in self._state_pools]
         self._inference_metadata: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, object]] = {}
+
+    def get_recurrent_state(self, layer_idx: int) -> torch.Tensor:
+        pool = self._state_pools[layer_idx]
+        _materialize_recurrent_state(self.recurrent_states[layer_idx], pool)
+        return pool
 
     def layer_states(self, layer_idx: int, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, object, torch.Tensor]:
         return self.attention_shift[layer_idx], self.recurrent_states[layer_idx], self.feed_forward_shift[layer_idx]
