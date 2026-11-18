@@ -159,16 +159,17 @@ class RwkvStructureTest(unittest.TestCase):
         module = load_flash_rwkv2(
             (
                 "pretrain_tmix_wkv7_recurrent_bf16",
-                "statetune_tmix_wkv7_recurrent_fp32io16",
+                "pretrain_tmix_tokenshift_bf16",
+                "pretrain_cmix_bf16",
                 "infer_tmix_wkv_prepare_forward_varlen",
                 "infer_sampling_six_parameter_forward_varlen",
                 "prepare_tuning",
                 "get_tuning_cache_dir",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a19")
-        with mock.patch.object(module, "__version__", "0.1.0a18"):
-            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.1\.0a19"):
+        self.assertEqual(module.__version__, "0.2.0a1")
+        with mock.patch.object(module, "__version__", "0.1.0a19"):
+            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.2\.0a1"):
                 load_flash_rwkv2("prepare_tuning")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
@@ -254,9 +255,7 @@ class RwkvBF16ProviderTest(unittest.TestCase):
 
     @slow
     @torch.no_grad()
-    def test_tuning_preserves_state_and_logprobs_and_require_reuses_profiles(self):
-        import flashrwkv2
-
+    def test_tuning_preserves_state_and_logits_and_require_reuses_profiles(self):
         torch.manual_seed(118)
         model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16).eval()
         for parameter in model.parameters():
@@ -269,7 +268,6 @@ class RwkvBF16ProviderTest(unittest.TestCase):
         logits = model(first_token, past_key_values=cache).logits
         last_token = logits[:, -1].argmax(-1, keepdim=True)
         expected = torch.cat((ids, first_token, last_token), dim=-1)
-        expected_logprobs = flashrwkv2.head_logprobs(logits, last_token)
         for mode in ("tune", "require"):
             actual = model.generate(
                 ids,
@@ -288,9 +286,6 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 if mode == "require":
                     self.assertTrue(all(row["status"] in {"fixed", "hit"} for row in graph.tuning_report["records"]))
             torch.testing.assert_close(runtime.decode_graph.logits, logits[:, -1], atol=0, rtol=0)
-            logprobs = flashrwkv2.head_logprobs(runtime.decode_graph.logits[:, None], last_token)
-            self.assertEqual(logprobs.dtype, torch.float32)
-            torch.testing.assert_close(logprobs, expected_logprobs, atol=0, rtol=0)
             for layer_idx, layer in enumerate(cache.layers):
                 state = runtime.state.recurrent_states[layer_idx]._state_pool
                 self.assertEqual(state.dtype, torch.float32)
@@ -359,15 +354,13 @@ class RwkvBF16ProviderTest(unittest.TestCase):
             model(ids[:, :1], past_key_values=full.past_key_values)
 
     def test_training_prefill_decode_batch_state_and_optimizer(self):
-        import flashrwkv2
-
         torch.manual_seed(115)
         model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             for parameter in model.parameters():
                 if parameter.ndim >= 2:
                     parameter.normal_(std=0.03)
-        ids = torch.randint(1, model.config.vocab_size, (2, 16), device="cuda")
+        ids = torch.randint(1, model.config.vocab_size, (2, 17), device="cuda")
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         for step in range(2):
             model.train()
@@ -389,11 +382,6 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 torch.testing.assert_close(torch.cat(chunks, dim=1), full, atol=0, rtol=0)
                 single = model(ids[:1], use_cache=False).logits
                 torch.testing.assert_close(single, full[:1], atol=0, rtol=0)
-                targets = ids.contiguous()
-                expected_logprobs = flashrwkv2.head_logprobs(full, targets)
-                actual_logprobs = flashrwkv2.head_logprobs(torch.cat(chunks, dim=1).contiguous(), targets)
-                self.assertEqual(actual_logprobs.dtype, torch.float32)
-                torch.testing.assert_close(actual_logprobs, expected_logprobs, atol=0, rtol=0)
                 for trained, whole, chunked in zip(
                     training_cache.layers, full_cache.layers, chunk_cache.layers, strict=True
                 ):
@@ -604,17 +592,6 @@ class RwkvCacheTest(unittest.TestCase):
         cache.reset()
         self.assertEqual(cache.get_seq_length(), 0)
         self.assertEqual(cache.stream_lengths.tolist(), [0, 0])
-
-    def test_training_chunk_metadata_covers_arbitrary_lengths(self):
-        cache = RwkvCache(self.config)
-        for sequence_length in (1, 7, 15, 16, 17, 31):
-            offsets, starts, ends = cache.training_metadata(2, sequence_length, self.hidden.device)
-            self.assertEqual(offsets[0].item(), 0)
-            self.assertEqual(offsets[-1].item(), len(starts))
-            self.assertEqual(starts[0].item(), 0)
-            self.assertEqual(ends[-1].item(), 2 * sequence_length)
-            self.assertTrue(torch.all(ends > starts))
-            self.assertTrue(torch.all(ends - starts <= 16))
 
 
 @require_torch

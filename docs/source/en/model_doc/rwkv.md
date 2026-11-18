@@ -24,7 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a19`, which provides fixed configurations, verified tuning profiles, and the
+This integration requires CUDA and `FlashRWKV2==0.2.0a1`, which provides fixed configurations, verified tuning profiles, and the
 public preparation API. Install the RWKV dependencies with:
 
 ```bash
@@ -126,9 +126,8 @@ backpropagation segment.
 
 ## Training
 
-Load the complete model in BF16 before training. Stateless training uses the canonical FlashRWKV2 pretraining
-operators for sequence lengths divisible by 16; other non-empty chunks use the differentiable zero-initial-state
-StateTune path.
+Load the complete model in BF16 before training. The dense FlashRWKV2 training operators accept any non-empty sequence length.
+With a cache, they consume each layer's initial shifts and FP32 WKV state and return the final states.
 
 ```python
 model.to(device="cuda", dtype=torch.bfloat16).train()

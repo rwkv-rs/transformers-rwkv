@@ -112,15 +112,11 @@ class _RwkvGraphState:
         self.wkv_mode = config.wkv_mode
         self.attention_shift = torch.zeros(shift_shape, dtype=torch.bfloat16, device=device)
         self.feed_forward_shift = torch.zeros_like(self.attention_shift)
-        prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.wkv_mode}_state")
+        prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.wkv_mode}_state_from_tensor")
+        state_shape = (batch_size, config.num_attention_heads, config.head_size, config.head_size)
+        state_dtype = torch.float16 if self.wkv_mode == "fp16" else torch.float32
         self.recurrent_states = [
-            prepare_state(
-                batch_size,
-                config.hidden_size,
-                sequence_capacity=batch_size,
-                head_size=config.head_size,
-                device=device,
-            )
+            prepare_state(torch.zeros(state_shape, dtype=state_dtype, device=device))
             for _ in range(config.num_hidden_layers)
         ]
         self._inference_metadata: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, object]] = {}
@@ -438,7 +434,7 @@ class _RwkvGenerationModelRunner:
         operators.extend(
             (
                 f"infer_tmix_wkv7_recurrent_{wkv_mode}_forward_varlen",
-                f"prepare_tmix_wkv7_recurrent_{wkv_mode}_state",
+                f"prepare_tmix_wkv7_recurrent_{wkv_mode}_state_from_tensor",
             )
         )
         if generation_config.do_sample:
