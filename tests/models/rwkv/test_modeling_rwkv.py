@@ -159,17 +159,16 @@ class RwkvStructureTest(unittest.TestCase):
         module = load_flash_rwkv2(
             (
                 "pretrain_tmix_wkv7_recurrent_bf16",
-                "statetune_tmix_wkv7_recurrent_fp32io16",
+                "pretrain_tmix_tokenshift_bf16",
+                "pretrain_cmix_bf16",
                 "infer_tmix_wkv_prepare_forward_varlen",
                 "infer_sampling_six_parameter_forward_varlen",
-                "prepare_tuning",
-                "get_tuning_cache_dir",
             )
         )
-        self.assertEqual(module.__version__, "0.1.0a19")
-        with mock.patch.object(module, "__version__", "0.1.0a18"):
-            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.1\.0a19"):
-                load_flash_rwkv2("prepare_tuning")
+        self.assertEqual(module.__version__, "0.2.0a1")
+        with mock.patch.object(module, "__version__", "0.1.0a19"):
+            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.2\.0a1"):
+                load_flash_rwkv2("pretrain_cmix_bf16")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
 
@@ -221,87 +220,6 @@ class RwkvStructureTest(unittest.TestCase):
 
 @require_torch_gpu
 class RwkvBF16ProviderTest(unittest.TestCase):
-    @slow
-    def test_training_tuning_covers_backward_and_preserves_gradients(self):
-        import flashrwkv2
-
-        torch.manual_seed(119)
-        model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16).train()
-        with torch.no_grad():
-            for parameter in model.parameters():
-                if parameter.ndim >= 2:
-                    parameter.normal_(std=0.03)
-        ids = torch.randint(1, model.config.vocab_size, (2, 16), device="cuda")
-
-        def training_step():
-            model.zero_grad(set_to_none=True)
-            model(ids, labels=ids, use_cache=False).loss.backward()
-
-        training_step()
-        expected_gradients = [parameter.grad.clone() for parameter in model.parameters()]
-        forward_report = flashrwkv2.prepare_tuning((lambda: model(ids, labels=ids, use_cache=False),), mode="inspect")
-        for mode in ("tune", "require"):
-            report = flashrwkv2.prepare_tuning((training_step,), mode=mode)
-            self.assertTrue(report["complete"])
-            self.assertLess(
-                {(row["owner"], json.dumps(row["key"])) for row in forward_report["records"]},
-                {(row["owner"], json.dumps(row["key"])) for row in report["records"]},
-            )
-            if mode == "require":
-                self.assertTrue(all(row["status"] in {"fixed", "hit"} for row in report["records"]))
-            for parameter, expected in zip(model.parameters(), expected_gradients, strict=True):
-                torch.testing.assert_close(parameter.grad, expected, atol=0, rtol=0)
-
-    @slow
-    @torch.no_grad()
-    def test_tuning_preserves_state_and_logprobs_and_require_reuses_profiles(self):
-        import flashrwkv2
-
-        torch.manual_seed(118)
-        model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16).eval()
-        for parameter in model.parameters():
-            if parameter.ndim >= 2:
-                parameter.normal_(std=0.03)
-        ids = torch.randint(1, model.config.vocab_size, (2, 8), device="cuda")
-        cache = RwkvCache(model.config)
-        first_logits = model(ids, past_key_values=cache, logits_to_keep=1).logits
-        first_token = first_logits[:, -1].argmax(-1, keepdim=True)
-        logits = model(first_token, past_key_values=cache).logits
-        last_token = logits[:, -1].argmax(-1, keepdim=True)
-        expected = torch.cat((ids, first_token, last_token), dim=-1)
-        expected_logprobs = flashrwkv2.head_logprobs(logits, last_token)
-        for mode in ("tune", "require"):
-            actual = model.generate(
-                ids,
-                max_new_tokens=2,
-                prefill_chunk_size=3,
-                do_sample=False,
-                eos_token_id=None,
-                tuning_mode=mode,
-            )
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-            runtime = next(reversed(model._rwkv_generation_graphs.values()))
-            self.assertEqual(runtime.prefill_lengths, (3, 3, 1))
-            for graph in (*runtime.prefill_graphs.values(), runtime.decode_graph):
-                self.assertTrue(graph.tuning_report["complete"])
-                self.assertGreater(len(graph.tuning_report["records"]), 0)
-                if mode == "require":
-                    self.assertTrue(all(row["status"] in {"fixed", "hit"} for row in graph.tuning_report["records"]))
-            torch.testing.assert_close(runtime.decode_graph.logits, logits[:, -1], atol=0, rtol=0)
-            logprobs = flashrwkv2.head_logprobs(runtime.decode_graph.logits[:, None], last_token)
-            self.assertEqual(logprobs.dtype, torch.float32)
-            torch.testing.assert_close(logprobs, expected_logprobs, atol=0, rtol=0)
-            for layer_idx, layer in enumerate(cache.layers):
-                state = runtime.state.recurrent_states[layer_idx]._state_pool
-                self.assertEqual(state.dtype, torch.float32)
-                torch.testing.assert_close(state, layer.recurrent_states[0], atol=0, rtol=0)
-                torch.testing.assert_close(
-                    runtime.state.attention_shift[layer_idx], layer.conv_states[0].squeeze(-1), atol=0, rtol=0
-                )
-                torch.testing.assert_close(
-                    runtime.state.feed_forward_shift[layer_idx], layer.conv_states[1].squeeze(-1), atol=0, rtol=0
-                )
-
     def test_fp16_state_inference_preserves_fp32_training(self):
         torch.manual_seed(117)
         model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
@@ -358,16 +276,92 @@ class RwkvBF16ProviderTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dtype torch.float32"):
             model(ids[:, :1], past_key_values=full.past_key_values)
 
-    def test_training_prefill_decode_batch_state_and_optimizer(self):
-        import flashrwkv2
+    def test_grad_enabled_eval_backpropagates_through_fp32_cache(self):
+        torch.manual_seed(122)
+        model = RwkvForCausalLM(tiny_config(wkv_mode="fp16")).to(device="cuda", dtype=torch.bfloat16).eval()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+        cache = model(ids[:, :3], use_cache=True).past_key_values
+        layer = cache.layers[0]
+        states = (layer.conv_states[0], layer.recurrent_states[0], layer.conv_states[1])
+        self.assertEqual(states[1].dtype, torch.float32)
+        loss = model(ids[:, 3:], labels=ids[:, 3:], past_key_values=cache).loss
+        for grad in torch.autograd.grad(loss, (*states, model.model.embed_tokens.weight)):
+            self.assertTrue(grad.isfinite().all())
+            self.assertGreater(grad.count_nonzero().item(), 0)
 
+    @slow
+    @torch.no_grad()
+    def test_fp16_deferred_state_across_decode_clone_and_beam_reorder(self):
+        torch.manual_seed(121)
+        for heads in (40, 64):
+            with self.subTest(heads=heads):
+                config = tiny_config(
+                    hidden_size=64 * heads, intermediate_size=None, num_hidden_layers=1, wkv_mode="fp16"
+                )
+                model = RwkvForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
+                for parameter in model.parameters():
+                    if parameter.ndim >= 2:
+                        parameter.normal_(std=0.01)
+                ids = torch.randint(1, config.vocab_size, (16, 11), device="cuda")
+                cache, reference = RwkvCache(config), RwkvCache(config)
+                model(ids[:, :3], past_key_values=cache)
+                model(ids[:, :3], past_key_values=reference)
+                handle = next(iter(cache._inference_recurrent_states.values()))
+                self.assertGreater(handle.memory_layout["private_bytes_per_slot"], 0)
+
+                chunks = ids[:, 3:9].split((1, 1, 1, 2, 1), dim=1)
+                expected_logits = []
+                for chunk in chunks:
+                    expected_logits.append(model(chunk, past_key_values=reference).logits)
+                    reference.get_recurrent_state(0)
+                with mock.patch.object(
+                    type(handle), "materialize_slots_", side_effect=AssertionError("hot-path flush")
+                ):
+                    for chunk, expected in zip(chunks, expected_logits, strict=True):
+                        actual = model(chunk, past_key_values=cache).logits
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    self.assertIs(next(iter(cache._inference_recurrent_states.values())), handle)
+
+                cloned = cache.clone()
+                torch.testing.assert_close(
+                    cloned.get_recurrent_state(0), reference.get_recurrent_state(0), atol=0, rtol=0
+                )
+                for current in (cache, reference):
+                    model(ids[:, 9:10], past_key_values=current)
+                beams = torch.arange(15, -1, -1, device="cuda")
+                beams[1] = beams[0]
+                expected_state = reference.get_recurrent_state(0)[beams]
+                cache.reorder_cache(beams)
+                torch.testing.assert_close(cache.layers[0].recurrent_states[0], expected_state, atol=0, rtol=0)
+                actual = model(ids[beams, 10:], past_key_values=cache).logits
+                expected = model(ids[:, 10:], past_key_values=reference).logits
+                torch.testing.assert_close(actual, expected[beams], atol=0, rtol=0)
+
+                generated = model.generate(
+                    ids[:, :4], max_new_tokens=3, prefill_chunk_size=3, do_sample=False, eos_token_id=None
+                )
+                eager = RwkvCache(config)
+                model(ids[:, :3], past_key_values=eager)
+                for pos in range(3, 6):
+                    logits = model(generated[:, pos : pos + 1], past_key_values=eager).logits
+                    torch.testing.assert_close(logits[:, -1].argmax(-1), generated[:, pos + 1], atol=0, rtol=0)
+                runtime = next(reversed(model._rwkv_generation_graphs.values()))
+                torch.testing.assert_close(
+                    runtime.state.get_recurrent_state(0), eager.get_recurrent_state(0), atol=0, rtol=0
+                )
+
+    def test_training_prefill_decode_batch_state_and_optimizer(self):
         torch.manual_seed(115)
         model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             for parameter in model.parameters():
                 if parameter.ndim >= 2:
                     parameter.normal_(std=0.03)
-        ids = torch.randint(1, model.config.vocab_size, (2, 16), device="cuda")
+        ids = torch.randint(1, model.config.vocab_size, (2, 17), device="cuda")
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         for step in range(2):
             model.train()
@@ -389,11 +383,6 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 torch.testing.assert_close(torch.cat(chunks, dim=1), full, atol=0, rtol=0)
                 single = model(ids[:1], use_cache=False).logits
                 torch.testing.assert_close(single, full[:1], atol=0, rtol=0)
-                targets = ids.contiguous()
-                expected_logprobs = flashrwkv2.head_logprobs(full, targets)
-                actual_logprobs = flashrwkv2.head_logprobs(torch.cat(chunks, dim=1).contiguous(), targets)
-                self.assertEqual(actual_logprobs.dtype, torch.float32)
-                torch.testing.assert_close(actual_logprobs, expected_logprobs, atol=0, rtol=0)
                 for trained, whole, chunked in zip(
                     training_cache.layers, full_cache.layers, chunk_cache.layers, strict=True
                 ):
@@ -446,7 +435,7 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 torch.testing.assert_close(runtime.decode_graph.logits, logits, atol=0, rtol=0)
                 for layer_idx, layer in enumerate(cache.layers):
                     torch.testing.assert_close(
-                        runtime.state.recurrent_states[layer_idx]._state_pool,
+                        runtime.state.get_recurrent_state(layer_idx),
                         layer.recurrent_states[0],
                         atol=0,
                         rtol=0,
@@ -604,17 +593,6 @@ class RwkvCacheTest(unittest.TestCase):
         cache.reset()
         self.assertEqual(cache.get_seq_length(), 0)
         self.assertEqual(cache.stream_lengths.tolist(), [0, 0])
-
-    def test_training_chunk_metadata_covers_arbitrary_lengths(self):
-        cache = RwkvCache(self.config)
-        for sequence_length in (1, 7, 15, 16, 17, 31):
-            offsets, starts, ends = cache.training_metadata(2, sequence_length, self.hidden.device)
-            self.assertEqual(offsets[0].item(), 0)
-            self.assertEqual(offsets[-1].item(), len(starts))
-            self.assertEqual(starts[0].item(), 0)
-            self.assertEqual(ends[-1].item(), 2 * sequence_length)
-            self.assertTrue(torch.all(ends > starts))
-            self.assertTrue(torch.all(ends - starts <= 16))
 
 
 @require_torch

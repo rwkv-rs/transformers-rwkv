@@ -35,16 +35,12 @@ from ...generation import (
     TopPLogitsWarper,
 )
 from ...integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
-from ...utils import logging
 from .configuration_rwkv import RwkvConfig
 
 
 if TYPE_CHECKING:
     from ...generation.streamers import BaseStreamer
     from .modeling_rwkv import RwkvForCausalLM, RwkvModel
-
-
-logger = logging.get_logger(__name__)
 
 
 def _rwkv_prefill_lengths(prompt_length: int, chunk_size: int | None) -> tuple[int, ...]:
@@ -100,6 +96,12 @@ def _recurrent_forward(
     )
 
 
+def _materialize_recurrent_state(handle, pool: torch.Tensor) -> None:
+    if pool.dtype == torch.float16 and handle.memory_layout["private_bytes_per_slot"]:
+        slots = torch.arange(pool.shape[0], dtype=torch.int32, device=pool.device)
+        handle.materialize_slots_(slots)
+
+
 class _RwkvGraphState:
     def __init__(
         self,
@@ -112,18 +114,19 @@ class _RwkvGraphState:
         self.wkv_mode = config.wkv_mode
         self.attention_shift = torch.zeros(shift_shape, dtype=torch.bfloat16, device=device)
         self.feed_forward_shift = torch.zeros_like(self.attention_shift)
-        prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.wkv_mode}_state")
-        self.recurrent_states = [
-            prepare_state(
-                batch_size,
-                config.hidden_size,
-                sequence_capacity=batch_size,
-                head_size=config.head_size,
-                device=device,
-            )
-            for _ in range(config.num_hidden_layers)
+        prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{self.wkv_mode}_state_from_tensor")
+        state_shape = (batch_size, config.num_attention_heads, config.head_size, config.head_size)
+        state_dtype = torch.float16 if self.wkv_mode == "fp16" else torch.float32
+        self._state_pools = [
+            torch.zeros(state_shape, dtype=state_dtype, device=device) for _ in range(config.num_hidden_layers)
         ]
+        self.recurrent_states = [prepare_state(pool) for pool in self._state_pools]
         self._inference_metadata: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, object]] = {}
+
+    def get_recurrent_state(self, layer_idx: int) -> torch.Tensor:
+        pool = self._state_pools[layer_idx]
+        _materialize_recurrent_state(self.recurrent_states[layer_idx], pool)
+        return pool
 
     def layer_states(self, layer_idx: int, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, object, torch.Tensor]:
         return self.attention_shift[layer_idx], self.recurrent_states[layer_idx], self.feed_forward_shift[layer_idx]
@@ -193,8 +196,6 @@ class _RwkvPrefillGraph:
         sequence_length: int,
         capture_stream: torch.cuda.Stream,
         graph_pool,
-        flash_rwkv2,
-        generation_config: GenerationConfig,
     ) -> None:
         self.input_ids = torch.zeros(
             (batch_size, sequence_length), dtype=torch.long, device=model.embed_tokens.weight.device
@@ -204,10 +205,7 @@ class _RwkvPrefillGraph:
         generation_stream = torch.cuda.current_stream(self.input_ids.device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
-            self.tuning_report = flash_rwkv2.prepare_tuning(
-                (lambda: model._forward_state_only(self.input_ids, None, state, False),),
-                mode=getattr(generation_config, "tuning_mode", "inspect"),
-            )
+            model._forward_state_only(self.input_ids, None, state, False)
             state.copy_(snapshot)
             with torch.cuda.graph(
                 self.graph,
@@ -280,10 +278,7 @@ class _RwkvDecodeGraph:
         generation_stream = torch.cuda.current_stream(device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
-            self.tuning_report = flash_rwkv2.prepare_tuning(
-                (lambda: self._forward(model),),
-                mode=getattr(generation_config, "tuning_mode", "inspect"),
-            )
+            self._forward(model)
             self._restore_capture_inputs(state_snapshot, sampling_snapshot)
             with torch.cuda.graph(
                 self.graph,
@@ -438,7 +433,7 @@ class _RwkvGenerationModelRunner:
         operators.extend(
             (
                 f"infer_tmix_wkv7_recurrent_{wkv_mode}_forward_varlen",
-                f"prepare_tmix_wkv7_recurrent_{wkv_mode}_state",
+                f"prepare_tmix_wkv7_recurrent_{wkv_mode}_state_from_tensor",
             )
         )
         if generation_config.do_sample:
@@ -460,8 +455,6 @@ class _RwkvGenerationModelRunner:
                 sequence_length,
                 capture_stream,
                 graph_pool,
-                flash_rwkv2,
-                generation_config,
             )
             for sequence_length in dict.fromkeys(self.prefill_lengths)
         }
@@ -477,15 +470,6 @@ class _RwkvGenerationModelRunner:
             graph_pool,
             flash_rwkv2,
         )
-        for graph in (*self.prefill_graphs.values(), self.decode_graph):
-            if not graph.tuning_report["complete"]:
-                logger.warning(
-                    "RWKV CUDA Graph uses %s untuned kernel configurations from %s. "
-                    "Run generate(..., tuning_mode='tune') to prepare missing profiles, then "
-                    "generate(..., tuning_mode='require') to enforce complete coverage.",
-                    graph.tuning_report["counts"]["missing"],
-                    graph.tuning_report["cache_root"],
-                )
 
     def generate(
         self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None
@@ -583,7 +567,6 @@ class RwkvGenerationMixin(GenerationMixin):
         self.generation_config.presence_penalty = getattr(self.generation_config, "presence_penalty", 0.0)
         self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
-        self.generation_config.tuning_mode = getattr(self.generation_config, "tuning_mode", "inspect")
 
     def _get_rwkv_generation_cache(self) -> _RwkvGenerationCache:
         cache = getattr(self, "_rwkv_generation_graphs", None)
@@ -728,7 +711,6 @@ class RwkvGenerationMixin(GenerationMixin):
             eos_key,
             stop_key,
             wkv_mode,
-            getattr(generation_config, "tuning_mode", "inspect"),
         )
 
     def _sample(

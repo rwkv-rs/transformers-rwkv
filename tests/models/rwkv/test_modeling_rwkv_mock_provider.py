@@ -64,25 +64,18 @@ def single_token_stop_criteria(vocab_size: int, token_id: int) -> StopStringCrit
 
 
 class FakeRecurrentState:
-    def __init__(self, state_pool, elapsed_state_pool, sequence_capacity):
+    def __init__(self, state_pool):
         self._state_pool = state_pool
-        self._elapsed_state_pool = elapsed_state_pool
-        self._sequence_capacity = sequence_capacity
 
     def clone(self):
-        elapsed_state_pool = None if self._elapsed_state_pool is None else self._elapsed_state_pool.clone()
-        return type(self)(self._state_pool.clone(), elapsed_state_pool, self._sequence_capacity)
+        return type(self)(self._state_pool.clone())
 
     def copy_(self, other):
         self._state_pool.copy_(other._state_pool)
-        if self._elapsed_state_pool is not None:
-            self._elapsed_state_pool.copy_(other._elapsed_state_pool)
         return self
 
     def zero_(self):
         self._state_pool.zero_()
-        if self._elapsed_state_pool is not None:
-            self._elapsed_state_pool.zero_()
         return self
 
 
@@ -101,12 +94,6 @@ class RecordingStreamer:
 
 
 class FakeFlashRwkv2:
-    @staticmethod
-    def prepare_tuning(calls, *, mode="require"):
-        for call in calls:
-            call()
-        return {"complete": True, "counts": {"missing": 0}, "cache_root": "mock-provider", "records": []}
-
     @staticmethod
     def _linear(x, weight, *, lora_a=None, lora_b=None, lora_scale=1.0, use_nora=False):
         output = F.linear(x, weight)
@@ -162,47 +149,22 @@ class FakeFlashRwkv2:
         if v_first is None:
             v_first = v
         else:
-            v = self.pretrain_tmix_vres_gate_bf16(v, v_first, v0, (xv @ v1) @ v2)
-        a_gate = self.pretrain_tmix_a_gate_bf16(a0, (xa @ a1) @ a2)
-        k, a, b = self.pretrain_tmix_kk_pre_bf16(k, k_k, a_gate, k_a, head_size=head_size)
-        return r, w0 + torch.tanh(xw @ w1) @ w2, k, v, a, b, torch.sigmoid(xg @ g1) @ g2, v_first
+            v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ v1) @ v2)
+        a_gate = torch.sigmoid(a0 + (xa @ a1) @ a2)
+        direction = F.normalize((k * k_k).unflatten(-1, (-1, head_size)).float(), dim=-1).to(k.dtype).view_as(k)
+        k = k * (1 + (a_gate - 1) * k_a)
+        w = w0 + torch.tanh(xw @ w1) @ w2
+        gate = torch.sigmoid(xg @ g1) @ g2
+        return r, w, k, v, -direction, direction * a_gate, gate, v_first
 
     @staticmethod
-    def _mix(x, initial, parameters):
-        previous = torch.cat((initial[:, None], x[:, :-1]), dim=1)
+    def pretrain_tmix_tokenshift_bf16(x, *parameters, initial_shift=None, return_final_state=False):
+        if initial_shift is None:
+            initial_shift = torch.zeros_like(x[:, 0])
+        previous = torch.cat((initial_shift[:, None], x[:, :-1]), dim=1)
         delta = previous - x
         outputs = tuple((x + delta * parameter).contiguous() for parameter in parameters)
-        return (*outputs, x[:, -1].contiguous())
-
-    def pretrain_tmix_tokenshift_bf16(self, x, *parameters):
-        initial = torch.zeros_like(x[:, 0])
-        return self._mix(x, initial, parameters)[:6]
-
-    def statetune_tmix_tokenshift_bf16(self, x, initial, *parameters):
-        return self._mix(x, initial, parameters)
-
-    @staticmethod
-    def pretrain_tmix_a_gate_bf16(a0, a12):
-        return torch.sigmoid(a0 + a12).contiguous()
-
-    @staticmethod
-    def pretrain_tmix_vres_gate_bf16(value, v_first, v0, v12):
-        return (value + (v_first - value) * torch.sigmoid(v0 + v12)).contiguous()
-
-    @staticmethod
-    def pretrain_tmix_kk_pre_bf16(key, key_scale, learning_rate, learning_rate_scale, *, head_size=64):
-        batch_size, sequence_length, channels = key.shape
-        heads = channels // head_size
-        direction = F.normalize(
-            (key * key_scale).view(batch_size, sequence_length, heads, head_size).float(),
-            dim=-1,
-        ).to(key.dtype)
-        prepared_key = key * (1 + (learning_rate - 1) * learning_rate_scale)
-        return (
-            prepared_key.contiguous(),
-            -direction.view_as(key).contiguous(),
-            (direction * learning_rate.view_as(direction)).view_as(key).contiguous(),
-        )
+        return (*outputs, x[:, -1].contiguous()) if return_final_state else outputs
 
     @staticmethod
     def _recurrence(initial_state, receptance, decay_logits, key, value, recurrent_a, recurrent_b, output_dtype=None):
@@ -230,41 +192,20 @@ class FakeFlashRwkv2:
             final_states.append(state)
         return torch.stack(outputs), torch.stack(final_states)
 
-    def pretrain_tmix_wkv7_recurrent_bf16(self, receptance, decay_logits, key, value, a, b, *, head_size=64):
+    def pretrain_tmix_wkv7_recurrent_bf16(
+        self, receptance, decay_logits, key, value, a, b, *, head_size=64, initial_state=None, return_final_state=False
+    ):
         batch_size, sequence_length, channels = receptance.shape
         heads = channels // head_size
         values = [
             tensor.view(batch_size, sequence_length, heads, head_size)
             for tensor in (receptance, decay_logits, key, value, a, b)
         ]
-        initial = torch.zeros(batch_size, heads, head_size, head_size, dtype=torch.float32)
-        output, _ = self._recurrence(initial, *values)
-        return output.view(batch_size, sequence_length, channels)
-
-    def statetune_tmix_wkv7_recurrent_fp32io16(
-        self,
-        initial_state,
-        sequence_chunk_offsets,
-        chunk_token_starts,
-        chunk_token_ends,
-        receptance,
-        decay_logits,
-        key,
-        value,
-        a,
-        b,
-        *,
-        scale=1.0,
-    ):
-        batch_size, heads, head_size, _ = initial_state.shape
-        sequence_length = receptance.shape[0] // batch_size
-        values = [
-            tensor.view(batch_size, sequence_length, heads, head_size)
-            for tensor in (receptance, decay_logits, key, value, a, b)
-        ]
+        if initial_state is None:
+            initial_state = receptance.new_zeros((batch_size, heads, head_size, head_size), dtype=torch.float32)
         output, final_state = self._recurrence(initial_state, *values)
-        output = (output * scale).view_as(value)
-        return output, final_state
+        output = output.view_as(receptance)
+        return (output, final_state) if return_final_state else output
 
     def pretrain_tmix_readout_bf16(
         self,
@@ -307,11 +248,12 @@ class FakeFlashRwkv2:
             )
         return output
 
-    def pretrain_cmix_bf16(self, x, x_k, key_weight, value_weight, **adapters):
-        return self.statetune_cmix_bf16(x, torch.zeros_like(x[:, 0]), x_k, key_weight, value_weight, **adapters)[0]
-
-    def statetune_cmix_bf16(self, x, initial, x_k, key_weight, value_weight, **adapters):
-        previous = torch.cat((initial[:, None], x[:, :-1]), dim=1)
+    def pretrain_cmix_bf16(
+        self, x, x_k, key_weight, value_weight, *, initial_shift=None, return_final_state=False, **adapters
+    ):
+        if initial_shift is None:
+            initial_shift = torch.zeros_like(x[:, 0])
+        previous = torch.cat((initial_shift[:, None], x[:, :-1]), dim=1)
         output = x + (previous - x) * x_k
         for name, weight in (("key", key_weight), ("value", value_weight)):
             output = self._linear(
@@ -324,7 +266,7 @@ class FakeFlashRwkv2:
             )
             if name == "key":
                 output = F.relu(output).square()
-        return output, x[:, -1].contiguous()
+        return (output, x[:, -1].contiguous()) if return_final_state else output
 
     @staticmethod
     def infer_embedding_ln0_forward_varlen(embedding, weight, bias, *, eps=1e-5):
@@ -335,22 +277,8 @@ class FakeFlashRwkv2:
         return object()
 
     @staticmethod
-    def prepare_tmix_wkv7_recurrent_fp32io16_state(
-        state_pool_size, channels, *, sequence_capacity, head_size=64, device=None
-    ):
-        state_pool = torch.zeros(
-            state_pool_size,
-            channels // head_size,
-            head_size,
-            head_size,
-            dtype=torch.float32,
-            device=device,
-        )
-        return FakeRecurrentState(state_pool, None, sequence_capacity)
-
-    @staticmethod
     def prepare_tmix_wkv7_recurrent_fp32io16_state_from_tensor(state_pool):
-        return FakeRecurrentState(state_pool, None, state_pool.shape[0])
+        return FakeRecurrentState(state_pool)
 
     @staticmethod
     def setup_sampling_states(seed, num_slots):
@@ -403,7 +331,9 @@ class FakeFlashRwkv2:
         sequence_length = x.shape[0] // batch_size
         residual = x + residual
         normalized = F.layer_norm(residual, (x.shape[-1],), weight, bias, eps).view(batch_size, sequence_length, -1)
-        outputs = self._mix(normalized, shift_state_pool, parameters)
+        outputs = self.pretrain_tmix_tokenshift_bf16(
+            normalized, *parameters, initial_shift=shift_state_pool, return_final_state=True
+        )
         shift_state_pool.copy_(outputs[-1])
         self.expected_cmix_input = residual
         return (residual, *(value.view_as(x) for value in outputs[:6]))
@@ -698,24 +628,6 @@ class RwkvMockProviderTest(unittest.TestCase):
             reference_completion.append(reference_token)
         expected = torch.cat((input_ids, *reference_completion), dim=-1)
 
-        with (
-            mock.patch.object(
-                self.fake, "prepare_tuning", side_effect=RuntimeError("missing verified tuning profile")
-            ),
-            mock.patch("torch.cuda.graph") as capture,
-            self.assertRaisesRegex(RuntimeError, "missing verified tuning profile"),
-        ):
-            model.generate(
-                input_ids,
-                max_new_tokens=3,
-                prefill_chunk_size=2,
-                do_sample=False,
-                eos_token_id=None,
-                tuning_mode="require",
-            )
-        capture.assert_not_called()
-        self.assertEqual(len(model._rwkv_generation_graphs), 0)
-
         first = model.generate(
             input_ids,
             max_new_tokens=3,
@@ -745,23 +657,8 @@ class RwkvMockProviderTest(unittest.TestCase):
                 runtime.state.feed_forward_shift[layer_idx], reference_layer.conv_states[1].squeeze(-1)
             )
             torch.testing.assert_close(
-                runtime.state.recurrent_states[layer_idx]._state_pool, reference_layer.recurrent_states[0]
+                runtime.state.get_recurrent_state(layer_idx), reference_layer.recurrent_states[0]
             )
-
-        with mock.patch.object(self.fake, "prepare_tuning", wraps=self.fake.prepare_tuning) as prepare:
-            prepared = model.generate(
-                input_ids,
-                max_new_tokens=3,
-                prefill_chunk_size=2,
-                do_sample=False,
-                eos_token_id=None,
-                tuning_mode="tune",
-            )
-        torch.testing.assert_close(prepared, expected)
-        self.assertEqual(prepare.call_count, 3)  # prefill lengths 2 and 1, then decode
-        for call in prepare.call_args_list:
-            self.assertEqual(call.kwargs, {"mode": "tune"})
-        self.assertEqual(len(model._rwkv_generation_graphs), 2)
 
     @require_torch_gpu
     def test_single_token_prompt_starts_with_decode_graph_and_exposes_first_logits(self):
