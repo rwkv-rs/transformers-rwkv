@@ -161,7 +161,9 @@ parameters directly; no runtime weight copies or CPU offload are needed. Warm up
 
 Generation runs each distinct prefill chunk length and the one-token decode path on the capture stream before
 capturing their CUDA Graphs. It restores recurrent state, sampling state, and penalties after warmup.
-FlashRWKV2 selects the kernel configurations. The generation benchmark reports warmup and capture time separately
+FlashRWKV2 selects kernel configurations from its packaged profiles. When upgrading, remove `tuning_mode` from
+`generate()` calls and `--tuning-mode` from benchmark commands. Update scripts that read the benchmark JSON to drop
+the `tuning_reports` field. The benchmark reports warmup and capture together in `capture_warmup_time`, separately
 from generation throughput.
 
 ## LoRA and NoRA training
