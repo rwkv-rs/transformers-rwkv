@@ -117,10 +117,10 @@ bound WKV tensor. Eager inference and CUDA Graph replay keep the provider handle
 reordering materialize the pending update before exposing or moving the tensor. Read the state again after advancing
 the cache, or clone it to keep a snapshot. CUDA Graph warmup and restore copy the state through the handle.
 
-Budget 1,284 extra bytes per slot per head per layer for these FP16 pools (five 64-element FP32 vectors and one
-int32 phase). This is 51,360 bytes per slot at 40 heads or 82,176 at 64 heads, independent of pool capacity.
-The fixed workspace is zero. FP32 state, including training and gradient-enabled evaluation, and other FP16
-geometries use zero private log bytes.
+Budget private state using the provider handle's `memory_layout["private_bytes_per_slot"]` for each layer.
+With FlashRWKV2 0.2.0a1, the D64 layout uses 51,360 bytes per slot at 40 heads. At 64 heads, it uses
+98,560 bytes on a 128-SM RTX 4090 and 82,176 on an RTX PRO 6000. These paths use zero fixed workspace.
+FP32 state, including training and gradient-enabled evaluation, and other FP16 geometries use zero private log bytes.
 
 ```python
 from transformers import RwkvCache
