@@ -24,8 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.1.0a19`, which provides fixed configurations, verified tuning profiles, and the
-public preparation API. Install the RWKV dependencies with:
+This integration requires CUDA and `FlashRWKV2==0.2.0a1`. Install the RWKV dependencies with:
 
 ```bash
 pip install "transformers[rwkv]"
@@ -112,6 +111,17 @@ Pass the returned `past_key_values` back to the model to continue a stream. [`Rw
 and one WKV matrix per layer: FP32 for training and default inference, or FP16 for `wkv_mode="fp16"` inference.
 It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
 
+For FP16 serving with head size 64 and 40 or 64 heads, FlashRWKV2 can defer writing a single-token update to the
+bound WKV tensor. Eager inference and CUDA Graph replay keep the provider handle across steps. Cache reads
+(`cache.get_recurrent_state(layer_idx)` or `cache.layers[layer_idx].recurrent_states[0]`), raw copies, and beam
+reordering materialize the pending update before exposing or moving the tensor. Read the state again after advancing
+the cache, or clone it to keep a snapshot. CUDA Graph warmup and restore copy the state through the handle.
+
+Budget private state using the provider handle's `memory_layout["private_bytes_per_slot"]` for each layer.
+With FlashRWKV2 0.2.0a1, the D64 layout uses 51,360 bytes per slot at 40 heads. At 64 heads, it uses
+98,560 bytes on a 128-SM RTX 4090 and 82,176 on an RTX PRO 6000. These paths use zero fixed workspace.
+FP32 state, including training and gradient-enabled evaluation, and other FP16 geometries use zero private log bytes.
+
 ```python
 from transformers import RwkvCache
 
@@ -121,14 +131,13 @@ first = model(input_ids=inputs.input_ids, past_key_values=cache, use_cache=True)
 continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache, use_cache=True)
 ```
 
-Stateful BF16 training keeps the recurrent state in the autograd graph. Call `cache.detach()` when starting a truncated
-backpropagation segment.
+Training and gradient-enabled evaluation keep the FP32 WKV state and both token shifts in the autograd graph across
+chunks. Call `cache.detach()` when starting a truncated backpropagation segment.
 
 ## Training
 
-Load the complete model in BF16 before training. Stateless training uses the canonical FlashRWKV2 pretraining
-operators for sequence lengths divisible by 16; other non-empty chunks use the differentiable zero-initial-state
-StateTune path.
+Load the complete model in BF16 before training. The dense FlashRWKV2 training operators accept any non-empty sequence length.
+With a cache, they consume each layer's initial shifts and FP32 WKV state and return the final states.
 
 ```python
 model.to(device="cuda", dtype=torch.bfloat16).train()
@@ -150,36 +159,12 @@ recurrent inference. CUDA Graph generation does this automatically. Weight trans
 parameters directly; no runtime weight copies or CPU offload are needed. Warm up fixed batch/sequence shapes and their
 [`RwkvCache`] on the capture stream before capture so metadata and state addresses are ready.
 
-Generation checks FlashRWKV2 tuning coverage during each graph's real warmup. It covers the prompt prefix, each
-distinct prefill chunk length, and the one-token decode path including the output head. The default
-`tuning_mode="inspect"` reports missing configurations and warns when a graph uses untuned defaults. To prepare only
-missing configurations and then require verified coverage, use the same model, inputs, and generation settings:
-
-```python
-model.generate(**inputs, max_new_tokens=128, tokenizer=tokenizer, tuning_mode="tune")
-output_ids = model.generate(**inputs, max_new_tokens=128, tokenizer=tokenizer, tuning_mode="require")
-```
-
-`require` fails before capturing a graph whose warmup encounters a missing profile. Changing the preparation mode
-creates new graphs, so a graph captured with defaults is not reused after tuning. Warmup restores recurrent state,
-sampling state, and penalties before capture and generation.
-
-On RTX 4090 (SM89/128 SM) and RTX PRO 6000 (SM120/188 SM), validated fixed configurations report `status="fixed"`
-and satisfy `require` without loading profiles or searching configurations.
-
-FlashRWKV2 stores verified profiles in `~/.cache/flashrwkv2`, independently of the virtual environment,
-`TORCH_HOME`, and `XDG_CACHE_HOME`. Set `FLASHRWKV2_CACHE_DIR` before importing FlashRWKV2 to relocate this cache.
-After upgrading FlashRWKV2, prepare the actual workload again with `tuning_mode="tune"`.
-
-For ordinary forward or training preparation, call the public `flashrwkv2.prepare_tuning` with zero-argument
-callables that execute the actual workload. Training callables should include backward when preparing its kernels,
-clear gradients between runs, and use disposable or reset recurrent state. Preserve the workload's gradient mode and
-active LoRA/NoRA adapters. Preparation does not change the model's FP32 training state or head logits.
-
-`temp/benchmark_rwkv_generate.py` defaults to `--tuning-mode require`; use `--tuning-mode tune` to fill missing
-profiles before benchmarking. Its JSON records the loaded model configuration and every process's prefill/decode
-coverage report, including selected kernel configurations and cache paths. Preparation and capture time are reported
-separately from generation throughput.
+Generation runs each distinct prefill chunk length and the one-token decode path on the capture stream before
+capturing their CUDA Graphs. It restores recurrent state, sampling state, and penalties after warmup.
+FlashRWKV2 selects kernel configurations from its packaged profiles. When upgrading, remove `tuning_mode` from
+`generate()` calls and `--tuning-mode` from benchmark commands. Update scripts that read the benchmark JSON to drop
+the `tuning_reports` field. The benchmark reports warmup and capture together in `capture_warmup_time`, separately
+from generation throughput.
 
 ## LoRA and NoRA training
 
