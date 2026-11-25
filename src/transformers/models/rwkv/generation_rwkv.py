@@ -647,7 +647,7 @@ class RwkvGenerationMixin(GenerationMixin):
             or generation_config.output_logits
         ):
             raise ValueError("RWKV-7 CUDA graph generation does not support detailed generation outputs.")
-        if model_kwargs.get("past_key_values") is not None or model_kwargs.get("inputs_embeds") is not None:
+        if model_kwargs.get("cache") is not None or model_kwargs.get("inputs_embeds") is not None:
             raise ValueError("RWKV-7 CUDA graph generation does not accept an external cache or inputs_embeds.")
         unsupported_kwargs = {
             name

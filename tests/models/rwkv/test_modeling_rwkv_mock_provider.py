@@ -579,7 +579,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         self.assertIsInstance(outputs, CausalLMOutputWithPast)
         self.assertEqual(outputs.logits.shape, (2, 7, self.config.vocab_size))
         self.assertEqual(len(outputs.hidden_states), self.config.num_hidden_layers + 1)
-        self.assertIsNone(outputs.past_key_values)
+        self.assertIsNone(outputs.cache)
         outputs.loss.backward()
         self.assertIsNotNone(model.lm_head.weight.grad)
         self.assertIsNotNone(model.model.layers[0].linear_attn.o_proj.weight.grad)
@@ -620,7 +620,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         for _ in range(3):
             reference_logits = model(
                 reference_token,
-                past_key_values=reference_cache,
+                cache=reference_cache,
                 use_cache=True,
                 logits_to_keep=1,
             ).logits[:, -1]
@@ -668,7 +668,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         reference_logits = (
             model(
                 input_ids,
-                past_key_values=reference_cache,
+                cache=reference_cache,
                 use_cache=True,
                 logits_to_keep=1,
             )
@@ -856,17 +856,17 @@ class RwkvMockProviderTest(unittest.TestCase):
             evaluation = model(input_ids, use_cache=False)
 
         torch.testing.assert_close(evaluation.logits, training_logits)
-        self.assertIsNone(evaluation.past_key_values)
+        self.assertIsNone(evaluation.cache)
 
     def test_stateful_training_matches_full_sequence_and_keeps_graph(self):
         model = RwkvForCausalLM(self.config).to(dtype=torch.bfloat16).train()
         input_ids = torch.randint(0, self.config.vocab_size, (2, 7))
         full_cache = RwkvCache(self.config)
-        full = model(input_ids, past_key_values=full_cache, use_cache=True).logits
+        full = model(input_ids, cache=full_cache, use_cache=True).logits
 
         chunk_cache = RwkvCache(self.config)
-        first = model(input_ids[:, :3], past_key_values=chunk_cache, use_cache=True).logits
-        second = model(input_ids[:, 3:], past_key_values=chunk_cache, use_cache=True).logits
+        first = model(input_ids[:, :3], cache=chunk_cache, use_cache=True).logits
+        second = model(input_ids[:, 3:], cache=chunk_cache, use_cache=True).logits
         torch.testing.assert_close(torch.cat((first, second), dim=1), full, atol=2e-2, rtol=2e-2)
         self.assertEqual(chunk_cache.get_seq_length(), 7)
         for full_layer, chunk_layer in zip(full_cache.layers, chunk_cache.layers, strict=True):
@@ -884,15 +884,15 @@ class RwkvMockProviderTest(unittest.TestCase):
         full_cache = RwkvCache(self.config)
         full = model(
             input_ids,
-            past_key_values=full_cache,
+            cache=full_cache,
             use_cache=True,
             output_hidden_states=True,
         )
         self.assertEqual(len(full.hidden_states), self.config.num_hidden_layers + 1)
         model.to(dtype=torch.bfloat16)
         chunk_cache = RwkvCache(self.config)
-        first = model(input_ids[:, :3], past_key_values=chunk_cache, use_cache=True).logits
-        second = model(input_ids[:, 3:], past_key_values=chunk_cache, use_cache=True).logits
+        first = model(input_ids[:, :3], cache=chunk_cache, use_cache=True).logits
+        second = model(input_ids[:, 3:], cache=chunk_cache, use_cache=True).logits
         torch.testing.assert_close(torch.cat((first, second), dim=1), full.logits, atol=2e-3, rtol=2e-3)
         for full_layer, chunk_layer in zip(full_cache.layers, chunk_cache.layers, strict=True):
             torch.testing.assert_close(full_layer.conv_states[0], chunk_layer.conv_states[0])
@@ -903,7 +903,7 @@ class RwkvMockProviderTest(unittest.TestCase):
 
         model.to(dtype=torch.bfloat16)
         temporary = model(input_ids, use_cache=False, logits_to_keep=1)
-        self.assertIsNone(temporary.past_key_values)
+        self.assertIsNone(temporary.cache)
         self.assertEqual(temporary.logits.shape, (2, 1, self.config.vocab_size))
         embeddings = model.model.embed_tokens(input_ids).to(torch.bfloat16)
         embedded = model(inputs_embeds=embeddings, use_cache=False)
@@ -950,7 +950,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         plain_output = plain(
             input_ids,
             labels=labels,
-            past_key_values=plain_cache,
+            cache=plain_cache,
             use_cache=True,
         )
         plain_output.loss.backward()
@@ -959,7 +959,7 @@ class RwkvMockProviderTest(unittest.TestCase):
         checkpointed_output = checkpointed(
             input_ids,
             labels=labels,
-            past_key_values=checkpointed_cache,
+            cache=checkpointed_cache,
             use_cache=True,
         )
         checkpointed_output.loss.backward()
@@ -1002,6 +1002,7 @@ class RwkvMockProviderTest(unittest.TestCase):
             ),
             ("custom logits processors", {"logits_processor": [LogitsProcessor()]}),
             ("detailed generation outputs", {"return_dict_in_generate": True}),
+            ("external cache", {"cache": RwkvCache(self.config)}),
             ("generation mode 'GenerationMode.BEAM_SEARCH'", {"num_beams": 2}),
         )
         for error, kwargs in cases:

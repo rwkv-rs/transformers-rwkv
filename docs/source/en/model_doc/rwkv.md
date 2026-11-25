@@ -107,7 +107,7 @@ The weight publisher reuses existing local artifacts and skips already published
 
 ## Stateful execution
 
-Pass the returned `past_key_values` back to the model to continue a stream. [`RwkvCache`] stores two token-shift vectors
+Pass `outputs.cache` back to the model as `cache` to continue a stream. [`RwkvCache`] stores two token-shift vectors
 and one WKV matrix per layer: FP32 for training and default inference, or FP16 for `wkv_mode="fp16"` inference.
 It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
 
@@ -127,8 +127,8 @@ from transformers import RwkvCache
 
 
 cache = RwkvCache(model.config)
-first = model(input_ids=inputs.input_ids, past_key_values=cache, use_cache=True)
-continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache, use_cache=True)
+first = model(input_ids=inputs.input_ids, cache=cache, use_cache=True)
+continued = model(input_ids=torch.tensor([[42]], device=model.device), cache=cache, use_cache=True)
 ```
 
 Training and gradient-enabled evaluation keep the FP32 WKV state and both token shifts in the autograd graph across
