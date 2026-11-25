@@ -151,9 +151,38 @@ class RwkvStructureTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "padding or ragged"):
             model(input_ids, attention_mask=torch.tensor([[1, 0]]))
         with self.assertRaisesRegex(TypeError, "only RwkvCache"):
+            model(input_ids, cache=DynamicCache())
+        with (
+            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
+            self.assertRaisesRegex(TypeError, "only RwkvCache"),
+        ):
             model(input_ids, past_key_values=DynamicCache())
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             model(input_ids)
+
+    def test_exported_layers_accept_legacy_cache_keyword(self):
+        config = tiny_config()
+        layer = RwkvModel(config).layers[0]
+        hidden_states = torch.zeros(2, config.hidden_size, dtype=torch.bfloat16)
+        residual = torch.zeros_like(hidden_states)
+        metadata = (torch.tensor([0, 2]), torch.tensor([0]), 2, object())
+        cache = RwkvCache(config)
+        with (
+            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
+            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
+        ):
+            layer.linear_attn(
+                hidden_states,
+                residual=residual,
+                layer_norm=layer.input_layernorm,
+                inference_metadata=metadata,
+                cache_params=cache,
+            )
+        with (
+            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
+            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
+        ):
+            layer(hidden_states, residual, None, None, None, None, metadata, cache_params=cache)
 
     def test_provider_pin_and_requested_operator_validation(self):
         module = load_flash_rwkv2(
@@ -236,27 +265,25 @@ class RwkvBF16ProviderTest(unittest.TestCase):
         torch.testing.assert_close(training.logits, reference.logits, atol=0, rtol=0)
         for actual, expected in zip(torch.autograd.grad(training.loss, parameters), gradients, strict=True):
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        for actual, expected in zip(training.past_key_values.layers, reference.past_key_values.layers, strict=True):
+        for actual, expected in zip(training.cache.layers, reference.cache.layers, strict=True):
             self.assertEqual(actual.recurrent_states[0].dtype, torch.float32)
             torch.testing.assert_close(actual.recurrent_states[0], expected.recurrent_states[0], atol=0, rtol=0)
         model.eval()
         # Grad-enabled evaluation still uses differentiable FP32-state operators.
         evaluated = model(ids, use_cache=True)
         torch.testing.assert_close(evaluated.logits, reference.logits, atol=0, rtol=0)
-        self.assertEqual(evaluated.past_key_values.layers[0].recurrent_states[0].dtype, torch.float32)
+        self.assertEqual(evaluated.cache.layers[0].recurrent_states[0].dtype, torch.float32)
         with torch.no_grad():
             full = model(ids, use_cache=True)
             self.assertEqual(full.logits.dtype, torch.float32)
             cache = RwkvCache(model.config)
-            chunks = [model(ids[:, :7], past_key_values=cache).logits]
+            chunks = [model(ids[:, :7], cache=cache).logits]
             for position in range(7, ids.shape[1]):
-                chunks.append(model(ids[:, position : position + 1], past_key_values=cache).logits)
+                chunks.append(model(ids[:, position : position + 1], cache=cache).logits)
             torch.testing.assert_close(torch.cat(chunks, dim=1), full.logits, atol=0, rtol=0)
             single = model(ids[:1], use_cache=True)
             torch.testing.assert_close(single.logits, full.logits[:1], atol=0, rtol=0)
-            for whole, chunked, one in zip(
-                full.past_key_values.layers, cache.layers, single.past_key_values.layers, strict=True
-            ):
+            for whole, chunked, one in zip(full.cache.layers, cache.layers, single.cache.layers, strict=True):
                 self.assertEqual(whole.recurrent_states[0].dtype, torch.float16)
                 torch.testing.assert_close(chunked.recurrent_states[0], whole.recurrent_states[0], atol=0, rtol=0)
                 torch.testing.assert_close(one.recurrent_states[0], whole.recurrent_states[0][:1], atol=0, rtol=0)
@@ -267,14 +294,14 @@ class RwkvBF16ProviderTest(unittest.TestCase):
             copied.batch_repeat_interleave(2)
             copied.reorder_cache(torch.tensor([3, 0], device="cuda"))
             next_ids = ids[[1, 0], :1]
-            actual = model(next_ids, past_key_values=copied).logits
-            expected = model(ids[:, :1], past_key_values=cache).logits[[1, 0]]
+            actual = model(next_ids, cache=copied).logits
+            expected = model(ids[:, :1], cache=cache).logits[[1, 0]]
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
             copied.reset()
-            torch.testing.assert_close(model(ids, past_key_values=copied).logits, full.logits, atol=0, rtol=0)
+            torch.testing.assert_close(model(ids, cache=copied).logits, full.logits, atol=0, rtol=0)
         model.train()
         with self.assertRaisesRegex(ValueError, "dtype torch.float32"):
-            model(ids[:, :1], past_key_values=full.past_key_values)
+            model(ids[:, :1], cache=full.cache)
 
     def test_grad_enabled_eval_backpropagates_through_fp32_cache(self):
         torch.manual_seed(122)
@@ -284,11 +311,11 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 if parameter.ndim >= 2:
                     parameter.normal_(std=0.03)
         ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
-        cache = model(ids[:, :3], use_cache=True).past_key_values
+        cache = model(ids[:, :3], use_cache=True).cache
         layer = cache.layers[0]
         states = (layer.conv_states[0], layer.recurrent_states[0], layer.conv_states[1])
         self.assertEqual(states[1].dtype, torch.float32)
-        loss = model(ids[:, 3:], labels=ids[:, 3:], past_key_values=cache).loss
+        loss = model(ids[:, 3:], labels=ids[:, 3:], cache=cache).loss
         for grad in torch.autograd.grad(loss, (*states, model.model.embed_tokens.weight)):
             self.assertTrue(grad.isfinite().all())
             self.assertGreater(grad.count_nonzero().item(), 0)
@@ -308,21 +335,21 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                         parameter.normal_(std=0.01)
                 ids = torch.randint(1, config.vocab_size, (16, 11), device="cuda")
                 cache, reference = RwkvCache(config), RwkvCache(config)
-                model(ids[:, :3], past_key_values=cache)
-                model(ids[:, :3], past_key_values=reference)
+                model(ids[:, :3], cache=cache)
+                model(ids[:, :3], cache=reference)
                 handle = next(iter(cache._inference_recurrent_states.values()))
                 self.assertGreater(handle.memory_layout["private_bytes_per_slot"], 0)
 
                 chunks = ids[:, 3:9].split((1, 1, 1, 2, 1), dim=1)
                 expected_logits = []
                 for chunk in chunks:
-                    expected_logits.append(model(chunk, past_key_values=reference).logits)
+                    expected_logits.append(model(chunk, cache=reference).logits)
                     reference.get_recurrent_state(0)
                 with mock.patch.object(
                     type(handle), "materialize_slots_", side_effect=AssertionError("hot-path flush")
                 ):
                     for chunk, expected in zip(chunks, expected_logits, strict=True):
-                        actual = model(chunk, past_key_values=cache).logits
+                        actual = model(chunk, cache=cache).logits
                         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     self.assertIs(next(iter(cache._inference_recurrent_states.values())), handle)
 
@@ -331,23 +358,23 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                     cloned.get_recurrent_state(0), reference.get_recurrent_state(0), atol=0, rtol=0
                 )
                 for current in (cache, reference):
-                    model(ids[:, 9:10], past_key_values=current)
+                    model(ids[:, 9:10], cache=current)
                 beams = torch.arange(15, -1, -1, device="cuda")
                 beams[1] = beams[0]
                 expected_state = reference.get_recurrent_state(0)[beams]
                 cache.reorder_cache(beams)
                 torch.testing.assert_close(cache.layers[0].recurrent_states[0], expected_state, atol=0, rtol=0)
-                actual = model(ids[beams, 10:], past_key_values=cache).logits
-                expected = model(ids[:, 10:], past_key_values=reference).logits
+                actual = model(ids[beams, 10:], cache=cache).logits
+                expected = model(ids[:, 10:], cache=reference).logits
                 torch.testing.assert_close(actual, expected[beams], atol=0, rtol=0)
 
                 generated = model.generate(
                     ids[:, :4], max_new_tokens=3, prefill_chunk_size=3, do_sample=False, eos_token_id=None
                 )
                 eager = RwkvCache(config)
-                model(ids[:, :3], past_key_values=eager)
+                model(ids[:, :3], cache=eager)
                 for pos in range(3, 6):
-                    logits = model(generated[:, pos : pos + 1], past_key_values=eager).logits
+                    logits = model(generated[:, pos : pos + 1], cache=eager).logits
                     torch.testing.assert_close(logits[:, -1].argmax(-1), generated[:, pos + 1], atol=0, rtol=0)
                 runtime = next(reversed(model._rwkv_generation_graphs.values()))
                 torch.testing.assert_close(
@@ -369,17 +396,17 @@ class RwkvBF16ProviderTest(unittest.TestCase):
             self.assertEqual(training.logits.dtype, torch.float32)
             self.assertEqual(training.loss.dtype, torch.float32)
             training_cache = RwkvCache(model.config)
-            stateful = model(ids, labels=ids, past_key_values=training_cache, use_cache=True)
+            stateful = model(ids, labels=ids, cache=training_cache, use_cache=True)
             torch.testing.assert_close(stateful.logits, training.logits, atol=0, rtol=0)
             model.eval()
             with torch.no_grad():
                 full_cache = RwkvCache(model.config)
-                full = model(ids, past_key_values=full_cache, use_cache=True).logits
+                full = model(ids, cache=full_cache, use_cache=True).logits
                 torch.testing.assert_close(full, training.logits, atol=0, rtol=0)
                 chunk_cache = RwkvCache(model.config)
-                chunks = [model(ids[:, :7], past_key_values=chunk_cache).logits]
+                chunks = [model(ids[:, :7], cache=chunk_cache).logits]
                 for position in range(7, ids.shape[1]):
-                    chunks.append(model(ids[:, position : position + 1], past_key_values=chunk_cache).logits)
+                    chunks.append(model(ids[:, position : position + 1], cache=chunk_cache).logits)
                 torch.testing.assert_close(torch.cat(chunks, dim=1), full, atol=0, rtol=0)
                 single = model(ids[:1], use_cache=False).logits
                 torch.testing.assert_close(single, full[:1], atol=0, rtol=0)
@@ -418,11 +445,11 @@ class RwkvBF16ProviderTest(unittest.TestCase):
         for mode in ("fp32io16", "fp16"):
             model.config.wkv_mode = mode
             cache = RwkvCache(model.config)
-            logits = model(ids, past_key_values=cache, logits_to_keep=1).logits[:, -1]
+            logits = model(ids, cache=cache, logits_to_keep=1).logits[:, -1]
             token = logits.argmax(-1)
             completion = [token]
             for _ in range(2):
-                logits = model(token[:, None], past_key_values=cache).logits[:, -1]
+                logits = model(token[:, None], cache=cache).logits[:, -1]
                 token = logits.argmax(-1)
                 completion.append(token)
             expected = torch.cat((ids, torch.stack(completion, dim=1)), dim=1)
@@ -508,8 +535,8 @@ class RwkvNoRATrainingTest(unittest.TestCase):
                 if wkv_mode == "fp32io16":
                     torch.testing.assert_close(adapted, trained, atol=0, rtol=0)
                 cache = RwkvCache(model.config)
-                first = model(ids[:, :7], past_key_values=cache, use_cache=True).logits
-                last = model(ids[:, 7:], past_key_values=cache, use_cache=True).logits
+                first = model(ids[:, :7], cache=cache, use_cache=True).logits
+                last = model(ids[:, 7:], cache=cache, use_cache=True).logits
                 full = model(ids, use_cache=False).logits
                 torch.testing.assert_close(torch.cat((first, last), dim=1), full, atol=0, rtol=0)
                 generated = model.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
