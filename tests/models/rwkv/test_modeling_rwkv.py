@@ -160,6 +160,30 @@ class RwkvStructureTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
             model(input_ids)
 
+    def test_exported_layers_accept_legacy_cache_keyword(self):
+        config = tiny_config()
+        layer = RwkvModel(config).layers[0]
+        hidden_states = torch.zeros(2, config.hidden_size, dtype=torch.bfloat16)
+        residual = torch.zeros_like(hidden_states)
+        metadata = (torch.tensor([0, 2]), torch.tensor([0]), 2, object())
+        cache = RwkvCache(config)
+        with (
+            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
+            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
+        ):
+            layer.linear_attn(
+                hidden_states,
+                residual=residual,
+                layer_norm=layer.input_layernorm,
+                inference_metadata=metadata,
+                cache_params=cache,
+            )
+        with (
+            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
+            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
+        ):
+            layer(hidden_states, residual, None, None, None, None, metadata, cache_params=cache)
+
     def test_provider_pin_and_requested_operator_validation(self):
         module = load_flash_rwkv2(
             (

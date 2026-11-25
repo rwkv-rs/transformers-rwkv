@@ -612,6 +612,7 @@ class RwkvAttention(nn.Module):
         )
         return output, residual, v_first
 
+    @deprecate_kwarg("cache_params", "5.40.0", new_name="cache")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -736,6 +737,7 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+    @deprecate_kwarg("cache_params", "5.40.0", new_name="cache")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -798,7 +800,6 @@ class RwkvPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["RwkvDecoderLayer"]
-    _skip_keys_device_placement = ["cache"]
     _is_stateful = True
     _can_compile_fullgraph = False
 
