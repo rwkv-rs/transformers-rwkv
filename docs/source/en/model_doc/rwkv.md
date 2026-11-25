@@ -63,6 +63,25 @@ loss = model(input_ids=input_ids, labels=labels, use_cache=False).loss
 loss.backward()
 ```
 
+### Packing
+
+Use [`DataCollatorWithFlattening`] to pack independent training examples into a batch of shape `[1, total_tokens]`. Enable
+`return_flash_attn_kwargs` so the collator supplies `cu_seq_lens_q`. TimeMix, ChannelMix, and the WKV state start
+from zero at each sequence boundary. The collator masks the first label of each sequence to keep next-token loss
+within that sequence.
+
+```python
+from transformers import DataCollatorWithFlattening, Trainer
+
+trainer = Trainer(
+    model=model,
+    train_dataset=tokenized_dataset,
+    data_collator=DataCollatorWithFlattening(return_flash_attn_kwargs=True),
+)
+```
+
+Packed batches run without a recurrent cache. Use dense batches to pass `past_key_values` between chunks.
+
 ### Right padding
 
 Dense training supports right padding with stateless batches. Set padded labels to `-100` so they are excluded from the

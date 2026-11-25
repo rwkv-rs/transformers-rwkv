@@ -353,6 +353,82 @@ class RwkvBF16ProviderTest(unittest.TestCase):
         self.assertEqual(streamer.threads[0], threading.get_ident())
         self.assertTrue(all(thread != threading.get_ident() for thread in streamer.threads[1:]))
 
+    def test_packing_matches_independent_sequences(self):
+        from transformers import DataCollatorWithFlattening
+
+        torch.manual_seed(120)
+        model = RwkvForCausalLM(tiny_config()).cuda().bfloat16()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        lengths = (4, 1, 7, 3)
+        examples = [{"input_ids": torch.randint(1, model.config.vocab_size, (length,))} for length in lengths]
+        collator = DataCollatorWithFlattening(return_flash_attn_kwargs=True)
+        batch = {
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in collator(examples).items()
+        }
+        sequences = batch["input_ids"].split(lengths, dim=1)
+        parameters = tuple(model.parameters())
+
+        with self.assertRaisesRegex(ValueError, "packing cannot be used with past_key_values"):
+            model(**batch, past_key_values=RwkvCache(model.config))
+
+        for fused in (True, False):
+            with (
+                self.subTest(fused=fused),
+                mock.patch.object(model.model, "_supports_fused_projections", return_value=fused),
+            ):
+                model.train()
+                packed = model(**batch, use_cache=True)
+                self.assertIsNone(packed.past_key_values)
+                separate = [model(ids, labels=ids if ids.shape[1] > 1 else None, use_cache=False) for ids in sequences]
+                reference_logits = torch.cat([item.logits for item in separate], dim=1)
+                torch.testing.assert_close(packed.logits, reference_logits, atol=0, rtol=0)
+                reference_loss = sum(
+                    item.loss * (length - 1) for item, length in zip(separate, lengths, strict=True) if length > 1
+                ) / (sum(lengths) - len(lengths))
+                torch.testing.assert_close(packed.loss, reference_loss)
+                for actual, expected in zip(
+                    torch.autograd.grad(packed.loss, parameters),
+                    torch.autograd.grad(reference_loss, parameters),
+                    strict=True,
+                ):
+                    torch.testing.assert_close(actual.float(), expected.float(), atol=0.01, rtol=0.04)
+                with torch.no_grad():
+                    evaluated = model.eval()(**batch)
+                self.assertIsNone(evaluated.past_key_values)
+                torch.testing.assert_close(evaluated.logits, packed.logits, atol=0, rtol=0)
+
+    @require_accelerate
+    def test_trainer_with_packing(self):
+        from transformers import DataCollatorWithFlattening, Trainer, TrainingArguments
+
+        torch.manual_seed(121)
+        model = RwkvForCausalLM(tiny_config()).cuda().bfloat16()
+        dataset = [{"input_ids": list(range(1, length))} for length in range(4, 10)]
+        with tempfile.TemporaryDirectory() as directory:
+            args = TrainingArguments(
+                output_dir=directory,
+                max_steps=3,
+                per_device_train_batch_size=2,
+                per_device_eval_batch_size=2,
+                activation_checkpointing=True,
+                save_strategy="no",
+                report_to=[],
+                disable_tqdm=True,
+            )
+            trainer = Trainer(
+                model=model,
+                args=args,
+                train_dataset=dataset,
+                eval_dataset=dataset,
+                data_collator=DataCollatorWithFlattening(return_flash_attn_kwargs=True),
+            )
+            self.assertEqual(trainer.train().global_step, 3)
+            self.assertTrue(torch.isfinite(torch.tensor(trainer.evaluate()["eval_loss"])))
+
     def test_right_padding_preserves_loss_and_gradients(self):
         torch.manual_seed(117)
         model = RwkvForCausalLM(tiny_config(pad_token_id=0)).cuda().bfloat16()

@@ -356,11 +356,12 @@ class RwkvAttention(nn.Module):
         attention_shift: torch.Tensor | None,
         wkv_state: torch.Tensor | None,
         use_unfused_projections: bool,
+        cu_seqlens: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         flash_rwkv2 = load_flash_rwkv2()
         hidden_states = hidden_states.contiguous()
         shifts = flash_rwkv2.pretrain_tmix_tokenshift_bf16(
-            hidden_states,
+            hidden_states.squeeze(0) if cu_seqlens is not None else hidden_states,
             self.x_r.to(hidden_states.dtype),
             self.x_w.to(hidden_states.dtype),
             self.x_k.to(hidden_states.dtype),
@@ -368,8 +369,11 @@ class RwkvAttention(nn.Module):
             self.x_a.to(hidden_states.dtype),
             self.x_g.to(hidden_states.dtype),
             initial_shift=attention_shift.contiguous() if attention_shift is not None else None,
+            cu_seqlens=cu_seqlens,
             return_final_state=attention_shift is not None,
         )
+        if cu_seqlens is not None:
+            shifts = tuple(shift.unsqueeze(0) for shift in shifts)
         xr, xw, xk, xv, xa, xg = shifts[:6]
         next_attention_shift = shifts[6] if attention_shift is not None else None
 
@@ -442,20 +446,21 @@ class RwkvAttention(nn.Module):
                 )
             )
 
+        recurrent_inputs = (receptance, decay_logits, key, value, negative_direction, scaled_direction)
+        if cu_seqlens is not None:
+            recurrent_inputs = tuple(t.view(-1, self.num_heads, self.head_size) for t in recurrent_inputs)
         recurrent_output = flash_rwkv2.pretrain_tmix_wkv7_recurrent_bf16(
-            receptance,
-            decay_logits,
-            key,
-            value,
-            negative_direction,
-            scaled_direction,
+            *recurrent_inputs,
             head_size=self.head_size,
             initial_state=wkv_state,
+            cu_seqlens=cu_seqlens,
             return_final_state=wkv_state is not None,
         )
         next_wkv_state = None
         if wkv_state is not None:
             recurrent_output, next_wkv_state = recurrent_output
+        if cu_seqlens is not None:
+            recurrent_output = recurrent_output.view_as(hidden_states)
 
         output = flash_rwkv2.pretrain_tmix_readout_bf16(
             recurrent_output.contiguous(),
@@ -597,9 +602,17 @@ class RwkvAttention(nn.Module):
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
         cache_params: RwkvCache | _RwkvGraphState | None = None,
         use_unfused_projections: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
-            return self._training_forward(hidden_states, v_first, attention_shift, wkv_state, use_unfused_projections)
+            return self._training_forward(
+                hidden_states,
+                v_first,
+                attention_shift,
+                wkv_state,
+                use_unfused_projections,
+                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
+            )
         return self._inference_forward(
             hidden_states,
             residual,
@@ -628,6 +641,7 @@ class RwkvFeedForward(nn.Module):
         hidden_states: torch.Tensor,
         feed_forward_shift: torch.Tensor | None,
         use_unfused_projections: bool,
+        cu_seqlens: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if use_unfused_projections:
             previous = (
@@ -635,6 +649,8 @@ class RwkvFeedForward(nn.Module):
                 if feed_forward_shift is None
                 else torch.cat((feed_forward_shift[:, None], hidden_states[:, :-1]), dim=1)
             )
+            if cu_seqlens is not None:
+                previous = previous.index_fill(1, cu_seqlens[:-1].long(), 0)
             x = hidden_states.float()
             mixed = (x + (previous.float() - x) * self.x_k.float()).to(hidden_states.dtype)
             features = self.key(mixed.to(self.x_k.dtype)).relu().square()
@@ -644,12 +660,14 @@ class RwkvFeedForward(nn.Module):
         flash_rwkv2 = load_flash_rwkv2()
         key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
         value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
+        rows = hidden_states.squeeze(0) if cu_seqlens is not None else hidden_states
         output = flash_rwkv2.pretrain_cmix_bf16(
-            hidden_states.contiguous(),
+            rows.contiguous(),
             self.x_k,
             key_weight,
             value_weight,
             initial_shift=feed_forward_shift.contiguous() if feed_forward_shift is not None else None,
+            cu_seqlens=cu_seqlens,
             return_final_state=feed_forward_shift is not None,
             key_lora_a=key_a,
             key_lora_b=key_b,
@@ -660,6 +678,8 @@ class RwkvFeedForward(nn.Module):
             value_lora_scale=value_scale,
             value_use_nora=value_nora,
         )
+        if cu_seqlens is not None:
+            output = output.unsqueeze(0)
         return output if feed_forward_shift is not None else (output, None)
 
     def _inference_forward(
@@ -707,9 +727,15 @@ class RwkvFeedForward(nn.Module):
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
         use_unfused_projections: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
-            return self._training_forward(hidden_states, feed_forward_shift, use_unfused_projections)
+            return self._training_forward(
+                hidden_states,
+                feed_forward_shift,
+                use_unfused_projections,
+                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
+            )
         return self._inference_forward(hidden_states, residual, layer_norm, feed_forward_shift, inference_metadata)
 
 
@@ -734,6 +760,7 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None,
         cache_params: RwkvCache | _RwkvGraphState | None = None,
         use_unfused_projections: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
             flash_rwkv2 = load_flash_rwkv2()
@@ -748,6 +775,7 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
                 attention_shift,
                 wkv_state,
                 use_unfused_projections=use_unfused_projections,
+                **kwargs,
             )
             hidden_states = hidden_states + attention_output
             feed_forward_output, next_feed_forward_shift = self.mlp(
@@ -759,6 +787,7 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
                 ),
                 feed_forward_shift,
                 use_unfused_projections=use_unfused_projections,
+                **kwargs,
             )
             hidden_states = hidden_states + feed_forward_output
             return hidden_states, v_first, next_attention_shift, next_wkv_state, next_feed_forward_shift
@@ -962,6 +991,11 @@ class RwkvModel(RwkvPreTrainedModel):
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens_q is not None:
+            if past_key_values is not None:
+                raise ValueError("RWKV-7 packing cannot be used with past_key_values.")
+            use_cache = False
         inputs = input_ids if inputs_embeds is None else inputs_embeds
         if not inputs.is_cuda or not self.norm.weight.is_cuda:
             raise RuntimeError("RWKV-7 requires CUDA inputs and model weights.")
@@ -977,7 +1011,7 @@ class RwkvModel(RwkvPreTrainedModel):
         training_path = self.training or torch.is_grad_enabled()
         if use_cache is None:
             use_cache = past_key_values is not None or (not training_path and self.config.use_cache)
-        training_path = training_path or use_unfused_projections
+        training_path = training_path or use_unfused_projections or cu_seq_lens_q is not None
         output_hidden_states = (
             self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         )
@@ -1045,6 +1079,7 @@ class RwkvModel(RwkvPreTrainedModel):
                     feed_forward_shift,
                     None,
                     use_unfused_projections=use_unfused_projections,
+                    cu_seq_lens_q=cu_seq_lens_q,
                 )
                 if cache_params is not None:
                     cache_params.update_layer(
