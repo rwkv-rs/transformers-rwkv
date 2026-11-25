@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 from functools import cache
-from importlib import metadata
 from types import ModuleType
 
 import torch
@@ -29,8 +28,6 @@ def load_flash_rwkv2() -> ModuleType:
     """Load the pinned FlashRWKV2 public API on first use."""
     try:
         import flashrwkv2
-
-        version = metadata.version("FlashRWKV2")
     except ImportError as error:
         raise RuntimeError(
             "RWKV-7 requires the public `flashrwkv2` root API. Install this checkout with its "
@@ -39,9 +36,9 @@ def load_flash_rwkv2() -> ModuleType:
 
     requirement = deps["FlashRWKV2"]
     expected_version = requirement.split("==", maxsplit=1)[1]
-    if version != expected_version:
+    if flashrwkv2.__version__ != expected_version:
         raise RuntimeError(
-            f"RWKV-7 requires {requirement}; installed version={version}, source={flashrwkv2.__file__}."
+            f"RWKV-7 requires {requirement}; installed version={flashrwkv2.__version__}, source={flashrwkv2.__file__}."
         )
     return flashrwkv2
 
