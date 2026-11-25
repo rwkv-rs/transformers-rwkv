@@ -660,7 +660,7 @@ def is_torch_bf16_gpu_available() -> bool:
     import torch
 
     if is_torch_supa_available():
-        return torch.supa.is_bf16_supported()
+        return torch.supa.is_bf16_supported()  # ty: ignore[unresolved-attribute]
     if torch.cuda.is_available():
         return torch.cuda.is_bf16_supported()
     if is_torch_xpu_available():

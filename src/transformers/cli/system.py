@@ -126,7 +126,7 @@ def env(
     if is_torch_available():
         if pt_supa_available:
             info["Using SUPA in script?"] = "<fill in>"
-            info["SUPA type"] = torch.supa.get_device_name()
+            info["SUPA type"] = torch.supa.get_device_name()  # ty: ignore[unresolved-attribute]
             if hasattr(torch.version, "supa"):
                 info["SUPA version"] = torch.version.supa
         elif pt_cuda_available:
