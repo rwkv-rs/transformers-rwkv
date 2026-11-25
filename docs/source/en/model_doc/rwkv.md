@@ -15,52 +15,102 @@ rendered properly in your Markdown viewer.
 -->
 *This model was contributed to Hugging Face Transformers on 2023-05-09.*
 
-# RWKV
+# RWKV-7
 
-## Overview
-
-RWKV-7 is a recurrent language model whose TimeMix layers update a fixed-size matrix state instead of retaining a
-key/value tensor for every earlier token. The implementation follows the canonical RWKV-LM training equations and uses
-the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
-types are not compatible with RWKV-7 checkpoints.
-
-This integration requires CUDA and `FlashRWKV2==0.2.0a1`. Install the RWKV dependencies with:
+RWKV-7 lives in `transformers.models.rwkv`. The model source is
+[`src/transformers/models/rwkv/modeling_rwkv.py`](https://github.com/rwkv-rs/transformers-rwkv/blob/main/src/transformers/models/rwkv/modeling_rwkv.py).
+Import it with `from transformers import RwkvForCausalLM, RwkvConfig, RwkvTokenizer, RwkvCache`.
+`AutoModelForCausalLM` loads converted checkpoints without `trust_remote_code`. Loading an RWKV-4 checkpoint raises an error.
 
 ```bash
 pip install "transformers[rwkv]"
 ```
 
-Training, prefill, and decode use BF16 model tensors and activations with FP32 accumulation. By default, WKV states and
-head logits are FP32. The provider shares projection, normalization, and recurrence arithmetic across these paths.
-Inputs in one batch must have equal length because RWKV-7 does not use a padding token.
-
-The default `wkv_mode="fp32io16"` matches training bitwise. Set `model.config.wkv_mode = "fp16"` before inference
-to use optional FP16 WKV state in both ordinary forward and CUDA Graph generation. This keeps BF16 token IO and
-FP32 arithmetic, but rounds the recurrent state to FP16 after every token; it does not promise bitwise equality with
-the FP32 training trajectory. Training, including StateTune and recurrent training, always keeps FP32 state regardless
-of this inference option. Create a fresh cache when changing state precision or returning from FP16-state inference
-to training. The benchmark exposes the same option as `--wkv-mode fp16`.
+| Transformers | Component | RWKV-LM | FLA / hf_rwkv |
+| --- | --- | --- | --- |
+| `RwkvAttention` | TimeMix and WKV recurrence | `RWKV_Tmix_x070` | `RWKV7Attention` |
+| `RwkvFeedForward` | ChannelMix | `RWKV_CMix_x070` | `RWKV7FeedForward` |
+| `RwkvDecoderLayer` | TimeMix and ChannelMix block | `Block` | `RWKV7Block` |
 
 ## Inference
 
-Converted checkpoints use standard `AutoModelForCausalLM`, `AutoTokenizer`, `generate()`, and [`RwkvCache`] APIs.
-
 ```python
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+checkpoint = "rwkv-rs/rwkv7-g1-st"
+subfolder = "rwkv7-g1l-1.5b-20261031-ctx34304"
+tokenizer = AutoTokenizer.from_pretrained(checkpoint, subfolder=subfolder)
+model = AutoModelForCausalLM.from_pretrained(checkpoint, subfolder=subfolder, dtype=torch.bfloat16).cuda()
+inputs = tokenizer.apply_chat_template(
+    [{"role": "user", "content": "Explain recurrent language models briefly."}],
+    add_generation_prompt=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(model.device)
+outputs = model.generate(**inputs, tokenizer=tokenizer, max_new_tokens=128)
+print(tokenizer.decode(outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))
+```
 
+## Training
 
-checkpoint = "/path/to/converted-rwkv7"
-tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-model = AutoModelForCausalLM.from_pretrained(
-    checkpoint,
-    dtype=torch.bfloat16,
-).cuda().eval()
+RWKV-7 uses CUDA and BF16 activations. A dense batch contains token IDs and labels of shape `[batch, length]`.
+The model uses causal next-token loss.
 
-messages = [{"role": "user", "content": "Explain recurrent language models briefly."}]
-tools = None
-fake_cot_mode = False
+```python
+model.train()
+loss = model(input_ids=input_ids, labels=labels, use_cache=False).loss
+loss.backward()
+```
+
+### Right padding
+
+Dense training supports right padding with stateless batches. Set padded labels to `-100` so they are excluded from the
+loss. For example, set `tokenizer.pad_token = tokenizer.eos_token` and use
+[`DataCollatorForLanguageModeling`] with `mlm=False`. Left padding and padded stateful training are unsupported.
+Use batches of equal-length prompts for inference and generation.
+
+To score the last real token in each right-padded training batch, pass
+`logits_to_keep=(lengths - 1)[:, None]` and read `outputs.logits[:, 0]`.
+A one-dimensional index tensor selects the same positions for every sample.
+
+### PEFT
+
+A typical [PEFT](https://huggingface.co/docs/peft/) configuration targets these projections:
+
+```python
+from peft import LoraConfig, get_peft_model
+
+model = get_peft_model(
+    model,
+    LoraConfig(
+        task_type="CAUSAL_LM",
+        target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value"],
+    ),
+)
+```
+
+| Adapter | Training and ordinary forward | CUDA Graph generation |
+| --- | --- | --- |
+| One active LoRA or NoRA adapter with no dropout or bias | Fused | Supported |
+| One active LoRA or NoRA adapter with dropout | Unfused during training, fused in eval mode | Supported in eval mode |
+| DoRA, LoRA with bias, multiple active adapters, IA3, VeRA, or LoKr | Unfused | Merge into fused-compatible BF16 weights first |
+| QLoRA with bitsandbytes | Unfused | Use a BF16 model with compatible or merged adapters |
+
+The output head is also a valid target. If any projection needs its own module forward, the entire forward uses the
+unfused projection path. FlashRWKV2 still runs TimeMix token shift, WKV recurrence, and readout. NoRA requires the
+Joluck/NoRA PEFT fork and `use_nora=True`.
+
+## Chat and tool generation
+
+The chat template selects `bot` by default or accepts `rwkv_prompt_template="assistant"`. Tool definitions and tool-call
+history select the function-calling format. The default Open Think profile uses `generation_config.json`. Set
+`fake_cot_mode=True` in `apply_chat_template()` for an empty thinking prefix and load the Fake Think generation profile.
+When tools are present, use the tools profile.
+
+```python
+from transformers import GenerationConfig
+
 config_file_name = (
     "tools_generation_config.json"
     if tools
@@ -68,124 +118,13 @@ config_file_name = (
     if fake_cot_mode
     else "generation_config.json"
 )
-generation_config = (
-    model.generation_config
-    if config_file_name == "generation_config.json"
-    else GenerationConfig.from_pretrained(checkpoint, config_file_name=config_file_name)
-)
-inputs = tokenizer.apply_chat_template(
-    messages,
-    tools=tools,
-    add_generation_prompt=True,
-    fake_cot_mode=fake_cot_mode,
-    return_dict=True,
-    return_tensors="pt",
-).to(model.device)
-
-output_ids = model.generate(
-    **inputs,
-    generation_config=generation_config,
-    max_new_tokens=128,
-    tokenizer=tokenizer,
-)
-print(tokenizer.decode(output_ids[0, inputs.input_ids.shape[1] :]))
+generation_config = GenerationConfig.from_pretrained(checkpoint, subfolder=subfolder, config_file_name=config_file_name)
 ```
 
-The bundled Jinja template supports the RWKV bot and assistant prompt styles, tool-use conversations, and open/fake
-thinking prompts through ordinary `apply_chat_template()` keyword arguments. `rwkv_prompt_template` selects `bot`
-(the default), `assistant`, or `function_calling`. The boolean `fake_cot_mode` defaults to `False`, appending `<think`
-to the generation prompt; `True` appends `<think></think`. Tools or tool-call history select the function-calling format.
-The model repository contains three matching generation configurations. `generation_config.json` is the default
-Open Think profile. Fake Think uses
-`fake_think_generation_config.json`. Any request with tools uses `tools_generation_config.json`, which takes precedence
-over the thinking prompt and disables penalties. All three profiles use FlashRWKV2 Rapid-Sampling and contain the stop
-markers for every prompt style.
+## Converting a checkpoint
 
-New conversions save `temp/rwkv_chat_template.jinja` as the checkpoint's `chat_template.jinja`. Existing converted
-checkpoints need that file refreshed to use `fake_cot_mode`; updating this repository does not refresh saved templates.
-The weight publisher reuses existing local artifacts and skips already published checkpoints.
-
-## Stateful execution
-
-Pass the returned `past_key_values` back to the model to continue a stream. [`RwkvCache`] stores two token-shift vectors
-and one WKV matrix per layer: FP32 for training and default inference, or FP16 for `wkv_mode="fp16"` inference.
-It supports clone, detach, reset, batch repeat/select, and beam reorder operations.
-
-For FP16 serving with head size 64 and 40 or 64 heads, FlashRWKV2 can defer writing a single-token update to the
-bound WKV tensor. Eager inference and CUDA Graph replay keep the provider handle across steps. Cache reads
-(`cache.get_recurrent_state(layer_idx)` or `cache.layers[layer_idx].recurrent_states[0]`), raw copies, and beam
-reordering materialize the pending update before exposing or moving the tensor. Read the state again after advancing
-the cache, or clone it to keep a snapshot. CUDA Graph warmup and restore copy the state through the handle.
-
-Budget private state using the provider handle's `memory_layout["private_bytes_per_slot"]` for each layer.
-With FlashRWKV2 0.2.0a1, the D64 layout uses 51,360 bytes per slot at 40 heads. At 64 heads, it uses
-98,560 bytes on a 128-SM RTX 4090 and 82,176 on an RTX PRO 6000. These paths use zero fixed workspace.
-FP32 state, including training and gradient-enabled evaluation, and other FP16 geometries use zero private log bytes.
-
-```python
-from transformers import RwkvCache
-
-
-cache = RwkvCache(model.config)
-first = model(input_ids=inputs.input_ids, past_key_values=cache, use_cache=True)
-continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache, use_cache=True)
-```
-
-Training and gradient-enabled evaluation keep the FP32 WKV state and both token shifts in the autograd graph across
-chunks. Call `cache.detach()` when starting a truncated backpropagation segment.
-
-## Training
-
-Load the complete model in BF16 before training. The dense FlashRWKV2 training operators accept any non-empty sequence length.
-With a cache, they consume each layer's initial shifts and FP32 WKV state and return the final states.
-
-```python
-model.to(device="cuda", dtype=torch.bfloat16).train()
-outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-outputs.loss.backward()
-```
-
-For recurrent training, create one [`RwkvCache`] and pass it through the chunks. The cache update occurs outside each
-checkpointed decoder layer, so gradient checkpointing does not apply the state transition twice.
-
-## LoRA and CUDA Graphs
-
-BF16 inference supports one active PEFT LoRA or NoRA adapter on TimeMix R/K/V/O, ChannelMix key/value, and the
-output head. Disabled and merged adapters are also supported. The provider receives raw adapter parameters and applies
-NoRA normalization on each forward. Merge adapters with multiple active branches, DoRA, other variants, or bias.
-
-Training uses differentiable operators whenever gradients are enabled. Use `model.eval()` with `torch.no_grad()` for
-recurrent inference. CUDA Graph generation does this automatically. Weight transpose views refer to the canonical
-parameters directly; no runtime weight copies or CPU offload are needed. Warm up fixed batch/sequence shapes and their
-[`RwkvCache`] on the capture stream before capture so metadata and state addresses are ready.
-
-Generation runs each distinct prefill chunk length and the one-token decode path on the capture stream before
-capturing their CUDA Graphs. It restores recurrent state, sampling state, and penalties after warmup.
-FlashRWKV2 selects kernel configurations from its packaged profiles. When upgrading, remove `tuning_mode` from
-`generate()` calls and `--tuning-mode` from benchmark commands. Update scripts that read the benchmark JSON to drop
-the `tuning_reports` field. The benchmark reports warmup and capture together in `capture_warmup_time`, separately
-from generation throughput.
-
-## LoRA and NoRA training
-
-BF16 training supports one active PEFT LoRA or NoRA adapter with zero dropout on
-`r_proj`, `k_proj`, `v_proj`, `o_proj`, ChannelMix `key` / `value`, and `lm_head`.
-FlashRWKV2 receives the original adapter parameters and PEFT scaling. For NoRA,
-it computes column normalization and its gradient inside the training kernels;
-PEFT continues to own adapter state, disabling, saving, loading, and merging.
-NoRA requires the Joluck/NoRA PEFT fork (`use_nora=True`); `use_nora="init"`
-retains ordinary LoRA behavior after initialization.
-
-For a different output position in each sample, pass `logits_to_keep` as a
-`LongTensor` of shape `[batch_size, positions]`. RWKV gathers hidden states
-before the vocabulary projection. A 1D tensor continues to select the same
-positions for every sample. For example, right-padded next-token scoring uses
-`logits_to_keep=(lengths - 1)[:, None]` and reads `outputs.logits[:, 0]`.
-
-## Converting a canonical checkpoint
-
-The converter accepts canonical BlinkDL release keys only. It drops block 0's unused value-residual tensors, plans
-Safetensors shards before cloning them, and writes one shard at a time to bound peak host memory.
+Convert canonical BlinkDL release weights to sharded Safetensors. The converter also saves the tokenizer,
+chat template, and generation profiles.
 
 ```bash
 python temp/rwkv_pth2st.py \
@@ -195,8 +134,32 @@ python temp/rwkv_pth2st.py \
   --max-shard-size 5GB
 ```
 
-The output includes the model config, the Open Think, Fake Think, and tools generation configs, sharded Safetensors,
-the fixed RWKV World tokenizer, and the single standard chat template.
+## Stateful execution
+
+Pass the returned `past_key_values` back to continue a stream. [`RwkvCache`] stores two token-shift vectors and one
+WKV matrix per layer. Use `cache.clone()` to branch a stream and `cache.detach()` to start a truncated
+backpropagation segment.
+
+```python
+from transformers import RwkvCache
+
+cache = RwkvCache(model.config)
+model(input_ids=inputs.input_ids, past_key_values=cache)
+continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache)
+```
+
+### WKV state precision
+
+The default `wkv_mode="fp32io16"` keeps the WKV state in FP32 and uses BF16 activations.
+Set `model.config.wkv_mode = "fp16"` to halve WKV state storage for fused inference.
+FP16 inference rounds the state after each token. Differentiable and unfused forwards use FP32 state.
+Create a fresh cache when changing the state precision.
+
+### CUDA Graph generation
+
+`generate()` supports greedy decoding and sampling. It captures one graph for each distinct prefill chunk length and
+one graph for single-token decode. Reusing the same batch shape and generation settings reuses those graphs.
+Set `prefill_chunk_size` to control the prefill capture size.
 
 ## RwkvConfig
 
