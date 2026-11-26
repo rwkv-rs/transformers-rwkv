@@ -54,19 +54,11 @@ class Rwkv7sConfig(PreTrainedConfig):
         Rank of the value-residual projection. Inferred when omitted.
     gate_low_rank_dim (`int`, *optional*):
         Rank of the output-gate projection. Inferred when omitted.
-    use_autodeco (`bool`, *optional*, defaults to `True`):
-        Whether to attach the AutoDeco temperature and top-p predictor on top of the normalized second-to-last layer.
     train_autodeco (`bool`, *optional*, defaults to `False`):
         Whether `Rwkv7sForCausalLM.forward` computes the AutoDeco loss instead of the causal LM loss when `labels` are
         provided.
-    use_deep_embed (`bool`, *optional*, defaults to `True`):
-        Whether to apply `rwkv7a`-style low-rank factored DeepEmbed (`s_emb`, `s1`, `s2`, `s0`) channelwise scaling to
-        each MoE FFN output.
     deep_embed_dim (`int`, *optional*, defaults to 32):
         Low-rank projection dimension `r` for `rwkv7a` DeepEmbed (`s_emb` stores `r * r` values per token).
-    use_rosa (`bool`, *optional*, defaults to `True`):
-        Whether to enable token-level ROSA (`Emb(ROSA(input_ids))`) suffix-automaton retrieval injected into the
-        residual stream after `embedding_norm`.
     """
 
     model_type = "rwkv7s"
@@ -97,11 +89,8 @@ class Rwkv7sConfig(PreTrainedConfig):
     a_low_rank_dim: int | None = None
     v_low_rank_dim: int | None = None
     gate_low_rank_dim: int | None = None
-    use_autodeco: bool = True
     train_autodeco: bool = False
-    use_deep_embed: bool = True
     deep_embed_dim: int = 32
-    use_rosa: bool = True
 
     def __post_init__(self, **kwargs):
         if self.architecture_version != "rwkv7s" or {"attention_hidden_size", "rescale_every"}.intersection(kwargs):
@@ -132,8 +121,6 @@ class Rwkv7sConfig(PreTrainedConfig):
 
         if self.wkv_mode not in ("fp32io16", "fp16"):
             raise ValueError(f"`wkv_mode` must be 'fp32io16' or 'fp16', got {self.wkv_mode!r}.")
-        if self.train_autodeco and not self.use_autodeco:
-            raise ValueError("`train_autodeco=True` requires `use_autodeco=True`.")
         super().__post_init__(**kwargs)
 
 

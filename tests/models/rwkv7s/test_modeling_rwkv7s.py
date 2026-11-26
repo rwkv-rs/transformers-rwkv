@@ -802,7 +802,7 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
                     parameter.normal_(std=0.05)
         ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
 
-        # Forward uses normalized second-to-last layer hidden states and supports toggling off.
+        # Forward uses normalized second-to-last layer hidden states.
         model.eval()
         with torch.no_grad():
             base = model.model(ids, output_hidden_states=True, use_cache=False)
@@ -820,13 +820,6 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
             kept = model(ids, use_cache=False, logits_to_keep=1)
             torch.testing.assert_close(kept.temp_logits, out.temp_logits[:, -1:], atol=0, rtol=0)
             torch.testing.assert_close(kept.top_p_logits, out.top_p_logits[:, -1:], atol=0, rtol=0)
-
-        disabled = Rwkv7sForCausalLM(tiny_config(use_autodeco=False)).to(device="cuda", dtype=torch.bfloat16).eval()
-        self.assertIsNone(disabled.autodeco)
-        with torch.no_grad():
-            self.assertIsNone(disabled(ids, use_cache=False).temp_logits)
-        with self.assertRaisesRegex(ValueError, "requires `config.use_autodeco=True`"):
-            disabled(ids, labels=ids, train_autodeco=True)
 
         # AutoDeco training (with FP32 heads over BF16 backbone) updates only autodeco parameters.
         model.train()

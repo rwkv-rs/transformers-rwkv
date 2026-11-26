@@ -731,7 +731,7 @@ class Rwkv7sExperts(nn.Module):
 
 
 class Rwkv7sFeedForward(nn.Module):
-    """Token-shifted squared-ReLU MoE ChannelMix with optional `rwkv7a` low-rank DeepEmbed channelwise scaling."""
+    """Token-shifted squared-ReLU MoE ChannelMix with `rwkv7a` low-rank DeepEmbed channelwise scaling."""
 
     def __init__(self, config: Rwkv7sConfig, layer_idx: int):
         super().__init__()
@@ -741,14 +741,11 @@ class Rwkv7sFeedForward(nn.Module):
         self.gate = Rwkv7sTopkRouter(config)
         self.experts = Rwkv7sExperts(config)
         self.shared_experts = Rwkv7sMLP(config)
-        if config.use_deep_embed:
-            rank = config.deep_embed_dim
-            self.s_emb = nn.Embedding(config.vocab_size, rank * rank)
-            self.s1 = nn.Parameter(torch.empty(config.hidden_size, rank))
-            self.s2 = nn.Parameter(torch.empty(rank, config.hidden_size))
-            self.s0 = nn.Parameter(torch.ones(config.hidden_size))
-        else:
-            self.s_emb = None
+        rank = config.deep_embed_dim
+        self.s_emb = nn.Embedding(config.vocab_size, rank * rank)
+        self.s1 = nn.Parameter(torch.empty(config.hidden_size, rank))
+        self.s2 = nn.Parameter(torch.empty(rank, config.hidden_size))
+        self.s0 = nn.Parameter(torch.ones(config.hidden_size))
 
     def forward(
         self,
@@ -798,7 +795,7 @@ class Rwkv7sFeedForward(nn.Module):
         output = (self.experts(flat, topk_indices, topk_weights) + self.shared_experts(flat.to(self.x_k.dtype))).to(
             normed.dtype
         )
-        if self.s_emb is not None and input_ids is not None:
+        if input_ids is not None:
             rank = self.config.deep_embed_dim
             x_flat = normed.reshape(-1, normed.shape[-1])
             emb = self.s_emb(input_ids.reshape(-1)).view(-1, rank, rank).to(x_flat.dtype)
@@ -1014,18 +1011,17 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
             init.copy_(module.x_k, (1 - ddd.pow(ratio**4)).to(module.x_k.dtype))
             init.orthogonal_(module.shared_experts.up_proj.weight)
             init.zeros_(module.shared_experts.down_proj.weight)
-            if module.s_emb is not None:
-                init.normal_(module.s_emb.weight, mean=0.0, std=0.02)
-                init.normal_(module.s1, mean=0.0, std=0.02)
-                init.zeros_(module.s2)
-                init.ones_(module.s0)
+            init.normal_(module.s_emb.weight, mean=0.0, std=0.02)
+            init.normal_(module.s1, mean=0.0, std=0.02)
+            init.zeros_(module.s2)
+            init.ones_(module.s0)
         elif isinstance(module, Rwkv7sTopkRouter):
             init.normal_(module.weight, mean=0.0, std=0.02)
             init.zeros_(module.e_score_correction_bias)
         elif isinstance(module, Rwkv7sExperts):
             init.normal_(module.up_proj, mean=0.0, std=0.02)
             init.normal_(module.down_proj, mean=0.0, std=0.02)
-        elif isinstance(module, Rwkv7sModel) and module.rosa_gate is not None:
+        elif isinstance(module, Rwkv7sModel):
             init.zeros_(module.rosa_gate)
         elif isinstance(module, nn.LayerNorm):
             init.ones_(module.weight)
@@ -1038,12 +1034,8 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embedding_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        if config.use_rosa:
-            self.rosa_embed = nn.Embedding(config.vocab_size + 1, config.hidden_size, padding_idx=config.vocab_size)
-            self.rosa_gate = nn.Parameter(torch.zeros(config.hidden_size))
-        else:
-            self.rosa_embed = None
-            self.rosa_gate = None
+        self.rosa_embed = nn.Embedding(config.vocab_size + 1, config.hidden_size, padding_idx=config.vocab_size)
+        self.rosa_gate = nn.Parameter(torch.zeros(config.hidden_size))
         self.layers = nn.ModuleList(
             [Rwkv7sDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1087,7 +1079,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
             self.embedding_norm.bias,
             eps=self.config.layer_norm_epsilon,
         )
-        if self.rosa_embed is not None and rosa_ids is not None:
+        if rosa_ids is not None:
             rosa_tokens = torch.where(rosa_ids < 0, self.config.vocab_size, rosa_ids).reshape(-1)
             hidden_states = hidden_states + (self.rosa_embed(rosa_tokens) * self.rosa_gate).to(hidden_states.dtype)
         residual = torch.zeros_like(hidden_states)
@@ -1183,7 +1175,6 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         output_hidden_states = (
             self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         )
-        return_autodeco_hidden = self.config.use_autodeco
         _ = position_ids
 
         batch_size, sequence_length = inputs.shape[:2]
@@ -1216,15 +1207,14 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         if cache is None and (use_cache or not training_path):
             cache = Rwkv7sCache(self.config)
 
-        if self.rosa_embed is not None:
-            if rosa_ids is not None:
-                rosa_ids = rosa_ids.to(device=inputs.device)
-            elif input_ids is not None:
-                rosa_ids = (
-                    cache.step_rosa(input_ids)
-                    if cache is not None
-                    else compute_rwkv7s_rosa_ids(input_ids, cu_seqlens=cu_seq_lens_q)
-                )
+        if rosa_ids is not None:
+            rosa_ids = rosa_ids.to(device=inputs.device)
+        elif input_ids is not None:
+            rosa_ids = (
+                cache.step_rosa(input_ids)
+                if cache is not None
+                else compute_rwkv7s_rosa_ids(input_ids, cu_seqlens=cu_seq_lens_q)
+            )
 
         flash_rwkv2 = load_flash_rwkv2()
         autodeco_hidden = None
@@ -1237,7 +1227,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 self.embedding_norm.bias.to(torch.bfloat16),
                 eps=self.config.layer_norm_epsilon,
             )
-            if self.rosa_embed is not None and rosa_ids is not None:
+            if rosa_ids is not None:
                 rosa_tokens = torch.where(rosa_ids < 0, self.config.vocab_size, rosa_ids)
                 hidden_states = hidden_states + (self.rosa_embed(rosa_tokens) * self.rosa_gate).to(hidden_states.dtype)
             all_hidden_states = () if output_hidden_states else None
@@ -1272,7 +1262,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                         next_feed_forward_shift,
                         training=True,
                     )
-                if return_autodeco_hidden and layer_idx == second_last_idx:
+                if layer_idx == second_last_idx:
                     prev_hidden_states = hidden_states
 
                 if output_hidden_states:
@@ -1286,23 +1276,22 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 self.norm.bias.to(hidden_states.dtype),
                 eps=self.config.layer_norm_epsilon,
             )
-            if return_autodeco_hidden:
-                if prev_hidden_states is not None:
-                    autodeco_hidden = flash_rwkv2.infer_embedding_ln0_forward_varlen(
-                        prev_hidden_states,
-                        self.norm.weight.to(prev_hidden_states.dtype),
-                        self.norm.bias.to(prev_hidden_states.dtype),
-                        eps=self.config.layer_norm_epsilon,
-                    )
-                else:
-                    autodeco_hidden = hidden_states
+            if prev_hidden_states is not None:
+                autodeco_hidden = flash_rwkv2.infer_embedding_ln0_forward_varlen(
+                    prev_hidden_states,
+                    self.norm.weight.to(prev_hidden_states.dtype),
+                    self.norm.bias.to(prev_hidden_states.dtype),
+                    eps=self.config.layer_norm_epsilon,
+                )
+            else:
+                autodeco_hidden = hidden_states
         else:
             hidden_states, residual, all_hidden_states, autodeco_hidden = self._forward_state_only(
                 input_ids,
                 inputs_embeds,
                 cache,
                 output_hidden_states,
-                return_autodeco_hidden=return_autodeco_hidden,
+                return_autodeco_hidden=True,
                 rosa_ids=rosa_ids,
             )
             hidden_states = flash_rwkv2.infer_post_norm_output_forward_varlen(
@@ -1312,12 +1301,9 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 self.norm.bias,
                 eps=self.config.layer_norm_epsilon,
             ).view(batch_size, sequence_length, -1)
-            if return_autodeco_hidden:
-                autodeco_hidden = (
-                    autodeco_hidden.view(batch_size, sequence_length, -1)
-                    if autodeco_hidden is not None
-                    else hidden_states
-                )
+            autodeco_hidden = (
+                autodeco_hidden.view(batch_size, sequence_length, -1) if autodeco_hidden is not None else hidden_states
+            )
         if output_hidden_states:
             all_hidden_states = all_hidden_states[:-1] + (hidden_states,)
 
@@ -1338,11 +1324,11 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
         self.generation_config.presence_penalty = 0.0
         self.generation_config.frequency_penalty = 0.0
         self.generation_config.penalty_decay = 0.996
-        self.generation_config.use_autodeco = config.use_autodeco
+        self.generation_config.use_autodeco = True
         self.model = Rwkv7sModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.autodeco = Rwkv7sAutoDeco(config.hidden_size) if config.use_autodeco else None
+        self.autodeco = Rwkv7sAutoDeco(config.hidden_size)
         self.post_init()
 
     def _autodeco_loss(
@@ -1414,8 +1400,6 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
         """
         if train_autodeco is None:
             train_autodeco = self.config.train_autodeco
-        if train_autodeco and self.autodeco is None:
-            raise ValueError("`train_autodeco=True` requires `config.use_autodeco=True`.")
 
         head_spec = flash_rwkv2_linear_spec(self.lm_head)
         use_unfused_projections = head_spec is None or not self.model._supports_fused_projections()
@@ -1445,12 +1429,10 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
                     selected.contiguous(), weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
                 )
 
-        temp_logits = top_p_logits = None
-        if self.autodeco is not None:
-            autodeco_hidden = slice_logits_to_keep(outputs.autodeco_hidden_state, logits_to_keep)
-            if unsqueeze_scalar:
-                autodeco_hidden = autodeco_hidden.unsqueeze(1)
-            temp_logits, top_p_logits = self.autodeco(autodeco_hidden, logits)
+        autodeco_hidden = slice_logits_to_keep(outputs.autodeco_hidden_state, logits_to_keep)
+        if unsqueeze_scalar:
+            autodeco_hidden = autodeco_hidden.unsqueeze(1)
+        temp_logits, top_p_logits = self.autodeco(autodeco_hidden, logits)
 
         loss = None
         if labels is not None:

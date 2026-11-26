@@ -182,17 +182,16 @@ Set `prefill_chunk_size` to control the prefill capture size.
 
 ### AutoDeco dynamic decoding parameters
 
-`Rwkv7sConfig` enables AutoDeco by default (`use_autodeco=True`). `Rwkv7sForCausalLM` attaches [`Rwkv7sAutoDeco`] on
-top of the normalized second-to-last decoder layer (`model.norm(layers[-2])`). During `generate(..., do_sample=True)`
-with `use_autodeco=True`, per-token `temperature` and `top_p` tensors are predicted inside the CUDA Graph decode step
-and passed directly to FlashRWKV2 sampling. Set `train_autodeco=True` to freeze the backbone forward and train the
-AutoDeco heads.
+`Rwkv7sForCausalLM` attaches [`Rwkv7sAutoDeco`] on top of the normalized second-to-last decoder layer
+(`model.norm(layers[-2])`). During `generate(..., do_sample=True)` with `use_autodeco=True` (default), per-token
+`temperature` and `top_p` tensors are predicted inside the CUDA Graph decode step and passed directly to FlashRWKV2
+sampling. Set `train_autodeco=True` to freeze the backbone forward and train the AutoDeco heads.
 
 ### DeepEmbed and token-level ROSA
 
-`Rwkv7sConfig` enables `rwkv7a`-style low-rank DeepEmbed (`use_deep_embed=True`, `deep_embed_dim=32`) and token-level
-ROSA (`use_rosa=True`) by default. Both are identity-initialized (`s2=0, s0=1` and `rosa_gate=0`) for post-training.
-During training, DataLoader CPU workers can precompute `rosa_ids = compute_rwkv7s_rosa_ids(input_ids, cu_seqlens)`
+RWKV-7S includes `rwkv7a`-style low-rank DeepEmbed (`deep_embed_dim=32`) on each MoE FFN and token-level ROSA injected
+after `embedding_norm`. Both are identity-initialized (`s2=0, s0=1` and `rosa_gate=0`) for post-training. During
+training, DataLoader CPU workers can precompute `rosa_ids = compute_rwkv7s_rosa_ids(input_ids, cu_seqlens)`
 asynchronously and pass `rosa_ids` into `forward()`. During inference and CUDA Graph `generate()`, online suffix
 automatons advance in O(1) amortized time per decode token on CPU using pinned staging buffers.
 

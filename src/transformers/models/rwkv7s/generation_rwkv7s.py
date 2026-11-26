@@ -290,11 +290,7 @@ class _Rwkv7sPrefillGraph:
     ) -> None:
         device = model.embed_tokens.weight.device
         self.input_ids = torch.zeros((batch_size, sequence_length), dtype=torch.long, device=device)
-        self.rosa_ids = (
-            torch.full((batch_size, sequence_length), -1, dtype=torch.long, device=device)
-            if model.config.use_rosa
-            else None
-        )
+        self.rosa_ids = torch.full((batch_size, sequence_length), -1, dtype=torch.long, device=device)
         self.graph = torch.cuda.CUDAGraph()
         snapshot = state.clone()
         generation_stream = torch.cuda.current_stream(device)
@@ -312,10 +308,9 @@ class _Rwkv7sPrefillGraph:
             state.copy_(snapshot)
         generation_stream.wait_stream(capture_stream)
 
-    def replay(self, input_ids: torch.LongTensor, rosa_ids: torch.LongTensor | None = None) -> None:
+    def replay(self, input_ids: torch.LongTensor, rosa_ids: torch.LongTensor) -> None:
         self.input_ids.copy_(input_ids)
-        if self.rosa_ids is not None:
-            self.rosa_ids.copy_(rosa_ids, non_blocking=True)
+        self.rosa_ids.copy_(rosa_ids, non_blocking=True)
         self.graph.replay()
 
 
@@ -351,12 +346,9 @@ class _Rwkv7sDecodeGraph:
         self.flash_rwkv2 = flash_rwkv2
         self.stop_string_criteria = tuple(copy.copy(criteria) for criteria in stop_string_criteria)
         self.input_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-        if model.config.use_rosa:
-            self.rosa_ids = torch.full((batch_size, 1), -1, dtype=torch.long, device=device)
-            self._rosa_token_cpu = torch.empty(batch_size, dtype=torch.long, pin_memory=True)
-            self._rosa_next_cpu = torch.empty((batch_size, 1), dtype=torch.long, pin_memory=True)
-        else:
-            self.rosa_ids = None
+        self.rosa_ids = torch.full((batch_size, 1), -1, dtype=torch.long, device=device)
+        self._rosa_token_cpu = torch.empty(batch_size, dtype=torch.long, pin_memory=True)
+        self._rosa_next_cpu = torch.empty((batch_size, 1), dtype=torch.long, pin_memory=True)
         self.completion = torch.empty((batch_size, max_new_tokens), dtype=torch.long, device=device)
         self.completion_index = torch.zeros(1, dtype=torch.long, device=device)
         self.completion_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -402,8 +394,7 @@ class _Rwkv7sDecodeGraph:
             self.sampling_states.copy_(sampling_snapshot)
             self.penalties.zero_()
         self.input_ids.zero_()
-        if self.rosa_ids is not None:
-            self.rosa_ids.fill_(-1)
+        self.rosa_ids.fill_(-1)
         self.completion.fill_(self.pad_token_id)
         self.completion_index.zero_()
         self.completion_lengths.zero_()
@@ -553,7 +544,6 @@ class _Rwkv7sGenerationModelRunner:
         stop_string_criteria: tuple[StopStringCriteria, ...],
     ) -> None:
         batch_size, prompt_length = input_ids.shape
-        self.use_rosa = model.config.use_rosa
         self.prefill_lengths = _rwkv7s_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
         max_new_tokens = max_length - prompt_length
         flash_rwkv2 = load_flash_rwkv2()
@@ -600,16 +590,13 @@ class _Rwkv7sGenerationModelRunner:
         self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None
     ) -> torch.LongTensor:
         self.decode_graph.prepare(input_ids, seed)
-        rosa_states = None
-        prompt_rosa_ids = None
-        if self.use_rosa:
-            rosa_states = [_Rwkv7sRosa() for _ in range(input_ids.shape[0])]
-            prompt_rosa_ids = torch.tensor(
-                [state.extend(row) for state, row in zip(rosa_states, input_ids.detach().cpu().tolist(), strict=True)],
-                dtype=torch.long,
-                pin_memory=True,
-            )
-            self.decode_graph.rosa_ids.copy_(prompt_rosa_ids[:, -1:], non_blocking=True)
+        rosa_states = [_Rwkv7sRosa() for _ in range(input_ids.shape[0])]
+        prompt_rosa_ids = torch.tensor(
+            [state.extend(row) for state, row in zip(rosa_states, input_ids.detach().cpu().tolist(), strict=True)],
+            dtype=torch.long,
+            pin_memory=True,
+        )
+        self.decode_graph.rosa_ids.copy_(prompt_rosa_ids[:, -1:], non_blocking=True)
         generation_stream = torch.cuda.current_stream(input_ids.device)
         async_streamer = (
             None
@@ -627,8 +614,10 @@ class _Rwkv7sGenerationModelRunner:
         start_event.record(generation_stream)
         offset = 0
         for sequence_length in self.prefill_lengths:
-            chunk_rosa = None if prompt_rosa_ids is None else prompt_rosa_ids[:, offset : offset + sequence_length]
-            self.prefill_graphs[sequence_length].replay(input_ids[:, offset : offset + sequence_length], chunk_rosa)
+            self.prefill_graphs[sequence_length].replay(
+                input_ids[:, offset : offset + sequence_length],
+                prompt_rosa_ids[:, offset : offset + sequence_length],
+            )
             offset += sequence_length
 
         produced_tokens = 0
@@ -644,7 +633,7 @@ class _Rwkv7sGenerationModelRunner:
             produced_tokens += 1
             if synchronize_stopping and not bool(self.decode_graph.unfinished.any().item()):
                 break
-            if rosa_states is not None and step + 1 < self.decode_graph.max_new_tokens:
+            if step + 1 < self.decode_graph.max_new_tokens:
                 self.decode_graph.step_rosa(rosa_states)
         end_event.record(generation_stream)
         self.last_generation_events = start_event, first_token_event, end_event
@@ -705,7 +694,7 @@ class Rwkv7sGenerationMixin(GenerationMixin):
         self.generation_config.presence_penalty = getattr(self.generation_config, "presence_penalty", 0.0)
         self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
-        self.generation_config.use_autodeco = getattr(self.generation_config, "use_autodeco", self.config.use_autodeco)
+        self.generation_config.use_autodeco = getattr(self.generation_config, "use_autodeco", True)
 
     def _validate_generation_mode(self, generation_mode, generation_config, generation_mode_kwargs):
         super()._validate_generation_mode(generation_mode, generation_config, generation_mode_kwargs)
@@ -788,13 +777,7 @@ class Rwkv7sGenerationMixin(GenerationMixin):
             raise ValueError(
                 f"RWKV-7S CUDA graph generation does not support model kwargs {sorted(unsupported_kwargs)}."
             )
-        use_autodeco = generation_config.do_sample and bool(
-            getattr(generation_config, "use_autodeco", self.config.use_autodeco)
-        )
-        if use_autodeco and not self.config.use_autodeco:
-            raise ValueError(
-                "RWKV-7S `use_autodeco=True` generation requires a model with `config.use_autodeco=True`."
-            )
+        use_autodeco = generation_config.do_sample and bool(getattr(generation_config, "use_autodeco", True))
         if generation_config.prefill_chunk_size is not None and generation_config.prefill_chunk_size <= 0:
             raise ValueError("`prefill_chunk_size` must be a positive integer.")
         supported_criteria = (MaxLengthCriteria, EosTokenCriteria, StopStringCriteria)
