@@ -59,6 +59,14 @@ class Rwkv7sConfig(PreTrainedConfig):
     train_autodeco (`bool`, *optional*, defaults to `False`):
         Whether `Rwkv7sForCausalLM.forward` computes the AutoDeco loss instead of the causal LM loss when `labels` are
         provided.
+    use_deep_embed (`bool`, *optional*, defaults to `True`):
+        Whether to apply `rwkv7a`-style low-rank factored DeepEmbed (`s_emb`, `s1`, `s2`, `s0`) channelwise scaling to
+        each MoE FFN output.
+    deep_embed_dim (`int`, *optional*, defaults to 32):
+        Low-rank projection dimension `r` for `rwkv7a` DeepEmbed (`s_emb` stores `r * r` values per token).
+    use_rosa (`bool`, *optional*, defaults to `True`):
+        Whether to enable token-level ROSA (`Emb(ROSA(input_ids))`) suffix-automaton retrieval injected into the
+        residual stream after `embedding_norm`.
     """
 
     model_type = "rwkv7s"
@@ -91,12 +99,17 @@ class Rwkv7sConfig(PreTrainedConfig):
     gate_low_rank_dim: int | None = None
     use_autodeco: bool = True
     train_autodeco: bool = False
+    use_deep_embed: bool = True
+    deep_embed_dim: int = 32
+    use_rosa: bool = True
 
     def __post_init__(self, **kwargs):
         if self.architecture_version != "rwkv7s" or {"attention_hidden_size", "rescale_every"}.intersection(kwargs):
             raise ValueError("This `rwkv7s` implementation requires an RWKV-7S checkpoint.")
         if self.num_experts < 1 or not 1 <= self.num_experts_per_tok <= self.num_experts:
             raise ValueError("`num_experts_per_tok` must satisfy 1 <= num_experts_per_tok <= num_experts.")
+        if self.deep_embed_dim <= 0:
+            raise ValueError("`deep_embed_dim` must be positive.")
         if self.moe_intermediate_size is None:
             self.moe_intermediate_size = self.hidden_size
         if self.shared_expert_intermediate_size is None:

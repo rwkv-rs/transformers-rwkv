@@ -39,6 +39,8 @@ from .generation_rwkv7s import (
     _recurrent_forward,
     _recurrent_metadata,
     _Rwkv7sGraphState,
+    _Rwkv7sRosa,
+    compute_rwkv7s_rosa_ids,
 )
 
 
@@ -81,6 +83,14 @@ class Rwkv7sCache(Cache):
         self._seen_tokens = 0
         self._stream_lengths: torch.Tensor | None = None
         self._inference_metadata: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, object]] = {}
+        self._rosa_states: list[_Rwkv7sRosa] | None = None
+
+    def step_rosa(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._rosa_states is None:
+            self._rosa_states = [_Rwkv7sRosa() for _ in range(input_ids.shape[0])]
+        rows = input_ids.detach().cpu().tolist()
+        matched = [state.extend(row) for state, row in zip(self._rosa_states, rows, strict=True)]
+        return torch.tensor(matched, dtype=torch.long, device=input_ids.device)
 
     @property
     def is_compileable(self) -> bool:
@@ -227,6 +237,8 @@ class Rwkv7sCache(Cache):
         if self._stream_lengths is not None:
             stream_lengths = self._stream_lengths.detach() if detach else self._stream_lengths
             copied._stream_lengths = stream_lengths.clone()
+        if self._rosa_states is not None:
+            copied._rosa_states = [state.clone() for state in self._rosa_states]
         for source, target in zip(self.layers, copied.layers, strict=True):
             target.device = source.device
             target.dtype = source.dtype
@@ -263,6 +275,9 @@ class Rwkv7sCache(Cache):
                     layer.has_previous_state[state_idx] = False
             if self._stream_lengths is not None:
                 self._stream_lengths.zero_()
+            if self._rosa_states is not None:
+                for state in self._rosa_states:
+                    state.reset()
             self._seen_tokens = 0
         else:
             for layer in self.layers:
@@ -279,6 +294,9 @@ class Rwkv7sCache(Cache):
             if self._stream_lengths is not None:
                 self._stream_lengths.index_fill_(0, batch_indices.to(self._stream_lengths.device), 0)
                 self._seen_tokens = int(self._stream_lengths.max().item())
+            if self._rosa_states is not None:
+                for idx in batch_indices.tolist():
+                    self._rosa_states[idx].reset()
         self._inference_metadata.clear()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
@@ -290,6 +308,8 @@ class Rwkv7sCache(Cache):
                         getattr(layer, states_name)[state_idx] = state.repeat_interleave(repeats, dim=0)
         if self._stream_lengths is not None:
             self._stream_lengths = self._stream_lengths.repeat_interleave(repeats, dim=0)
+        if self._rosa_states is not None:
+            self._rosa_states = [state.clone() for state in self._rosa_states for _ in range(repeats)]
         self._inference_metadata.clear()
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
@@ -302,6 +322,8 @@ class Rwkv7sCache(Cache):
         if self._stream_lengths is not None:
             self._stream_lengths = self._stream_lengths.index_select(0, indices.to(self._stream_lengths.device))
             self._seen_tokens = int(self._stream_lengths.max().item())
+        if self._rosa_states is not None:
+            self._rosa_states = [self._rosa_states[idx].clone() for idx in indices.tolist()]
         self._inference_metadata.clear()
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
@@ -709,7 +731,7 @@ class Rwkv7sExperts(nn.Module):
 
 
 class Rwkv7sFeedForward(nn.Module):
-    """Token-shifted squared-ReLU MoE ChannelMix (`x_k` shift + sigmoid router + routed and shared `relu2` experts)."""
+    """Token-shifted squared-ReLU MoE ChannelMix with optional `rwkv7a` low-rank DeepEmbed channelwise scaling."""
 
     def __init__(self, config: Rwkv7sConfig, layer_idx: int):
         super().__init__()
@@ -719,6 +741,14 @@ class Rwkv7sFeedForward(nn.Module):
         self.gate = Rwkv7sTopkRouter(config)
         self.experts = Rwkv7sExperts(config)
         self.shared_experts = Rwkv7sMLP(config)
+        if config.use_deep_embed:
+            rank = config.deep_embed_dim
+            self.s_emb = nn.Embedding(config.vocab_size, rank * rank)
+            self.s1 = nn.Parameter(torch.empty(config.hidden_size, rank))
+            self.s2 = nn.Parameter(torch.empty(rank, config.hidden_size))
+            self.s0 = nn.Parameter(torch.ones(config.hidden_size))
+        else:
+            self.s_emb = None
 
     def forward(
         self,
@@ -727,6 +757,7 @@ class Rwkv7sFeedForward(nn.Module):
         residual: torch.Tensor | None = None,
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
+        input_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
@@ -767,6 +798,12 @@ class Rwkv7sFeedForward(nn.Module):
         output = (self.experts(flat, topk_indices, topk_weights) + self.shared_experts(flat.to(self.x_k.dtype))).to(
             normed.dtype
         )
+        if self.s_emb is not None and input_ids is not None:
+            rank = self.config.deep_embed_dim
+            x_flat = normed.reshape(-1, normed.shape[-1])
+            emb = self.s_emb(input_ids.reshape(-1)).view(-1, rank, rank).to(x_flat.dtype)
+            ss = torch.bmm((x_flat @ self.s1.to(x_flat.dtype)).unsqueeze(1), emb).squeeze(1)
+            output = output * ((ss @ self.s2.to(x_flat.dtype)) + self.s0.to(x_flat.dtype))
         return output.view_as(hidden_states), state_out
 
 
@@ -792,6 +829,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None,
         cache: Rwkv7sCache | _Rwkv7sGraphState | None = None,
         use_unfused_projections: bool = False,
+        input_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
@@ -818,6 +856,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
                     eps=self.post_attention_layernorm.eps,
                 ),
                 feed_forward_shift,
+                input_ids=input_ids,
                 **kwargs,
             )
             hidden_states = hidden_states + feed_forward_output
@@ -839,6 +878,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
             residual=attention_output,
             layer_norm=self.post_attention_layernorm,
             inference_metadata=inference_metadata,
+            input_ids=input_ids,
         )
         return hidden_states, residual, v_first, None, None
 
@@ -913,6 +953,8 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
         super()._init_weights(module)
         if isinstance(module, nn.Embedding):
             init.uniform_(module.weight, -1e-4, 1e-4)
+            if module.padding_idx is not None:
+                init.zeros_(module.weight[module.padding_idx])
         elif hasattr(self, "lm_head") and module is self.lm_head:
             gain = (
                 0.5 * math.sqrt(self.config.vocab_size / self.config.hidden_size)
@@ -972,12 +1014,19 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
             init.copy_(module.x_k, (1 - ddd.pow(ratio**4)).to(module.x_k.dtype))
             init.orthogonal_(module.shared_experts.up_proj.weight)
             init.zeros_(module.shared_experts.down_proj.weight)
+            if module.s_emb is not None:
+                init.normal_(module.s_emb.weight, mean=0.0, std=0.02)
+                init.normal_(module.s1, mean=0.0, std=0.02)
+                init.zeros_(module.s2)
+                init.ones_(module.s0)
         elif isinstance(module, Rwkv7sTopkRouter):
             init.normal_(module.weight, mean=0.0, std=0.02)
             init.zeros_(module.e_score_correction_bias)
         elif isinstance(module, Rwkv7sExperts):
             init.normal_(module.up_proj, mean=0.0, std=0.02)
             init.normal_(module.down_proj, mean=0.0, std=0.02)
+        elif isinstance(module, Rwkv7sModel) and module.rosa_gate is not None:
+            init.zeros_(module.rosa_gate)
         elif isinstance(module, nn.LayerNorm):
             init.ones_(module.weight)
             init.zeros_(module.bias)
@@ -989,6 +1038,12 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embedding_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        if config.use_rosa:
+            self.rosa_embed = nn.Embedding(config.vocab_size + 1, config.hidden_size, padding_idx=config.vocab_size)
+            self.rosa_gate = nn.Parameter(torch.zeros(config.hidden_size))
+        else:
+            self.rosa_embed = None
+            self.rosa_gate = None
         self.layers = nn.ModuleList(
             [Rwkv7sDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1015,6 +1070,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         cache: Rwkv7sCache | _Rwkv7sGraphState,
         output_hidden_states: bool,
         return_autodeco_hidden: bool = False,
+        rosa_ids: torch.LongTensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...] | None, torch.Tensor | None]:
         if inputs_embeds is None:
             batch_size, sequence_length = input_ids.shape
@@ -1031,6 +1087,9 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
             self.embedding_norm.bias,
             eps=self.config.layer_norm_epsilon,
         )
+        if self.rosa_embed is not None and rosa_ids is not None:
+            rosa_tokens = torch.where(rosa_ids < 0, self.config.vocab_size, rosa_ids).reshape(-1)
+            hidden_states = hidden_states + (self.rosa_embed(rosa_tokens) * self.rosa_gate).to(hidden_states.dtype)
         residual = torch.zeros_like(hidden_states)
         inference_metadata = cache.recurrent_metadata(flash_rwkv2, batch_size, sequence_length, hidden_states.device)
 
@@ -1058,6 +1117,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 feed_forward_shift,
                 inference_metadata,
                 cache,
+                input_ids=input_ids,
             )
             if isinstance(cache, Rwkv7sCache):
                 cache.mark_layer_updated(layer_idx)
@@ -1088,8 +1148,14 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         cache: Cache | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
+        rosa_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Rwkv7sModelOutputWithPast:
+        r"""
+        rosa_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Precomputed token-level ROSA successor IDs (`-1` when unmatched), e.g. produced asynchronously by CPU
+            DataLoader workers via `compute_rwkv7s_rosa_ids`. Computed automatically from `input_ids` when omitted.
+        """
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
@@ -1150,6 +1216,16 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         if cache is None and (use_cache or not training_path):
             cache = Rwkv7sCache(self.config)
 
+        if self.rosa_embed is not None:
+            if rosa_ids is not None:
+                rosa_ids = rosa_ids.to(device=inputs.device)
+            elif input_ids is not None:
+                rosa_ids = (
+                    cache.step_rosa(input_ids)
+                    if cache is not None
+                    else compute_rwkv7s_rosa_ids(input_ids, cu_seqlens=cu_seq_lens_q)
+                )
+
         flash_rwkv2 = load_flash_rwkv2()
         autodeco_hidden = None
         if training_path:
@@ -1161,6 +1237,9 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 self.embedding_norm.bias.to(torch.bfloat16),
                 eps=self.config.layer_norm_epsilon,
             )
+            if self.rosa_embed is not None and rosa_ids is not None:
+                rosa_tokens = torch.where(rosa_ids < 0, self.config.vocab_size, rosa_ids)
+                hidden_states = hidden_states + (self.rosa_embed(rosa_tokens) * self.rosa_gate).to(hidden_states.dtype)
             all_hidden_states = () if output_hidden_states else None
             if output_hidden_states:
                 all_hidden_states += (hidden_states.view(batch_size, sequence_length, -1),)
@@ -1182,6 +1261,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                     feed_forward_shift,
                     None,
                     use_unfused_projections=use_unfused_projections,
+                    input_ids=input_ids,
                     cu_seq_lens_q=cu_seq_lens_q,
                 )
                 if cache is not None:
@@ -1223,6 +1303,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 cache,
                 output_hidden_states,
                 return_autodeco_hidden=return_autodeco_hidden,
+                rosa_ids=rosa_ids,
             )
             hidden_states = flash_rwkv2.infer_post_norm_output_forward_varlen(
                 hidden_states,
@@ -1321,12 +1402,15 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         train_autodeco: bool | None = None,
+        rosa_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Rwkv7sCausalLMOutputWithPast:
         r"""
         train_autodeco (`bool`, *optional*):
             When `True`, runs the backbone and LM head without gradients and computes the AutoDeco loss when `labels`
             are provided. Defaults to `config.train_autodeco`.
+        rosa_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Precomputed token-level ROSA successor IDs (`-1` when unmatched). Computed automatically when omitted.
         """
         if train_autodeco is None:
             train_autodeco = self.config.train_autodeco
@@ -1343,6 +1427,7 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
                 cache=cache,
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
+                rosa_ids=rosa_ids,
                 _use_unfused_projections=use_unfused_projections,
                 **kwargs,
             )
@@ -1398,4 +1483,5 @@ __all__ = [
     "Rwkv7sModelOutputWithPast",
     "Rwkv7sPreTrainedModel",
     "Rwkv7sTopkRouter",
+    "compute_rwkv7s_rosa_ids",
 ]

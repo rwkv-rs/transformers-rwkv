@@ -188,6 +188,14 @@ with `use_autodeco=True`, per-token `temperature` and `top_p` tensors are predic
 and passed directly to FlashRWKV2 sampling. Set `train_autodeco=True` to freeze the backbone forward and train the
 AutoDeco heads.
 
+### DeepEmbed and token-level ROSA
+
+`Rwkv7sConfig` enables `rwkv7a`-style low-rank DeepEmbed (`use_deep_embed=True`, `deep_embed_dim=32`) and token-level
+ROSA (`use_rosa=True`) by default. Both are identity-initialized (`s2=0, s0=1` and `rosa_gate=0`) for post-training.
+During training, DataLoader CPU workers can precompute `rosa_ids = compute_rwkv7s_rosa_ids(input_ids, cu_seqlens)`
+asynchronously and pass `rosa_ids` into `forward()`. During inference and CUDA Graph `generate()`, online suffix
+automatons advance in O(1) amortized time per decode token on CPU using pinned staging buffers.
+
 ## Rwkv7sConfig
 
 [[autodoc]] Rwkv7sConfig
@@ -245,3 +253,7 @@ AutoDeco heads.
 ## Rwkv7sPreTrainedModel
 
 [[autodoc]] Rwkv7sPreTrainedModel
+
+## compute_rwkv7s_rosa_ids
+
+[[autodoc]] compute_rwkv7s_rosa_ids

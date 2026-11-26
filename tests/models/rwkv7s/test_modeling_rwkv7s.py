@@ -923,6 +923,56 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
         self.assertEqual(set(indices.flatten().tolist()), {0, 2})
         torch.testing.assert_close(weights.sum(dim=-1), torch.ones(4, device="cuda"), atol=1e-5, rtol=0)
 
+    def test_deep_embed_and_token_rosa_exactness_and_async_precompute(self):
+        from transformers.models.rwkv7s.modeling_rwkv7s import compute_rwkv7s_rosa_ids
+
+        # Exact longest-suffix most-recent match verification (including packed sequence boundaries).
+        seq = torch.tensor([[1, 2, 3, 1, 2, 4, 1, 2]], dtype=torch.long)
+        # pos 0(1):-1, 1(2):-1, 2(3):-1, 3(1)->2, 4(2)->3, 5(4):-1, 6(1)->2 (recent), 7(2)->4 (len-2 suffix [1,2] recent)
+        expected_rosa = torch.tensor([[-1, -1, -1, 2, 3, -1, 2, 4]], dtype=torch.long)
+        torch.testing.assert_close(compute_rwkv7s_rosa_ids(seq), expected_rosa, atol=0, rtol=0)
+
+        packed = torch.tensor([[1, 2, 3, 1, 2, 1, 2]], dtype=torch.long)
+        cu = torch.tensor([0, 5, 7], dtype=torch.int32)
+        torch.testing.assert_close(
+            compute_rwkv7s_rosa_ids(packed, cu_seqlens=cu),
+            torch.tensor([[-1, -1, -1, 2, 3, -1, -1]], dtype=torch.long),
+            atol=0,
+            rtol=0,
+        )
+
+        # Identity initialization for post-training: step-0 outputs match disabled DeepEmbed/ROSA identically.
+        torch.manual_seed(136)
+        cfg = tiny_config(deep_embed_dim=8)
+        model = Rwkv7sForCausalLM(cfg).to(device="cuda", dtype=torch.bfloat16).eval()
+        ids = torch.tensor([[1, 2, 3, 1, 2, 4, 1, 2], [5, 6, 5, 6, 7, 5, 6, 8]], device="cuda")
+        with torch.no_grad():
+            base_logits = model(ids, use_cache=False).logits
+            # Precomputed CPU rosa_ids matches automatic computation bit-for-bit, even with nonzero rosa_gate.
+            model.model.rosa_gate.fill_(0.5)
+            model.model.layers[0].mlp.s2.normal_(std=0.1)
+            auto_out = model(ids, use_cache=False).logits
+            precomputed = compute_rwkv7s_rosa_ids(ids.cpu())
+            precomputed_out = model(ids, rosa_ids=precomputed, use_cache=False).logits
+            torch.testing.assert_close(precomputed_out, auto_out, atol=0, rtol=0)
+            self.assertFalse(torch.allclose(auto_out, base_logits))
+
+            # CUDA Graph generation with active DeepEmbed + active ROSA matches eager step-by-step bit-for-bit.
+            cache = Rwkv7sCache(cfg)
+            eager_logits = model(ids[:, :6], cache=cache, logits_to_keep=1).logits[:, -1]
+            token = eager_logits.argmax(-1)
+            expected_tokens = [token]
+            for _ in range(2):
+                eager_logits = model(token[:, None], cache=cache).logits[:, -1]
+                token = eager_logits.argmax(-1)
+                expected_tokens.append(token)
+            generated = model.generate(
+                ids[:, :6], max_new_tokens=3, prefill_chunk_size=3, do_sample=False, eos_token_id=None
+            )
+            torch.testing.assert_close(
+                generated, torch.cat((ids[:, :6], torch.stack(expected_tokens, dim=1)), dim=1), atol=0, rtol=0
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

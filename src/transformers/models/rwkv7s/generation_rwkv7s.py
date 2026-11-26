@@ -53,6 +53,97 @@ def _rwkv7s_prefill_lengths(prompt_length: int, chunk_size: int | None) -> tuple
     return (chunk_size,) * full_chunks + ((remainder,) if remainder else ())
 
 
+class _Rwkv7sRosa:
+    """Online ROSA (Rapid Online Suffix Automaton): longest-suffix most-recent match successor."""
+
+    __slots__ = ("endpos", "last", "length", "link", "tokens", "transitions")
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.tokens: list[int] = []
+        self.transitions: list[dict[int, int]] = [{}]
+        self.link: list[int] = [-1]
+        self.length: list[int] = [0]
+        self.endpos: list[int] = [-1]
+        self.last: int = 0
+
+    def clone(self) -> _Rwkv7sRosa:
+        copied = _Rwkv7sRosa.__new__(_Rwkv7sRosa)
+        copied.tokens, copied.link, copied.length, copied.endpos = (
+            self.tokens.copy(),
+            self.link.copy(),
+            self.length.copy(),
+            self.endpos.copy(),
+        )
+        copied.transitions = [t.copy() for t in self.transitions]
+        copied.last = self.last
+        return copied
+
+    def step(self, token: int) -> int:
+        pos = len(self.tokens)
+        self.tokens.append(token)
+        cur = len(self.transitions)
+        self.transitions.append({})
+        self.length.append(self.length[self.last] + 1)
+        self.link.append(-1)
+        self.endpos.append(-1)
+
+        p = self.last
+        while p != -1 and token not in self.transitions[p]:
+            self.transitions[p][token] = cur
+            p = self.link[p]
+        if p == -1:
+            self.link[cur] = 0
+        else:
+            q = self.transitions[p][token]
+            if self.length[p] + 1 == self.length[q]:
+                self.link[cur] = q
+            else:
+                clone = len(self.transitions)
+                self.transitions.append(self.transitions[q].copy())
+                self.length.append(self.length[p] + 1)
+                self.link.append(self.link[q])
+                self.endpos.append(self.endpos[q])
+                while p != -1 and self.transitions[p].get(token) == q:
+                    self.transitions[p][token] = clone
+                    p = self.link[p]
+                self.link[q] = self.link[cur] = clone
+
+        self.last = cur
+        matched, v = -1, cur
+        while v != -1:
+            if self.length[v] > 0 and self.endpos[v] >= 0:
+                matched = self.tokens[self.endpos[v] + 1]
+                break
+            v = self.link[v]
+        v = cur
+        while v != -1 and self.endpos[v] < pos:
+            self.endpos[v] = pos
+            v = self.link[v]
+        return matched
+
+    def extend(self, tokens: list[int]) -> list[int]:
+        return [self.step(token) for token in tokens]
+
+
+def compute_rwkv7s_rosa_ids(input_ids: torch.Tensor, cu_seqlens: torch.Tensor | None = None) -> torch.Tensor:
+    """Compute token-level ROSA successor IDs on CPU (`-1` when unmatched). Safe to run in DataLoader workers."""
+    rows = input_ids.detach().cpu().tolist()
+    if cu_seqlens is not None:
+        bounds = cu_seqlens.detach().cpu().tolist()
+        flat = rows[0] if input_ids.ndim == 2 else rows
+        matched = [
+            tok
+            for start, end in zip(bounds[:-1], bounds[1:], strict=True)
+            for tok in _Rwkv7sRosa().extend(flat[start:end])
+        ]
+        return torch.tensor(matched, dtype=torch.long, device=input_ids.device).view_as(input_ids)
+    matched = _Rwkv7sRosa().extend(rows) if input_ids.ndim == 1 else [_Rwkv7sRosa().extend(row) for row in rows]
+    return torch.tensor(matched, dtype=torch.long, device=input_ids.device)
+
+
 def _recurrent_metadata(flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device):
     cu_seqlens = torch.arange(0, (batch_size + 1) * sequence_length, sequence_length, dtype=torch.int32, device=device)
     state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
@@ -197,15 +288,19 @@ class _Rwkv7sPrefillGraph:
         capture_stream: torch.cuda.Stream,
         graph_pool,
     ) -> None:
-        self.input_ids = torch.zeros(
-            (batch_size, sequence_length), dtype=torch.long, device=model.embed_tokens.weight.device
+        device = model.embed_tokens.weight.device
+        self.input_ids = torch.zeros((batch_size, sequence_length), dtype=torch.long, device=device)
+        self.rosa_ids = (
+            torch.full((batch_size, sequence_length), -1, dtype=torch.long, device=device)
+            if model.config.use_rosa
+            else None
         )
         self.graph = torch.cuda.CUDAGraph()
         snapshot = state.clone()
-        generation_stream = torch.cuda.current_stream(self.input_ids.device)
+        generation_stream = torch.cuda.current_stream(device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
-            model._forward_state_only(self.input_ids, None, state, False)
+            model._forward_state_only(self.input_ids, None, state, False, rosa_ids=self.rosa_ids)
             state.copy_(snapshot)
             with torch.cuda.graph(
                 self.graph,
@@ -213,12 +308,14 @@ class _Rwkv7sPrefillGraph:
                 stream=capture_stream,
                 capture_error_mode="thread_local",
             ):
-                model._forward_state_only(self.input_ids, None, state, False)
+                model._forward_state_only(self.input_ids, None, state, False, rosa_ids=self.rosa_ids)
             state.copy_(snapshot)
         generation_stream.wait_stream(capture_stream)
 
-    def replay(self, input_ids: torch.LongTensor) -> None:
+    def replay(self, input_ids: torch.LongTensor, rosa_ids: torch.LongTensor | None = None) -> None:
         self.input_ids.copy_(input_ids)
+        if self.rosa_ids is not None:
+            self.rosa_ids.copy_(rosa_ids, non_blocking=True)
         self.graph.replay()
 
 
@@ -254,6 +351,12 @@ class _Rwkv7sDecodeGraph:
         self.flash_rwkv2 = flash_rwkv2
         self.stop_string_criteria = tuple(copy.copy(criteria) for criteria in stop_string_criteria)
         self.input_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+        if model.config.use_rosa:
+            self.rosa_ids = torch.full((batch_size, 1), -1, dtype=torch.long, device=device)
+            self._rosa_token_cpu = torch.empty(batch_size, dtype=torch.long, pin_memory=True)
+            self._rosa_next_cpu = torch.empty((batch_size, 1), dtype=torch.long, pin_memory=True)
+        else:
+            self.rosa_ids = None
         self.completion = torch.empty((batch_size, max_new_tokens), dtype=torch.long, device=device)
         self.completion_index = torch.zeros(1, dtype=torch.long, device=device)
         self.completion_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -299,6 +402,8 @@ class _Rwkv7sDecodeGraph:
             self.sampling_states.copy_(sampling_snapshot)
             self.penalties.zero_()
         self.input_ids.zero_()
+        if self.rosa_ids is not None:
+            self.rosa_ids.fill_(-1)
         self.completion.fill_(self.pad_token_id)
         self.completion_index.zero_()
         self.completion_lengths.zero_()
@@ -312,6 +417,7 @@ class _Rwkv7sDecodeGraph:
             self.state,
             False,
             return_autodeco_hidden=self.use_autodeco,
+            rosa_ids=self.rosa_ids,
         )
         hidden_states = self.flash_rwkv2.infer_post_norm_output_forward_varlen(
             hidden_states,
@@ -386,6 +492,12 @@ class _Rwkv7sDecodeGraph:
             self.sampling_states.copy_(self.flash_rwkv2.setup_sampling_states(seed, self.batch_size))
             self.penalties.zero_()
 
+    def step_rosa(self, rosa_states: list[_Rwkv7sRosa]) -> None:
+        self._rosa_token_cpu.copy_(self.sampled_tokens)
+        for i, (state, tok) in enumerate(zip(rosa_states, self._rosa_token_cpu.tolist(), strict=True)):
+            self._rosa_next_cpu[i, 0] = state.step(tok)
+        self.rosa_ids.copy_(self._rosa_next_cpu, non_blocking=True)
+
     def replay(self) -> None:
         self.graph.replay()
 
@@ -441,6 +553,7 @@ class _Rwkv7sGenerationModelRunner:
         stop_string_criteria: tuple[StopStringCriteria, ...],
     ) -> None:
         batch_size, prompt_length = input_ids.shape
+        self.use_rosa = model.config.use_rosa
         self.prefill_lengths = _rwkv7s_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
         max_new_tokens = max_length - prompt_length
         flash_rwkv2 = load_flash_rwkv2()
@@ -487,6 +600,16 @@ class _Rwkv7sGenerationModelRunner:
         self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None
     ) -> torch.LongTensor:
         self.decode_graph.prepare(input_ids, seed)
+        rosa_states = None
+        prompt_rosa_ids = None
+        if self.use_rosa:
+            rosa_states = [_Rwkv7sRosa() for _ in range(input_ids.shape[0])]
+            prompt_rosa_ids = torch.tensor(
+                [state.extend(row) for state, row in zip(rosa_states, input_ids.detach().cpu().tolist(), strict=True)],
+                dtype=torch.long,
+                pin_memory=True,
+            )
+            self.decode_graph.rosa_ids.copy_(prompt_rosa_ids[:, -1:], non_blocking=True)
         generation_stream = torch.cuda.current_stream(input_ids.device)
         async_streamer = (
             None
@@ -504,14 +627,15 @@ class _Rwkv7sGenerationModelRunner:
         start_event.record(generation_stream)
         offset = 0
         for sequence_length in self.prefill_lengths:
-            self.prefill_graphs[sequence_length].replay(input_ids[:, offset : offset + sequence_length])
+            chunk_rosa = None if prompt_rosa_ids is None else prompt_rosa_ids[:, offset : offset + sequence_length]
+            self.prefill_graphs[sequence_length].replay(input_ids[:, offset : offset + sequence_length], chunk_rosa)
             offset += sequence_length
 
         produced_tokens = 0
         synchronize_stopping = self.decode_graph.eos_token_ids is not None or bool(
             self.decode_graph.stop_string_criteria
         )
-        for _ in range(self.decode_graph.max_new_tokens):
+        for step in range(self.decode_graph.max_new_tokens):
             self.decode_graph.replay()
             if produced_tokens == 0:
                 first_token_event.record(generation_stream)
@@ -520,6 +644,8 @@ class _Rwkv7sGenerationModelRunner:
             produced_tokens += 1
             if synchronize_stopping and not bool(self.decode_graph.unfinished.any().item()):
                 break
+            if rosa_states is not None and step + 1 < self.decode_graph.max_new_tokens:
+                self.decode_graph.step_rosa(rosa_states)
         end_event.record(generation_stream)
         self.last_generation_events = start_event, first_token_event, end_event
         output = torch.cat((input_ids, self.decode_graph.completion[:, :produced_tokens]), dim=-1)
