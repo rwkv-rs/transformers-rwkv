@@ -80,7 +80,7 @@ trainer = Trainer(
 )
 ```
 
-Packed batches run without a recurrent cache. Use dense batches to pass `past_key_values` between chunks.
+Packed batches run without a recurrent cache. Use dense batches to pass `cache` between chunks.
 
 ### Right padding
 
@@ -155,7 +155,7 @@ python temp/rwkv_pth2st.py \
 
 ## Stateful execution
 
-Pass the returned `past_key_values` back to continue a stream. [`RwkvCache`] stores two token-shift vectors and one
+Pass `outputs.cache` back as `cache` to continue a stream. [`RwkvCache`] stores two token-shift vectors and one
 WKV matrix per layer. Use `cache.clone()` to branch a stream and `cache.detach()` to start a truncated
 backpropagation segment.
 
@@ -163,8 +163,8 @@ backpropagation segment.
 from transformers import RwkvCache
 
 cache = RwkvCache(model.config)
-model(input_ids=inputs.input_ids, past_key_values=cache)
-continued = model(input_ids=torch.tensor([[42]], device=model.device), past_key_values=cache)
+model(input_ids=inputs.input_ids, cache=cache)
+continued = model(input_ids=torch.tensor([[42]], device=model.device), cache=cache)
 ```
 
 ### WKV state precision
