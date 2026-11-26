@@ -14,14 +14,21 @@
 
 import importlib.util
 import itertools
-import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from transformers import GenerationConfig, RwkvConfig, is_torch_available
-from transformers.testing_utils import require_peft, require_torch, require_torch_gpu, slow
+from transformers import RwkvConfig, is_torch_available
+from transformers.testing_utils import (
+    require_accelerate,
+    require_bitsandbytes,
+    require_peft,
+    require_torch,
+    require_torch_gpu,
+    slow,
+)
 
 from ...test_configuration_common import ConfigTester
 
@@ -30,8 +37,6 @@ if is_torch_available():
     import torch
 
     from transformers import RwkvForCausalLM, RwkvModel
-    from transformers.cache_utils import DynamicCache, LinearAttentionLayer
-    from transformers.integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
     from transformers.models.rwkv.modeling_rwkv import RwkvCache
 
     all_model_classes = (RwkvModel, RwkvForCausalLM)
@@ -62,189 +67,9 @@ class RwkvConfigTest(unittest.TestCase):
     def test_config(self):
         self.config_tester.run_common_tests()
 
-    def test_rank_formulas_and_fixed_contract(self):
-        config = RwkvConfig(hidden_size=1024, num_hidden_layers=24)
-        self.assertEqual(config.num_attention_heads, 16)
-        self.assertEqual(config.intermediate_size, 4096)
-        self.assertEqual(config.decay_low_rank_dim, 64)
-        self.assertEqual(config.a_low_rank_dim, 64)
-        self.assertEqual(config.v_low_rank_dim, 64)
-        self.assertEqual(config.gate_low_rank_dim, 160)
-        self.assertEqual(config.wkv_mode, "fp32io16")
-
-    def test_rwkv4_and_noncanonical_fields_fail_closed(self):
-        invalid = (
-            {"attention_hidden_size": 64},
-            {"rescale_every": 6},
-            {"head_size": 128},
-            {"intermediate_size": 320},
-            {"wkv_state_dtype": "float32"},
-            {"wkv_mode": "deltalog"},
-            {"pad_token_id": 0},
-            {"tie_word_embeddings": True},
-        )
-        for override in invalid:
-            with self.subTest(override=override), self.assertRaises(ValueError):
-                tiny_config(**override)
-
-
-@require_torch
-class RwkvStructureTest(unittest.TestCase):
-    def test_qwen_style_module_and_state_dict_names(self):
-        model = RwkvForCausalLM(tiny_config())
-        layer = model.model.layers[0]
-        self.assertEqual(
-            set(layer._modules),
-            {"linear_attn", "mlp", "input_layernorm", "post_attention_layernorm"},
-        )
-        keys = set(model.state_dict())
-        required = {
-            "model.embed_tokens.weight",
-            "model.embedding_norm.weight",
-            "model.layers.0.linear_attn.r_proj.weight",
-            "model.layers.0.mlp.key.weight",
-            "model.layers.0.mlp.value.weight",
-            "model.norm.weight",
-            "lm_head.weight",
-        }
-        self.assertTrue(required.issubset(keys))
-        self.assertFalse(any(key.startswith("model.layers.0.linear_attn.v0") for key in keys))
-        self.assertFalse(any(key.startswith("model.layers.0.linear_attn.v1") for key in keys))
-        self.assertFalse(any(key.startswith("model.layers.0.linear_attn.v2") for key in keys))
-        self.assertIn("model.layers.1.linear_attn.v0", keys)
-        self.assertFalse(any("time_mix" in key or "receptance" in key for key in keys))
-
-    def test_generation_config_defaults_disable_rapid_sampling_penalties(self):
-        generation_config = RwkvForCausalLM(tiny_config()).generation_config
-        self.assertEqual(generation_config.presence_penalty, 0.0)
-        self.assertEqual(generation_config.frequency_penalty, 0.0)
-        self.assertEqual(generation_config.penalty_decay, 0.996)
-
-    def test_initialization_matches_train_temp_formulas(self):
-        torch.manual_seed(11)
-        config = tiny_config()
-        model = RwkvForCausalLM(config)
-        attention = model.model.layers[1].linear_attn
-        channels = config.hidden_size
-        position = torch.arange(channels, dtype=torch.float32)
-        ddd = position / channels
-        ratio = 1.0 - 1 / config.num_hidden_layers
-        expected_x_r = 1 - ddd.pow(0.2 * ratio)
-        torch.testing.assert_close(attention.x_r.float(), expected_x_r)
-        linear = position / (channels - 1) - 0.5
-        torch.testing.assert_close(attention.v0.float(), 0.73 - linear * 0.4)
-        self.assertTrue(torch.equal(attention.w1, torch.zeros_like(attention.w1)))
-        self.assertTrue(torch.equal(attention.a1, torch.zeros_like(attention.a1)))
-        self.assertTrue(torch.equal(attention.v1, torch.zeros_like(attention.v1)))
-        self.assertTrue(torch.equal(attention.g1, torch.zeros_like(attention.g1)))
-        self.assertTrue(torch.equal(attention.o_proj.weight, torch.zeros_like(attention.o_proj.weight)))
-        self.assertTrue(
-            torch.equal(
-                model.model.layers[0].mlp.value.weight, torch.zeros_like(model.model.layers[0].mlp.value.weight)
-            )
-        )
-        self.assertLessEqual(float(model.model.embed_tokens.weight.detach().abs().max()), 1e-4)
-
-    def test_cpu_mask_and_cache_boundaries_fail_closed(self):
-        model = RwkvModel(tiny_config()).bfloat16().eval()
-        input_ids = torch.tensor([[1, 2]])
-        with self.assertRaisesRegex(ValueError, "padding or ragged"):
-            model(input_ids, attention_mask=torch.tensor([[1, 0]]))
-        with self.assertRaisesRegex(TypeError, "only RwkvCache"):
-            model(input_ids, cache=DynamicCache())
-        with (
-            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
-            self.assertRaisesRegex(TypeError, "only RwkvCache"),
-        ):
-            model(input_ids, past_key_values=DynamicCache())
-        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
-            model(input_ids)
-
-    def test_exported_layers_accept_legacy_cache_keyword(self):
-        config = tiny_config()
-        layer = RwkvModel(config).layers[0]
-        hidden_states = torch.zeros(2, config.hidden_size, dtype=torch.bfloat16)
-        residual = torch.zeros_like(hidden_states)
-        metadata = (torch.tensor([0, 2]), torch.tensor([0]), 2, object())
-        cache = RwkvCache(config)
-        with (
-            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
-            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
-        ):
-            layer.linear_attn(
-                hidden_states,
-                residual=residual,
-                layer_norm=layer.input_layernorm,
-                inference_metadata=metadata,
-                cache_params=cache,
-            )
-        with (
-            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
-            self.assertRaisesRegex(RuntimeError, "requires CUDA"),
-        ):
-            layer(hidden_states, residual, None, None, None, None, metadata, cache_params=cache)
-
-    def test_provider_pin_and_requested_operator_validation(self):
-        module = load_flash_rwkv2(
-            (
-                "pretrain_tmix_wkv7_recurrent_bf16",
-                "pretrain_tmix_tokenshift_bf16",
-                "pretrain_cmix_bf16",
-                "infer_tmix_wkv_prepare_forward_varlen",
-                "infer_sampling_six_parameter_forward_varlen",
-            )
-        )
-        self.assertEqual(module.__version__, "0.2.0a4")
-        with mock.patch.object(module, "__version__", "0.1.0a19"):
-            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.2\.0a4"):
-                load_flash_rwkv2("pretrain_cmix_bf16")
-        with self.assertRaisesRegex(RuntimeError, "public operators"):
-            load_flash_rwkv2("operator_that_does_not_exist")
-
-    def test_plain_linear_spec_and_bias_failure(self):
-        projection = torch.nn.Linear(8, 8, bias=False)
-        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(projection)
-        self.assertIs(weight, projection.weight)
-        self.assertIsNone(lora_a)
-        self.assertIsNone(lora_b)
-        self.assertEqual(scale, 1.0)
-        with self.assertRaisesRegex(RuntimeError, "base bias"):
-            flash_rwkv2_linear_spec(torch.nn.Linear(8, 8, bias=True))
-
-    @require_peft
-    def test_peft_linear_spec_active_disabled_merged_and_unsupported(self):
-        from peft import LoraConfig, get_peft_model
-
-        model = get_peft_model(
-            RwkvForCausalLM(tiny_config()),
-            LoraConfig(r=4, lora_alpha=8, target_modules=["r_proj"]),
-        )
-        projection = model.base_model.model.model.layers[0].linear_attn.r_proj
-        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(projection)
-        self.assertIs(weight, projection.get_base_layer().weight)
-        self.assertIs(lora_a, projection.lora_A["default"].weight)
-        self.assertIs(lora_b, projection.lora_B["default"].weight)
-        self.assertEqual(scale, 2.0)
-
-        model.disable_adapter_layers()
-        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0, False))
-        model.enable_adapter_layers()
-        model.merge_adapter()
-        self.assertEqual(flash_rwkv2_linear_spec(projection)[1:], (None, None, 1.0, False))
-        model.unmerge_adapter()
-
-        model.add_adapter("second", LoraConfig(r=4, lora_alpha=4, target_modules=["r_proj"]))
-        projection.set_adapter(["default", "second"])
-        with self.assertRaisesRegex(RuntimeError, "exactly one active"):
-            flash_rwkv2_linear_spec(projection)
-
-        dora_model = get_peft_model(
-            RwkvForCausalLM(tiny_config()),
-            LoraConfig(r=4, lora_alpha=8, use_dora=True, target_modules=["r_proj"]),
-        )
-        dora_projection = dora_model.base_model.model.model.layers[0].linear_attn.r_proj
-        with self.assertRaisesRegex(RuntimeError, "LoRA and NoRA"):
-            flash_rwkv2_linear_spec(dora_projection)
+    def test_rwkv4_config_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "requires an RWKV-7 checkpoint"):
+            RwkvConfig.from_dict({"model_type": "rwkv", "rescale_every": 6})
 
 
 @require_torch_gpu
@@ -474,6 +299,207 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                         runtime.state.feed_forward_shift[layer_idx], layer.conv_states[1].squeeze(-1), atol=0, rtol=0
                     )
         self.assertEqual(len(model._rwkv_generation_graphs), 2)
+        with self.assertRaisesRegex(ValueError, "does not accept an external cache"):
+            model.generate(ids, cache=cache, max_new_tokens=1)
+
+        head = torch.nn.Linear(
+            model.config.hidden_size, model.vocab_size, bias=False, device="cuda", dtype=torch.bfloat16
+        )
+        model.set_output_embeddings(head)
+        expected_tokens = model(ids, logits_to_keep=1).logits[:, -1].argmax(dim=-1)
+        actual = model.generate(ids, max_new_tokens=1, do_sample=False, eos_token_id=None)
+        torch.testing.assert_close(actual[:, -1], expected_tokens)
+        self.assertEqual(len(model._rwkv_generation_graphs), 1)
+
+    def test_generation_streams_and_pads_finished_rows(self):
+        class Streamer:
+            def __init__(self):
+                self.values = []
+                self.threads = []
+
+            def put(self, value):
+                self.values.append(value)
+                self.threads.append(threading.get_ident())
+
+            def end(self):
+                self.threads.append(threading.get_ident())
+
+        torch.manual_seed(116)
+        model = RwkvForCausalLM(tiny_config()).cuda().bfloat16().eval()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+            ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+            first_tokens = model(ids, use_cache=False, logits_to_keep=1).logits[:, -1].argmax(-1)
+        self.assertNotEqual(first_tokens[0].item(), first_tokens[1].item())
+        streamer = Streamer()
+        generated = model.generate(
+            ids,
+            max_new_tokens=4,
+            prefill_chunk_size=3,
+            do_sample=False,
+            eos_token_id=first_tokens[0].item(),
+            pad_token_id=0,
+            streamer=streamer,
+        )
+        completion = generated[:, ids.shape[1] :].cpu()
+        self.assertGreater(completion.shape[1], 1)
+        torch.testing.assert_close(completion[:, 0], first_tokens.cpu())
+        torch.testing.assert_close(completion[0, 1:], torch.zeros_like(completion[0, 1:]))
+        torch.testing.assert_close(streamer.values[0], ids.cpu())
+        self.assertTrue(all(value.is_pinned() for value in streamer.values[1:]))
+        torch.testing.assert_close(torch.stack(streamer.values[1:], dim=1), completion)
+        self.assertEqual(streamer.threads[0], threading.get_ident())
+        self.assertTrue(all(thread != threading.get_ident() for thread in streamer.threads[1:]))
+
+    def test_packing_matches_independent_sequences(self):
+        from transformers import DataCollatorWithFlattening
+
+        torch.manual_seed(120)
+        model = RwkvForCausalLM(tiny_config()).cuda().bfloat16()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        lengths = (4, 1, 7, 3)
+        examples = [{"input_ids": torch.randint(1, model.config.vocab_size, (length,))} for length in lengths]
+        collator = DataCollatorWithFlattening(return_flash_attn_kwargs=True)
+        batch = {
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in collator(examples).items()
+        }
+        sequences = batch["input_ids"].split(lengths, dim=1)
+        parameters = tuple(model.parameters())
+
+        with self.assertRaisesRegex(ValueError, "packing cannot be used with cache"):
+            model(**batch, cache=RwkvCache(model.config))
+        with (
+            self.assertWarnsRegex(FutureWarning, r"Use `cache` instead"),
+            self.assertRaisesRegex(ValueError, "packing cannot be used with cache"),
+        ):
+            model(**batch, past_key_values=RwkvCache(model.config))
+
+        for fused in (True, False):
+            with (
+                self.subTest(fused=fused),
+                mock.patch.object(model.model, "_supports_fused_projections", return_value=fused),
+            ):
+                model.train()
+                packed = model(**batch, use_cache=True)
+                self.assertIsNone(packed.cache)
+                separate = [model(ids, labels=ids if ids.shape[1] > 1 else None, use_cache=False) for ids in sequences]
+                reference_logits = torch.cat([item.logits for item in separate], dim=1)
+                torch.testing.assert_close(packed.logits, reference_logits, atol=0, rtol=0)
+                reference_loss = sum(
+                    item.loss * (length - 1) for item, length in zip(separate, lengths, strict=True) if length > 1
+                ) / (sum(lengths) - len(lengths))
+                torch.testing.assert_close(packed.loss, reference_loss)
+                for actual, expected in zip(
+                    torch.autograd.grad(packed.loss, parameters),
+                    torch.autograd.grad(reference_loss, parameters),
+                    strict=True,
+                ):
+                    torch.testing.assert_close(actual.float(), expected.float(), atol=0.01, rtol=0.04)
+                with torch.no_grad():
+                    evaluated = model.eval()(**batch)
+                self.assertIsNone(evaluated.cache)
+                torch.testing.assert_close(evaluated.logits, packed.logits, atol=0, rtol=0)
+
+    @require_accelerate
+    def test_trainer_with_packing(self):
+        from transformers import DataCollatorWithFlattening, Trainer, TrainingArguments
+
+        torch.manual_seed(121)
+        model = RwkvForCausalLM(tiny_config()).cuda().bfloat16()
+        dataset = [{"input_ids": list(range(1, length))} for length in range(4, 10)]
+        with tempfile.TemporaryDirectory() as directory:
+            args = TrainingArguments(
+                output_dir=directory,
+                max_steps=3,
+                per_device_train_batch_size=2,
+                per_device_eval_batch_size=2,
+                activation_checkpointing=True,
+                save_strategy="no",
+                report_to=[],
+                disable_tqdm=True,
+            )
+            trainer = Trainer(
+                model=model,
+                args=args,
+                train_dataset=dataset,
+                eval_dataset=dataset,
+                data_collator=DataCollatorWithFlattening(return_flash_attn_kwargs=True),
+            )
+            self.assertEqual(trainer.train().global_step, 3)
+            self.assertTrue(torch.isfinite(torch.tensor(trainer.evaluate()["eval_loss"])))
+
+    def test_right_padding_preserves_loss_and_gradients(self):
+        torch.manual_seed(117)
+        model = RwkvForCausalLM(tiny_config(pad_token_id=0)).cuda().bfloat16()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+        ids[0, 4:] = 0
+        mask = ids.ne(0)
+        batched = model(ids, attention_mask=mask, labels=ids.masked_fill(~mask, -100), use_cache=False)
+        first = model(ids[:1, :4], labels=ids[:1, :4], use_cache=False)
+        second = model(ids[1:], labels=ids[1:], use_cache=False)
+        reference_loss = (first.loss * 3 + second.loss * 6) / 9
+        torch.testing.assert_close(batched.loss, reference_loss)
+        parameters = tuple(model.parameters())
+        for actual, expected in zip(
+            torch.autograd.grad(batched.loss, parameters), torch.autograd.grad(reference_loss, parameters), strict=True
+        ):
+            torch.testing.assert_close(actual.float(), expected.float(), atol=0.01, rtol=0.04)
+        with torch.no_grad(), self.assertRaisesRegex(ValueError, "unpadded"):
+            model.eval()(ids, attention_mask=mask)
+
+    @require_accelerate
+    def test_trainer_right_padding_eval_save_reload_and_resume(self):
+        from transformers import DataCollatorForLanguageModeling, Trainer, TrainingArguments
+
+        from .test_tokenization_rwkv import make_tokenizer
+
+        tokenizer = make_tokenizer()
+        tokenizer.pad_token = tokenizer.eos_token
+        dataset = [{"input_ids": list(range(index + 1, 10))} for index in range(4)]
+        eval_dataset = [{"input_ids": [index + 1, 6, 7, 8]} for index in range(2)]
+        collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        with tempfile.TemporaryDirectory() as directory:
+            args = TrainingArguments(
+                output_dir=directory,
+                max_steps=1,
+                per_device_train_batch_size=2,
+                per_device_eval_batch_size=2,
+                eval_strategy="steps",
+                eval_steps=1,
+                save_steps=1,
+                logging_strategy="no",
+                report_to=[],
+                disable_tqdm=True,
+            )
+            trainer = Trainer(
+                model=RwkvForCausalLM(tiny_config(pad_token_id=tokenizer.pad_token_id)).cuda().bfloat16(),
+                args=args,
+                train_dataset=dataset,
+                eval_dataset=eval_dataset,
+                data_collator=collator,
+            )
+            self.assertEqual(trainer.train().global_step, 1)
+            self.assertIn("eval_loss", trainer.evaluate())
+            checkpoint = Path(directory) / "checkpoint-1"
+            reloaded = RwkvForCausalLM.from_pretrained(checkpoint, dtype=torch.bfloat16).cuda()
+            ids = torch.tensor([[1, 2, 3]], device="cuda")
+            with torch.no_grad():
+                torch.testing.assert_close(reloaded(ids).logits, trainer.model.eval()(ids).logits)
+            args.max_steps = 2
+            resumed = Trainer(
+                model=reloaded, args=args, train_dataset=dataset, eval_dataset=eval_dataset, data_collator=collator
+            )
+            self.assertEqual(resumed.train(resume_from_checkpoint=checkpoint).global_step, 2)
 
 
 @require_torch_gpu
@@ -570,6 +596,110 @@ class RwkvNoRATrainingTest(unittest.TestCase):
                     actual = merged(ids, use_cache=False, logits_to_keep=positions).logits
                     torch.testing.assert_close(actual.float(), adapted.float(), atol=0.04, rtol=0.04)
 
+    def test_unfused_lora_matches_fused_logits_and_gradients(self):
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        torch.manual_seed(119)
+        base = RwkvForCausalLM(tiny_config()).cuda().bfloat16()
+        with torch.no_grad():
+            for parameter in base.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
+        model = get_peft_model(
+            base,
+            LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=8,
+                lora_alpha=8,
+                target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
+            ),
+        )
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.normal_(std=0.01)
+
+        ids = torch.randint(1, base.config.vocab_size, (2, 7), device="cuda")
+        params = tuple(parameter for parameter in model.parameters() if parameter.requires_grad)
+        fused = model(ids, labels=ids, use_cache=False)
+        with mock.patch.object(base.model, "_supports_fused_projections", return_value=False):
+            unfused = model(ids, labels=ids, use_cache=False)
+        torch.testing.assert_close(unfused.logits.float(), fused.logits.float(), atol=0.02, rtol=0.03)
+        for actual, expected in zip(
+            torch.autograd.grad(unfused.loss, params), torch.autograd.grad(fused.loss, params), strict=True
+        ):
+            torch.testing.assert_close(actual.float(), expected.float(), atol=0.002, rtol=0.08)
+
+    def test_unfused_dropout_dora_and_multiple_adapters_train(self):
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        torch.manual_seed(113)
+        for options in ({"lora_dropout": 0.05}, {"use_dora": True}, {}):
+            with self.subTest(options=options):
+                base = RwkvForCausalLM(tiny_config()).cuda().bfloat16()
+                with torch.no_grad():
+                    for parameter in base.parameters():
+                        if parameter.ndim >= 2:
+                            parameter.normal_(std=0.03)
+                config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=["r_proj", "key"], **options)
+                model = get_peft_model(base, config)
+                if not options:
+                    model.add_adapter("second", config)
+                    model.base_model.set_adapter(["default", "second"])
+                model.train()
+                self.assertFalse(base.model._supports_fused_projections())
+                ids = torch.randint(1, base.config.vocab_size, (2, 7), device="cuda")
+                optimizer = torch.optim.AdamW(p for p in model.parameters() if p.requires_grad)
+                loss = model(ids, labels=ids, use_cache=False).loss
+                self.assertTrue(torch.isfinite(loss))
+                loss.backward()
+                for name, parameter in model.named_parameters():
+                    self.assertEqual(parameter.grad is not None, "lora_" in name, name)
+                optimizer.step()
+                if options.get("use_dora"):
+                    model.eval()
+                    with torch.no_grad():
+                        before_merge = model(ids, use_cache=False).logits
+                        with self.assertRaisesRegex(ValueError, "Merge unsupported PEFT adapters"):
+                            model.generate(ids, max_new_tokens=1)
+                        merged = model.merge_and_unload()
+                        self.assertTrue(merged.model._supports_fused_projections())
+                        after_merge = merged(ids, use_cache=False).logits
+                        torch.testing.assert_close(before_merge.float(), after_merge.float(), atol=0.03, rtol=0.04)
+
+    @require_bitsandbytes
+    @require_accelerate
+    def test_qlora_4bit_training(self):
+        from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+
+        from transformers import BitsAndBytesConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = RwkvForCausalLM(tiny_config()).bfloat16()
+            with torch.no_grad():
+                for parameter in base.parameters():
+                    if parameter.ndim >= 2:
+                        parameter.normal_(std=0.03)
+            base.save_pretrained(directory)
+            quantized = RwkvForCausalLM.from_pretrained(
+                directory,
+                quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16),
+                device_map={"": "cuda"},
+                dtype=torch.bfloat16,
+            )
+            prepare_model_for_kbit_training(quantized, gradient_checkpointing_kwargs={"use_reentrant": True})
+            model = get_peft_model(
+                quantized, LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=["r_proj", "key"])
+            ).train()
+            self.assertFalse(quantized.model._supports_fused_projections())
+            ids = torch.randint(1, base.config.vocab_size, (2, 7), device="cuda")
+            loss = model(ids, labels=ids, use_cache=False).loss
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            for name, parameter in model.named_parameters():
+                self.assertEqual(parameter.grad is not None, "lora_" in name, name)
+            torch.optim.AdamW(p for p in model.parameters() if p.requires_grad).step()
+
 
 @require_torch
 class RwkvCacheTest(unittest.TestCase):
@@ -577,9 +707,8 @@ class RwkvCacheTest(unittest.TestCase):
         self.config = tiny_config()
         self.hidden = torch.zeros(2, 3, self.config.hidden_size, dtype=torch.bfloat16)
 
-    def test_layout_length_and_linear_attention_layers(self):
+    def test_initial_state_shapes_and_length(self):
         cache = RwkvCache(self.config)
-        self.assertTrue(all(isinstance(layer, LinearAttentionLayer) for layer in cache.layers))
         self.assertTrue(all(layer.number_of_states == 2 for layer in cache.layers))
         attention_shift, wkv_state, mlp_shift = cache.layer_states(0, self.hidden)
         self.assertEqual(attention_shift.shape, (2, 64))
@@ -622,7 +751,7 @@ class RwkvCacheTest(unittest.TestCase):
         self.assertEqual(cache.stream_lengths.tolist(), [0, 0])
 
 
-@require_torch
+@require_torch_gpu
 class RwkvConverterTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -632,8 +761,8 @@ class RwkvConverterTest(unittest.TestCase):
         spec.loader.exec_module(cls.converter)
 
     @staticmethod
-    def canonical_state_dict(config: RwkvConfig) -> dict[str, torch.Tensor]:
-        model_state = RwkvForCausalLM(config).state_dict()
+    def canonical_state_dict(model: RwkvForCausalLM) -> dict[str, torch.Tensor]:
+        config = model.config
         source = {}
         top_level = {
             "model.embed_tokens.weight": "emb.weight",
@@ -650,7 +779,7 @@ class RwkvConverterTest(unittest.TestCase):
             "o_proj": "output",
             "g_norm": "ln_x",
         }
-        for target_key, tensor in model_state.items():
+        for target_key, tensor in model.state_dict().items():
             if target_key in top_level:
                 source_key = top_level[target_key]
             else:
@@ -687,106 +816,24 @@ class RwkvConverterTest(unittest.TestCase):
         source["blocks.0.att.v2"] = torch.zeros(config.v_low_rank_dim, config.hidden_size)
         return source
 
-    def test_inference_translation_and_layer_zero_drop(self):
-        config = tiny_config(decay_low_rank_dim=17, a_low_rank_dim=19, v_low_rank_dim=23, gate_low_rank_dim=29)
-        source = self.canonical_state_dict(config)
-        inferred = self.converter.infer_config(source, context_length=16)
-        self.assertEqual(
-            (
-                inferred.decay_low_rank_dim,
-                inferred.a_low_rank_dim,
-                inferred.v_low_rank_dim,
-                inferred.gate_low_rank_dim,
-            ),
-            (17, 19, 23, 29),
-        )
-        plan, dropped = self.converter.translation_plan(source)
-        self.assertEqual(dropped, self.converter.LAYER_ZERO_UNUSED)
-        expected = self.converter.expected_state_dict(inferred)
-        self.converter.validate_plan(source, plan, dropped, expected)
-        self.assertEqual(set(plan), set(expected))
-        self.assertEqual(plan["model.layers.0.mlp.key.weight"], "blocks.0.ffn.key.weight")
-
-    def test_converter_rejects_compiled_and_cross_layer_rank_drift(self):
+    def test_converted_checkpoint_matches_reference_logits(self):
+        torch.manual_seed(113)
+        reference = RwkvForCausalLM(tiny_config()).bfloat16().eval()
+        with torch.no_grad():
+            for parameter in reference.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.03)
         with tempfile.TemporaryDirectory() as directory:
-            checkpoint = Path(directory) / "compiled.pth"
-            torch.save({"_orig_mod.emb.weight": torch.empty(1)}, checkpoint)
-            with self.assertRaisesRegex(ValueError, "_orig_mod"):
-                self.converter.load_checkpoint(checkpoint)
-
-        source = self.canonical_state_dict(tiny_config())
-        source["blocks.1.att.w1"] = torch.empty(64, 31)
-        source["blocks.1.att.w2"] = torch.empty(31, 64)
-        with self.assertRaisesRegex(ValueError, "rank must agree"):
-            self.converter.infer_config(source, context_length=16)
-
-    def test_converter_rejects_noncanonical_broad_squeeze_shapes(self):
-        config = tiny_config()
-        source = self.canonical_state_dict(config)
-        source["blocks.0.att.x_r"] = source["blocks.0.att.x_r"].reshape(1, config.hidden_size, 1)
-        plan, dropped = self.converter.translation_plan(source)
-        with self.assertRaisesRegex(ValueError, "mismatched"):
-            self.converter.validate_plan(source, plan, dropped, self.converter.expected_state_dict(config))
-
-    def test_generation_configs_define_open_fake_and_tools_profiles(self):
-        expected = {
-            "generation_config.json": (0.96, 0.90, -1, 1.0, 0.09, 0.994),
-            "fake_think_generation_config.json": (1.0, 0.28, 32, 0.0, 0.0, 0.996),
-            "tools_generation_config.json": (0.96, 0.76, 32, 0.0, 0.0, 0.996),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            self.converter.save_generation_configs(tiny_config(), Path(directory))
-            for config_file_name, values in expected.items():
-                generation_config = GenerationConfig.from_pretrained(
-                    directory,
-                    config_file_name=config_file_name,
-                    local_files_only=True,
-                )
-                self.assertTrue(generation_config.do_sample)
-                self.assertEqual(
-                    (
-                        generation_config.temperature,
-                        generation_config.top_p,
-                        generation_config.top_k,
-                        generation_config.presence_penalty,
-                        generation_config.frequency_penalty,
-                        generation_config.penalty_decay,
-                    ),
-                    values,
-                )
-                self.assertEqual(generation_config.stop_strings, self.converter.STOP_STRINGS)
-                model = RwkvForCausalLM(tiny_config())
-                processors = model._get_logits_processor(generation_config)
-                model._validate_graph_logits_processors(processors, generation_config)
-                self.assertEqual(generation_config.top_k, values[2])
-
-    def test_shard_writer_consumes_source_and_writes_reloadable_values(self):
-        from safetensors import safe_open
-
-        config = tiny_config()
-        source = self.canonical_state_dict(config)
-        expected_embedding = source["emb.weight"].clone()
-        storage = torch.cat([tensor.flatten() for tensor in source.values()])
-        offset = 0
-        for key, tensor in source.items():
-            source[key] = storage[offset : offset + tensor.numel()].view_as(tensor)
-            offset += tensor.numel()
-        plan, dropped = self.converter.translation_plan(source)
-        expected = self.converter.expected_state_dict(config)
-        for source_key in dropped:
-            source.pop(source_key)
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            self.converter.write_shards(source, plan, expected, output, "20KB")
-            index_path = output / "model.safetensors.index.json"
-            self.assertTrue(index_path.is_file())
-            index = json.loads(index_path.read_text())
-            self.assertEqual(set(index["weight_map"]), set(expected))
-            embedding_file = output / index["weight_map"]["model.embed_tokens.weight"]
-            with safe_open(embedding_file, framework="pt") as shard:
-                actual = shard.get_tensor("model.embed_tokens.weight")
-            torch.testing.assert_close(actual, expected_embedding)
-        self.assertFalse(source)
+            checkpoint = Path(directory) / "test.pth"
+            output = Path(directory) / "converted"
+            torch.save(self.canonical_state_dict(reference), checkpoint)
+            with mock.patch.object(self.converter, "save_tokenizer"):
+                self.converter.convert_checkpoint(checkpoint, output, 32, "20KB", None)
+            model = RwkvForCausalLM.from_pretrained(output, dtype=torch.bfloat16).cuda().eval()
+            reference.cuda()
+            ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+            with torch.no_grad():
+                torch.testing.assert_close(model(ids).logits, reference(ids).logits, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

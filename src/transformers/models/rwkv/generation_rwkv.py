@@ -424,21 +424,7 @@ class _RwkvGenerationModelRunner:
         batch_size, prompt_length = input_ids.shape
         self.prefill_lengths = _rwkv_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
         max_new_tokens = max_length - prompt_length
-        operators = [
-            "pretrain_head_linear_bf16",
-            "infer_post_norm_output_forward_varlen",
-            "prepare_tmix_wkv7_recurrent_metadata",
-        ]
-        wkv_mode = model.config.wkv_mode
-        operators.extend(
-            (
-                f"infer_tmix_wkv7_recurrent_{wkv_mode}_forward_varlen",
-                f"prepare_tmix_wkv7_recurrent_{wkv_mode}_state_from_tensor",
-            )
-        )
-        if generation_config.do_sample:
-            operators.extend(("infer_sampling_six_parameter_forward_varlen", "setup_sampling_states"))
-        flash_rwkv2 = load_flash_rwkv2(tuple(operators), model.lm_head.weight, "CUDA graph generation")
+        flash_rwkv2 = load_flash_rwkv2()
         self.state = _RwkvGraphState(
             model.config,
             batch_size,
@@ -568,18 +554,6 @@ class RwkvGenerationMixin(GenerationMixin):
         self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
 
-    def _get_rwkv_generation_cache(self) -> _RwkvGenerationCache:
-        cache = getattr(self, "_rwkv_generation_graphs", None)
-        if cache is None:
-            cache = _RwkvGenerationCache()
-            self._rwkv_generation_graphs = cache
-        return cache
-
-    def _clear_rwkv_generation_cache(self) -> None:
-        cache = getattr(self, "_rwkv_generation_graphs", None)
-        if cache is not None:
-            cache.clear()
-
     def _validate_generation_mode(self, generation_mode, generation_config, generation_mode_kwargs):
         super()._validate_generation_mode(generation_mode, generation_config, generation_mode_kwargs)
         if generation_config.token_healing:
@@ -624,6 +598,8 @@ class RwkvGenerationMixin(GenerationMixin):
         synced_gpus: bool,
         model_kwargs: dict,
     ) -> tuple[int, torch.Tensor | None, tuple[StopStringCriteria, ...]]:
+        if flash_rwkv2_linear_spec(self.lm_head) is None or not self.model._supports_fused_projections():
+            raise ValueError("RWKV-7 generation requires fused projections. Merge unsupported PEFT adapters first.")
         if input_ids.device.type != "cuda" or self.lm_head.weight.device != input_ids.device:
             raise ValueError("RWKV-7 generation requires the model and a static input batch on one CUDA device.")
         if self.training or self.lm_head.weight.dtype != torch.bfloat16:
@@ -762,7 +738,14 @@ class RwkvGenerationMixin(GenerationMixin):
             if hasattr(module, "lora_A")
         )
         with torch.cuda.device(input_ids.device):
-            cache = self._get_rwkv_generation_cache()
+            # Captured kernels use the storage addresses recorded during capture.
+            weight_layout = tuple((p.data_ptr(), p.shape, p.stride(), p.dtype, p.device) for p in self.parameters())
+            cache = getattr(self, "_rwkv_generation_graphs", None)
+            if cache is None:
+                cache = self._rwkv_generation_graphs = _RwkvGenerationCache()
+            elif self._rwkv_graph_weight_layout != weight_layout:
+                cache.clear()
+            self._rwkv_graph_weight_layout = weight_layout
             runner = cache.get(key)
             if runner is None:
                 runner = _RwkvGenerationModelRunner(

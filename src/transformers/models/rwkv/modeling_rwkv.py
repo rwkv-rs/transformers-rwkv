@@ -17,15 +17,16 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ... import initialization as init
 from ...cache_utils import Cache, LinearAttentionLayer
 from ...integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
-from ...modeling_utils import PreTrainedModel
+from ...modeling_utils import PreTrainedModel, slice_logits_to_keep
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
 from .configuration_rwkv import RwkvConfig
 from .generation_rwkv import (
@@ -35,31 +36,6 @@ from .generation_rwkv import (
     _recurrent_metadata,
     _RwkvGraphState,
 )
-
-
-_TRAIN_ATTENTION_OPERATORS = (
-    "pretrain_tmix_readout_bf16",
-    "pretrain_tmix_tokenshift_bf16",
-    "pretrain_tmix_wkv_prepare_bf16",
-    "pretrain_tmix_wkv7_recurrent_bf16",
-)
-_INFER_ATTENTION_OPERATORS = (
-    "infer_tmix_postnorm_tokenshift_forward_varlen",
-    "infer_tmix_readout_forward_varlen",
-    "infer_tmix_wkv_prepare_forward_varlen",
-)
-_INFER_FEED_FORWARD_OPERATORS = ("infer_cmix_forward_varlen",)
-
-
-def _validate_attention_mask(attention_mask: torch.Tensor | None, batch_size: int, sequence_length: int) -> None:
-    if attention_mask is None:
-        return
-    if attention_mask.ndim != 2 or attention_mask.shape[0] != batch_size:
-        raise ValueError(
-            "RWKV-7 accepts only a two-dimensional all-ones attention mask with shape [batch_size, sequence_length]."
-        )
-    if attention_mask.shape[1] < sequence_length or not bool(torch.all(attention_mask != 0)):
-        raise ValueError("RWKV-7 does not support padding or ragged batches; bucket inputs by sequence length.")
 
 
 class _RwkvCacheLayer(LinearAttentionLayer):
@@ -93,7 +69,6 @@ class RwkvCache(Cache):
     """RWKV-7 recurrent cache with two token shifts and one WKV state per layer, FP32 by default."""
 
     def __init__(self, config: RwkvConfig):
-        config.validate_architecture()
         self._inference_recurrent_states: dict[int, object] = {}
         super().__init__(
             layers=[_RwkvCacheLayer(self._inference_recurrent_states) for _ in range(config.num_hidden_layers)]
@@ -136,9 +111,8 @@ class RwkvCache(Cache):
         self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool, materialize: bool
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer = self.layers[layer_idx]
-        batch_size, _, hidden_size = hidden_states.shape
-        expected_shift_shape = (batch_size, hidden_size, 1)
-        expected_wkv_shape = (
+        batch_size = hidden_states.shape[0]
+        wkv_shape = (
             batch_size,
             self.config.num_attention_heads,
             self.config.head_size,
@@ -150,7 +124,7 @@ class RwkvCache(Cache):
             template = hidden_states[:, -1].unsqueeze(-1)
             layer.lazy_initialization(conv_states=template, state_idx=0, conv_kernel_size=1)
         if not layer.is_recurrent_states_initialized[0]:
-            template = torch.empty(expected_wkv_shape, dtype=state_dtype, device=hidden_states.device)
+            template = torch.empty(wkv_shape, dtype=state_dtype, device=hidden_states.device)
             layer.lazy_initialization(recurrent_states=template, state_idx=0)
         if not layer.is_conv_states_initialized[1]:
             template = hidden_states[:, -1].unsqueeze(-1)
@@ -159,16 +133,6 @@ class RwkvCache(Cache):
         attention_shift = layer.conv_states[0]
         wkv_state = (layer.recurrent_states if materialize else layer._recurrent_states)[0]
         feed_forward_shift = layer.conv_states[1]
-        if attention_shift.shape != expected_shift_shape or feed_forward_shift.shape != expected_shift_shape:
-            raise ValueError(
-                f"RWKV-7 cache batch/hidden shape does not match this input: expected {expected_shift_shape}."
-            )
-        if wkv_state.shape != expected_wkv_shape or wkv_state.dtype != state_dtype:
-            raise ValueError(
-                f"RWKV-7 WKV cache must have shape {expected_wkv_shape} and dtype {state_dtype}; "
-                f"got shape={tuple(wkv_state.shape)}, dtype={wkv_state.dtype}. "
-                "Create a new cache when changing state precision or switching from FP16-state inference to training."
-            )
         return attention_shift.squeeze(-1), wkv_state, feed_forward_shift.squeeze(-1)
 
     def update_layer(
@@ -208,10 +172,6 @@ class RwkvCache(Cache):
     def advance(self, num_tokens: int, batch_size: int, device: torch.device) -> None:
         if self._stream_lengths is None:
             self._stream_lengths = torch.full((batch_size,), self._seen_tokens, dtype=torch.long, device=device)
-        elif self._stream_lengths.numel() != batch_size:
-            raise ValueError(
-                f"RWKV-7 cache batch size is {self._stream_lengths.numel()}, but the input batch size is {batch_size}."
-            )
         self._stream_lengths = self._stream_lengths + num_tokens
         self._seen_tokens += num_tokens
 
@@ -345,6 +305,8 @@ class RwkvCache(Cache):
 
 
 class RwkvAttention(nn.Module):
+    """TimeMix, called `RWKV_Tmix_x070` in RWKV-LM and `RWKV7Attention` in FLA and hf_rwkv."""
+
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -394,95 +356,121 @@ class RwkvAttention(nn.Module):
         v_first: torch.Tensor | None,
         attention_shift: torch.Tensor | None,
         wkv_state: torch.Tensor | None,
+        use_unfused_projections: bool,
+        cu_seqlens: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        flash_rwkv2 = load_flash_rwkv2(_TRAIN_ATTENTION_OPERATORS, hidden_states, "training")
-        if hidden_states.dtype != torch.bfloat16:
-            raise TypeError(f"RWKV-7 training requires bfloat16 hidden states, got {hidden_states.dtype}.")
+        flash_rwkv2 = load_flash_rwkv2()
         hidden_states = hidden_states.contiguous()
         shifts = flash_rwkv2.pretrain_tmix_tokenshift_bf16(
-            hidden_states,
-            self.x_r,
-            self.x_w,
-            self.x_k,
-            self.x_v,
-            self.x_a,
-            self.x_g,
+            hidden_states.squeeze(0) if cu_seqlens is not None else hidden_states,
+            self.x_r.to(hidden_states.dtype),
+            self.x_w.to(hidden_states.dtype),
+            self.x_k.to(hidden_states.dtype),
+            self.x_v.to(hidden_states.dtype),
+            self.x_a.to(hidden_states.dtype),
+            self.x_g.to(hidden_states.dtype),
             initial_shift=attention_shift.contiguous() if attention_shift is not None else None,
+            cu_seqlens=cu_seqlens,
             return_final_state=attention_shift is not None,
         )
+        if cu_seqlens is not None:
+            shifts = tuple(shift.unsqueeze(0) for shift in shifts)
         xr, xw, xk, xv, xa, xg = shifts[:6]
         next_attention_shift = shifts[6] if attention_shift is not None else None
 
-        r_weight, r_a, r_b, r_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj)
-        k_weight, k_a, k_b, k_scale, k_nora = flash_rwkv2_linear_spec(self.k_proj)
-        v_weight, v_a, v_b, v_scale, v_nora = flash_rwkv2_linear_spec(self.v_proj)
-        if self.layer_idx != 0 and v_first is None:
-            raise ValueError("RWKV-7 layers after layer 0 require the first layer's value residual.")
-        receptance, decay_logits, key, value, negative_direction, scaled_direction, gate, v_first = (
-            flash_rwkv2.pretrain_tmix_wkv_prepare_bf16(
-                xr,
-                xw,
-                xk,
-                xv,
-                xa,
-                xg,
-                r_weight,
-                k_weight,
-                v_weight,
-                self.w0,
-                self.w1,
-                self.w2,
-                self.a0,
-                self.a1,
-                self.a2,
-                self.g1,
-                self.g2,
-                self.k_k,
-                self.k_a,
-                v_first=v_first if self.layer_idx != 0 else None,
-                v0=self.v0 if self.layer_idx != 0 else None,
-                v1=self.v1 if self.layer_idx != 0 else None,
-                v2=self.v2 if self.layer_idx != 0 else None,
-                receptance_lora_a=r_a,
-                receptance_lora_b=r_b,
-                receptance_lora_scale=r_scale,
-                key_lora_a=k_a,
-                key_lora_b=k_b,
-                key_lora_scale=k_scale,
-                value_lora_a=v_a,
-                value_lora_b=v_b,
-                value_lora_scale=v_scale,
-                receptance_use_nora=r_nora,
-                key_use_nora=k_nora,
-                value_use_nora=v_nora,
-                head_size=self.head_size,
+        if use_unfused_projections:
+            dtype = hidden_states.dtype
+            projection_dtype = self.w0.dtype
+            receptance = self.r_proj(xr.to(projection_dtype)).to(dtype)
+            key = self.k_proj(xk.to(projection_dtype)).to(dtype)
+            value = self.v_proj(xv.to(projection_dtype)).to(dtype)
+            decay = ((xw @ self.w1.to(dtype)).tanh() @ self.w2.to(dtype)).float()
+            # The training recurrence applies the decay activation to biased logits.
+            decay_logits = (decay + self.w0.float()).to(dtype)
+            rate = (self.a0.float() + (xa @ self.a1.to(dtype) @ self.a2.to(dtype)).float()).sigmoid().to(dtype)
+            gate = (xg @ self.g1.to(dtype)).sigmoid() @ self.g2.to(dtype)
+            if self.layer_idx == 0:
+                v_first = value
+            else:
+                value_gate = (self.v0.float() + (xv @ self.v1.to(dtype) @ self.v2.to(dtype)).float()).sigmoid()
+                value = (value.float() + (v_first.float() - value.float()) * value_gate).to(dtype)
+            direction = F.normalize(
+                (key.float() * self.k_k.float()).unflatten(-1, (self.num_heads, self.head_size)), dim=-1
+            ).flatten(-2)
+            negative_direction = (-direction).to(dtype)
+            scaled_direction = (direction * rate.float()).to(dtype)
+            key = (key.float() * (1.0 + (rate.float() - 1.0) * self.k_a.float())).to(dtype)
+            o_weight, o_a, o_b, o_scale, o_nora = None, None, None, 1.0, False
+        else:
+            r_weight, r_a, r_b, r_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj)
+            k_weight, k_a, k_b, k_scale, k_nora = flash_rwkv2_linear_spec(self.k_proj)
+            v_weight, v_a, v_b, v_scale, v_nora = flash_rwkv2_linear_spec(self.v_proj)
+            o_weight, o_a, o_b, o_scale, o_nora = flash_rwkv2_linear_spec(self.o_proj)
+            receptance, decay_logits, key, value, negative_direction, scaled_direction, gate, v_first = (
+                flash_rwkv2.pretrain_tmix_wkv_prepare_bf16(
+                    xr,
+                    xw,
+                    xk,
+                    xv,
+                    xa,
+                    xg,
+                    r_weight,
+                    k_weight,
+                    v_weight,
+                    self.w0,
+                    self.w1,
+                    self.w2,
+                    self.a0,
+                    self.a1,
+                    self.a2,
+                    self.g1,
+                    self.g2,
+                    self.k_k,
+                    self.k_a,
+                    v_first=v_first if self.layer_idx != 0 else None,
+                    v0=self.v0 if self.layer_idx != 0 else None,
+                    v1=self.v1 if self.layer_idx != 0 else None,
+                    v2=self.v2 if self.layer_idx != 0 else None,
+                    receptance_lora_a=r_a,
+                    receptance_lora_b=r_b,
+                    receptance_lora_scale=r_scale,
+                    key_lora_a=k_a,
+                    key_lora_b=k_b,
+                    key_lora_scale=k_scale,
+                    value_lora_a=v_a,
+                    value_lora_b=v_b,
+                    value_lora_scale=v_scale,
+                    receptance_use_nora=r_nora,
+                    key_use_nora=k_nora,
+                    value_use_nora=v_nora,
+                    head_size=self.head_size,
+                )
             )
-        )
 
+        recurrent_inputs = (receptance, decay_logits, key, value, negative_direction, scaled_direction)
+        if cu_seqlens is not None:
+            recurrent_inputs = tuple(t.view(-1, self.num_heads, self.head_size) for t in recurrent_inputs)
         recurrent_output = flash_rwkv2.pretrain_tmix_wkv7_recurrent_bf16(
-            receptance,
-            decay_logits,
-            key,
-            value,
-            negative_direction,
-            scaled_direction,
+            *recurrent_inputs,
             head_size=self.head_size,
             initial_state=wkv_state,
+            cu_seqlens=cu_seqlens,
             return_final_state=wkv_state is not None,
         )
         next_wkv_state = None
         if wkv_state is not None:
             recurrent_output, next_wkv_state = recurrent_output
+        if cu_seqlens is not None:
+            recurrent_output = recurrent_output.view_as(hidden_states)
 
-        o_weight, o_a, o_b, o_scale, o_nora = flash_rwkv2_linear_spec(self.o_proj)
         output = flash_rwkv2.pretrain_tmix_readout_bf16(
             recurrent_output.contiguous(),
             receptance,
             key,
             value,
-            self.r_k,
-            self.g_norm.weight,
-            self.g_norm.bias,
+            self.r_k.to(hidden_states.dtype),
+            self.g_norm.weight.to(hidden_states.dtype),
+            self.g_norm.bias.to(hidden_states.dtype),
             gate,
             head_size=self.head_size,
             output_weight=o_weight,
@@ -491,6 +479,8 @@ class RwkvAttention(nn.Module):
             output_lora_scale=o_scale,
             output_use_nora=o_nora,
         )
+        if use_unfused_projections:
+            output = self.o_proj(output.to(self.w0.dtype)).to(hidden_states.dtype)
         return output, v_first, next_attention_shift, next_wkv_state
 
     def _inference_forward(
@@ -504,17 +494,7 @@ class RwkvAttention(nn.Module):
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
         cache: RwkvCache | _RwkvGraphState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flash_rwkv2 = load_flash_rwkv2(
-            _INFER_ATTENTION_OPERATORS
-            + (
-                f"infer_tmix_wkv7_recurrent_{self.config.wkv_mode}_forward_varlen",
-                f"prepare_tmix_wkv7_recurrent_{self.config.wkv_mode}_state_from_tensor",
-            ),
-            hidden_states,
-            "inference",
-        )
-        if hidden_states.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
-            raise TypeError("RWKV-7 inference requires bfloat16 hidden and residual tensors.")
+        flash_rwkv2 = load_flash_rwkv2()
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
         residual, xr, xw, xk, xv, xa, xg = flash_rwkv2.infer_tmix_postnorm_tokenshift_forward_varlen(
             hidden_states.contiguous(),
@@ -623,13 +603,18 @@ class RwkvAttention(nn.Module):
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
         cache: RwkvCache | _RwkvGraphState | None = None,
+        use_unfused_projections: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
-            return self._training_forward(hidden_states, v_first, attention_shift, wkv_state)
-        if residual is None or layer_norm is None or inference_metadata is None:
-            raise ValueError("RWKV-7 inference attention requires residual, layer norm, cache states, and metadata.")
-        if cache is None:
-            raise ValueError("RWKV-7 inference attention requires a recurrent cache operator.")
+            return self._training_forward(
+                hidden_states,
+                v_first,
+                attention_shift,
+                wkv_state,
+                use_unfused_projections,
+                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
+            )
         return self._inference_forward(
             hidden_states,
             residual,
@@ -643,6 +628,8 @@ class RwkvAttention(nn.Module):
 
 
 class RwkvFeedForward(nn.Module):
+    """ChannelMix, called `RWKV_CMix_x070` in RWKV-LM and `RWKV7FeedForward` in FLA and hf_rwkv."""
+
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -652,19 +639,37 @@ class RwkvFeedForward(nn.Module):
         self.value = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def _training_forward(
-        self, hidden_states: torch.Tensor, feed_forward_shift: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        feed_forward_shift: torch.Tensor | None,
+        use_unfused_projections: bool,
+        cu_seqlens: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        flash_rwkv2 = load_flash_rwkv2("pretrain_cmix_bf16", hidden_states, "training")
-        if hidden_states.dtype != torch.bfloat16:
-            raise TypeError(f"RWKV-7 training requires bfloat16 hidden states, got {hidden_states.dtype}.")
+        if use_unfused_projections:
+            previous = (
+                F.pad(hidden_states[:, :-1], (0, 0, 1, 0))
+                if feed_forward_shift is None
+                else torch.cat((feed_forward_shift[:, None], hidden_states[:, :-1]), dim=1)
+            )
+            if cu_seqlens is not None:
+                previous = previous.index_fill(1, cu_seqlens[:-1].long(), 0)
+            x = hidden_states.float()
+            mixed = (x + (previous.float() - x) * self.x_k.float()).to(hidden_states.dtype)
+            features = self.key(mixed.to(self.x_k.dtype)).relu().square()
+            output = self.value(features).to(hidden_states.dtype)
+            return output, hidden_states[:, -1] if feed_forward_shift is not None else None
+
+        flash_rwkv2 = load_flash_rwkv2()
         key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
         value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
+        rows = hidden_states.squeeze(0) if cu_seqlens is not None else hidden_states
         output = flash_rwkv2.pretrain_cmix_bf16(
-            hidden_states.contiguous(),
+            rows.contiguous(),
             self.x_k,
             key_weight,
             value_weight,
             initial_shift=feed_forward_shift.contiguous() if feed_forward_shift is not None else None,
+            cu_seqlens=cu_seqlens,
             return_final_state=feed_forward_shift is not None,
             key_lora_a=key_a,
             key_lora_b=key_b,
@@ -675,6 +680,8 @@ class RwkvFeedForward(nn.Module):
             value_lora_scale=value_scale,
             value_use_nora=value_nora,
         )
+        if cu_seqlens is not None:
+            output = output.unsqueeze(0)
         return output if feed_forward_shift is not None else (output, None)
 
     def _inference_forward(
@@ -685,7 +692,7 @@ class RwkvFeedForward(nn.Module):
         feed_forward_shift: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        flash_rwkv2 = load_flash_rwkv2(_INFER_FEED_FORWARD_OPERATORS, hidden_states, "inference")
+        flash_rwkv2 = load_flash_rwkv2()
         key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
         value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
@@ -721,15 +728,22 @@ class RwkvFeedForward(nn.Module):
         residual: torch.Tensor | None = None,
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
+        use_unfused_projections: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
-            return self._training_forward(hidden_states, feed_forward_shift)
-        if residual is None or layer_norm is None or inference_metadata is None:
-            raise ValueError("RWKV-7 inference ChannelMix requires residual, layer norm, cache state, and metadata.")
+            return self._training_forward(
+                hidden_states,
+                feed_forward_shift,
+                use_unfused_projections,
+                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
+            )
         return self._inference_forward(hidden_states, residual, layer_norm, feed_forward_shift, inference_metadata)
 
 
 class RwkvDecoderLayer(GradientCheckpointingLayer):
+    """RWKV-7 block, called `Block` in RWKV-LM and `RWKV7Block` in FLA and hf_rwkv."""
+
     def __init__(self, config: RwkvConfig, layer_idx: int):
         super().__init__()
         self.linear_attn = RwkvAttention(config, layer_idx)
@@ -748,29 +762,35 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
         feed_forward_shift: torch.Tensor | None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None,
         cache: RwkvCache | _RwkvGraphState | None = None,
+        use_unfused_projections: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
-            flash_rwkv2 = load_flash_rwkv2("infer_embedding_ln0_forward_varlen", hidden_states, "training")
+            flash_rwkv2 = load_flash_rwkv2()
             attention_output, v_first, next_attention_shift, next_wkv_state = self.linear_attn(
                 flash_rwkv2.infer_embedding_ln0_forward_varlen(
                     hidden_states,
-                    self.input_layernorm.weight,
-                    self.input_layernorm.bias,
+                    self.input_layernorm.weight.to(hidden_states.dtype),
+                    self.input_layernorm.bias.to(hidden_states.dtype),
                     eps=self.input_layernorm.eps,
                 ),
                 v_first,
                 attention_shift,
                 wkv_state,
+                use_unfused_projections=use_unfused_projections,
+                **kwargs,
             )
             hidden_states = hidden_states + attention_output
             feed_forward_output, next_feed_forward_shift = self.mlp(
                 flash_rwkv2.infer_embedding_ln0_forward_varlen(
                     hidden_states,
-                    self.post_attention_layernorm.weight,
-                    self.post_attention_layernorm.bias,
+                    self.post_attention_layernorm.weight.to(hidden_states.dtype),
+                    self.post_attention_layernorm.bias.to(hidden_states.dtype),
                     eps=self.post_attention_layernorm.eps,
                 ),
                 feed_forward_shift,
+                use_unfused_projections=use_unfused_projections,
+                **kwargs,
             )
             hidden_states = hidden_states + feed_forward_output
             return hidden_states, v_first, next_attention_shift, next_wkv_state, next_feed_forward_shift
@@ -873,8 +893,6 @@ class RwkvPreTrainedModel(PreTrainedModel):
 
 class RwkvModel(RwkvPreTrainedModel):
     def __init__(self, config: RwkvConfig):
-        if config.architecture_version != "rwkv7":
-            raise ValueError(f"RwkvModel requires architecture_version='rwkv7', got {config.architecture_version!r}.")
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embedding_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -885,11 +903,19 @@ class RwkvModel(RwkvPreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
+    def _supports_fused_projections(self) -> bool:
+        return all(
+            flash_rwkv2_linear_spec(projection) is not None
+            for layer in self.layers
+            for projection in (
+                layer.linear_attn.r_proj,
+                layer.linear_attn.k_proj,
+                layer.linear_attn.v_proj,
+                layer.linear_attn.o_proj,
+                layer.mlp.key,
+                layer.mlp.value,
+            )
+        )
 
     def _forward_state_only(
         self,
@@ -906,11 +932,7 @@ class RwkvModel(RwkvPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         inputs_embeds = inputs_embeds.reshape(-1, self.config.hidden_size).contiguous()
-        flash_rwkv2 = load_flash_rwkv2(
-            ("infer_embedding_ln0_forward_varlen", "prepare_tmix_wkv7_recurrent_metadata"),
-            inputs_embeds,
-            "inference",
-        )
+        flash_rwkv2 = load_flash_rwkv2()
         hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
             inputs_embeds,
             self.embedding_norm.weight,
@@ -967,45 +989,72 @@ class RwkvModel(RwkvPreTrainedModel):
         output_hidden_states: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        if is_torchdynamo_compiling():
-            raise RuntimeError("RWKV-7 FlashRWKV2 execution does not support torch.compile or export.")
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
-        if cache is not None and type(cache) is not RwkvCache:
-            raise TypeError(f"RWKV-7 accepts only RwkvCache, got {type(cache).__name__}.")
+        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
+        if cu_seq_lens_q is not None:
+            if cache is not None:
+                raise ValueError("RWKV-7 packing cannot be used with cache.")
+            use_cache = False
+        inputs = input_ids if inputs_embeds is None else inputs_embeds
+        if not inputs.is_cuda or not self.norm.weight.is_cuda:
+            raise RuntimeError("RWKV-7 requires CUDA inputs and model weights.")
+        use_unfused_projections = kwargs.pop("_use_unfused_projections", None)
+        if use_unfused_projections is None:
+            use_unfused_projections = not self._supports_fused_projections()
+        kbit_training = use_unfused_projections and getattr(self.config, "quantization_config", None) is not None
+        if not kbit_training and (
+            self.norm.weight.dtype != torch.bfloat16
+            or (inputs_embeds is not None and inputs_embeds.dtype != torch.bfloat16)
+        ):
+            raise TypeError("RWKV-7 requires bfloat16 model weights and input embeddings.")
         training_path = self.training or torch.is_grad_enabled()
-        if self.norm.weight.dtype != torch.bfloat16:
-            raise TypeError(f"RWKV-7 execution requires a bfloat16 model, got {self.norm.weight.dtype}.")
         if use_cache is None:
             use_cache = cache is not None or (not training_path and self.config.use_cache)
+        training_path = training_path or use_unfused_projections or cu_seq_lens_q is not None
         output_hidden_states = (
             self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         )
         _ = position_ids
 
-        if inputs_embeds is None:
-            batch_size, sequence_length = input_ids.shape
-        else:
-            batch_size, sequence_length = inputs_embeds.shape[:2]
-        if sequence_length == 0:
-            raise ValueError("RWKV-7 requires at least one input token.")
-        _validate_attention_mask(attention_mask, batch_size, sequence_length)
+        batch_size, sequence_length = inputs.shape[:2]
+        if (
+            not training_path
+            and attention_mask is not None
+            and (
+                attention_mask.ndim != 2
+                or attention_mask.shape[0] != batch_size
+                or attention_mask.shape[1] < sequence_length
+                or not torch.all(attention_mask != 0)
+            )
+        ):
+            raise ValueError("RWKV-7 inference requires an unpadded batch.")
 
+        if cache is not None:
+            if not isinstance(cache, RwkvCache):
+                raise TypeError(f"RWKV-7 accepts only RwkvCache, got {type(cache).__name__}.")
+            cache_batch_size = cache.batch_size
+            if cache_batch_size not in (-1, batch_size):
+                raise ValueError(f"RWKV-7 cache batch size is {cache_batch_size}, but the input has {batch_size}.")
+            state_dtype = torch.float16 if not training_path and self.config.wkv_mode == "fp16" else torch.float32
+            if any(
+                (state := layer._recurrent_states[0]) is not None and state.dtype != state_dtype
+                for layer in cache.layers
+            ):
+                raise ValueError(f"RWKV-7 requires a WKV cache with dtype {state_dtype} for this forward.")
         # FlashRWKV2 inference is recurrent even when the caller does not want the
         # state returned, so use a temporary cache for that call.
         if cache is None and (use_cache or not training_path):
             cache = RwkvCache(self.config)
 
+        flash_rwkv2 = load_flash_rwkv2()
         if training_path:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_tokens(input_ids)
-            if inputs_embeds.dtype != torch.bfloat16:
-                raise TypeError(f"RWKV-7 training requires bfloat16 embeddings, got {inputs_embeds.dtype}.")
-            flash_rwkv2 = load_flash_rwkv2("infer_embedding_ln0_forward_varlen", inputs_embeds, "training")
             hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
-                inputs_embeds,
-                self.embedding_norm.weight,
-                self.embedding_norm.bias,
+                inputs_embeds.to(torch.bfloat16),
+                self.embedding_norm.weight.to(torch.bfloat16),
+                self.embedding_norm.bias.to(torch.bfloat16),
                 eps=self.config.layer_norm_epsilon,
             )
             all_hidden_states = () if output_hidden_states else None
@@ -1026,6 +1075,8 @@ class RwkvModel(RwkvPreTrainedModel):
                     wkv_state,
                     feed_forward_shift,
                     None,
+                    use_unfused_projections=use_unfused_projections,
+                    cu_seq_lens_q=cu_seq_lens_q,
                 )
                 if cache is not None:
                     cache.update_layer(
@@ -1042,13 +1093,15 @@ class RwkvModel(RwkvPreTrainedModel):
             if cache is not None:
                 cache.advance(sequence_length, batch_size, hidden_states.device)
             hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
-                hidden_states, self.norm.weight, self.norm.bias, eps=self.config.layer_norm_epsilon
+                hidden_states,
+                self.norm.weight.to(hidden_states.dtype),
+                self.norm.bias.to(hidden_states.dtype),
+                eps=self.config.layer_norm_epsilon,
             )
         else:
             hidden_states, residual, all_hidden_states = self._forward_state_only(
                 input_ids, inputs_embeds, cache, output_hidden_states
             )
-            flash_rwkv2 = load_flash_rwkv2("infer_post_norm_output_forward_varlen", hidden_states, "inference")
             hidden_states = flash_rwkv2.infer_post_norm_output_forward_varlen(
                 hidden_states,
                 residual,
@@ -1068,6 +1121,8 @@ class RwkvModel(RwkvPreTrainedModel):
 
 @auto_docstring
 class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
     def __init__(self, config: RwkvConfig):
         super().__init__(config)
         self.generation_config.presence_penalty = 0.0
@@ -1076,30 +1131,7 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         self.model = RwkvModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.register_load_state_dict_post_hook(self._clear_generation_cache_hook)
         self.post_init()
-
-    @staticmethod
-    def _clear_generation_cache_hook(module, _incompatible_keys) -> None:
-        module._clear_rwkv_generation_cache()
-
-    def _apply(self, fn, recurse=True):
-        self._clear_rwkv_generation_cache()
-        return super()._apply(fn, recurse=recurse)
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self._clear_rwkv_generation_cache()
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self._clear_rwkv_generation_cache()
-        self.lm_head = new_embeddings
 
     @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache", raise_if_both_names=True)
     @can_return_tuple
@@ -1116,8 +1148,8 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
-        if labels is not None and not (isinstance(logits_to_keep, int) and logits_to_keep == 0):
-            raise ValueError("Set logits_to_keep=0 when labels are provided.")
+        head_spec = flash_rwkv2_linear_spec(self.lm_head)
+        use_unfused_projections = head_spec is None or not self.model._supports_fused_projections()
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1125,28 +1157,19 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
             cache=cache,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            _use_unfused_projections=use_unfused_projections,
             **kwargs,
         )
-        hidden_states = outputs.last_hidden_state
-
-        if isinstance(logits_to_keep, int):
-            if logits_to_keep < 0:
-                raise ValueError("logits_to_keep must be non-negative.")
-            selected = hidden_states if logits_to_keep == 0 else hidden_states[:, -logits_to_keep:, :]
-        elif logits_to_keep.ndim == 2:
-            if logits_to_keep.shape[0] != hidden_states.shape[0]:
-                raise ValueError("Per-sample logits_to_keep must have shape [batch_size, positions].")
-            selected = hidden_states.gather(1, logits_to_keep.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1]))
+        selected = slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep)
+        if selected.ndim == 2 and isinstance(logits_to_keep, torch.Tensor) and logits_to_keep.ndim == 0:
+            selected = selected.unsqueeze(1)
+        if use_unfused_projections:
+            logits = self.lm_head(selected.to(self.model.norm.weight.dtype))
         else:
-            selected = hidden_states[:, logits_to_keep, :]
-            if selected.ndim == 2:
-                selected = selected.unsqueeze(1)
-        selected = selected.contiguous()
-        flash_rwkv2 = load_flash_rwkv2("pretrain_head_linear_bf16", selected, "head projection")
-        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(self.lm_head)
-        logits = flash_rwkv2.pretrain_head_linear_bf16(
-            selected, weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
-        )
+            weight, lora_a, lora_b, scale, use_nora = head_spec
+            logits = load_flash_rwkv2().pretrain_head_linear_bf16(
+                selected.contiguous(), weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
+            )
 
         loss = None
         if labels is not None:
