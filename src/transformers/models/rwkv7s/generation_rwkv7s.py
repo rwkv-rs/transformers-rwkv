@@ -230,6 +230,7 @@ class _Rwkv7sDecodeGraph:
         batch_size: int,
         max_new_tokens: int,
         generation_config: GenerationConfig,
+        use_autodeco: bool,
         eos_token_ids: torch.Tensor | None,
         stop_string_criteria: tuple[StopStringCriteria, ...],
         capture_stream: torch.cuda.Stream,
@@ -242,11 +243,8 @@ class _Rwkv7sDecodeGraph:
         self.batch_size = batch_size
         self.max_new_tokens = max_new_tokens
         self.do_sample = generation_config.do_sample
-        self.use_autodeco = self.do_sample and bool(
-            getattr(generation_config, "use_autodeco", model.config.use_autodeco)
-        )
-        self.autodeco_temperature: torch.Tensor | None = None
-        self.autodeco_top_p: torch.Tensor | None = None
+        self.use_autodeco = use_autodeco
+        self.autodeco_temperature = self.autodeco_top_p = None
         self.presence_penalty = getattr(generation_config, "presence_penalty", 0.0)
         self.frequency_penalty = getattr(generation_config, "frequency_penalty", 0.0)
         self.penalty_decay = getattr(generation_config, "penalty_decay", 0.996)
@@ -438,6 +436,7 @@ class _Rwkv7sGenerationModelRunner:
         input_ids: torch.LongTensor,
         generation_config: GenerationConfig,
         max_length: int,
+        use_autodeco: bool,
         eos_token_ids: torch.Tensor | None,
         stop_string_criteria: tuple[StopStringCriteria, ...],
     ) -> None:
@@ -453,29 +452,36 @@ class _Rwkv7sGenerationModelRunner:
         )
         capture_stream = torch.cuda.Stream(device=input_ids.device)
         graph_pool = torch.cuda.graph_pool_handle()
-        self.prefill_graphs = {
-            sequence_length: _Rwkv7sPrefillGraph(
-                model.model,
+        original_experts_impl = model.config._experts_implementation
+        if original_experts_impl in ("eager", "grouped_mm"):
+            model.config._experts_implementation = "batched_mm"
+        try:
+            self.prefill_graphs = {
+                sequence_length: _Rwkv7sPrefillGraph(
+                    model.model,
+                    self.state,
+                    batch_size,
+                    sequence_length,
+                    capture_stream,
+                    graph_pool,
+                )
+                for sequence_length in dict.fromkeys(self.prefill_lengths)
+            }
+            self.decode_graph = _Rwkv7sDecodeGraph(
+                model,
                 self.state,
                 batch_size,
-                sequence_length,
+                max_new_tokens,
+                generation_config,
+                use_autodeco,
+                eos_token_ids,
+                stop_string_criteria,
                 capture_stream,
                 graph_pool,
+                flash_rwkv2,
             )
-            for sequence_length in dict.fromkeys(self.prefill_lengths)
-        }
-        self.decode_graph = _Rwkv7sDecodeGraph(
-            model,
-            self.state,
-            batch_size,
-            max_new_tokens,
-            generation_config,
-            eos_token_ids,
-            stop_string_criteria,
-            capture_stream,
-            graph_pool,
-            flash_rwkv2,
-        )
+        finally:
+            model.config._experts_implementation = original_experts_impl
 
     def generate(
         self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None
@@ -618,7 +624,7 @@ class Rwkv7sGenerationMixin(GenerationMixin):
         generation_config: GenerationConfig,
         synced_gpus: bool,
         model_kwargs: dict,
-    ) -> tuple[int, torch.Tensor | None, tuple[StopStringCriteria, ...]]:
+    ) -> tuple[int, torch.Tensor | None, tuple[StopStringCriteria, ...], bool]:
         if flash_rwkv2_linear_spec(self.lm_head) is None or not self.model._supports_fused_projections():
             raise ValueError("RWKV-7S generation requires fused projections. Merge unsupported PEFT adapters first.")
         if input_ids.device.type != "cuda" or self.lm_head.weight.device != input_ids.device:
@@ -656,11 +662,10 @@ class Rwkv7sGenerationMixin(GenerationMixin):
             raise ValueError(
                 f"RWKV-7S CUDA graph generation does not support model kwargs {sorted(unsupported_kwargs)}."
             )
-        if (
-            generation_config.do_sample
-            and bool(getattr(generation_config, "use_autodeco", self.config.use_autodeco))
-            and not self.config.use_autodeco
-        ):
+        use_autodeco = generation_config.do_sample and bool(
+            getattr(generation_config, "use_autodeco", self.config.use_autodeco)
+        )
+        if use_autodeco and not self.config.use_autodeco:
             raise ValueError(
                 "RWKV-7S `use_autodeco=True` generation requires a model with `config.use_autodeco=True`."
             )
@@ -681,7 +686,7 @@ class Rwkv7sGenerationMixin(GenerationMixin):
             criteria for criteria in stopping_criteria if isinstance(criteria, StopStringCriteria)
         )
         self._validate_graph_logits_processors(logits_processor, generation_config)
-        return max_length, eos_token_ids, stop_string_criteria
+        return max_length, eos_token_ids, stop_string_criteria, use_autodeco
 
     @staticmethod
     def _graph_generation_key(
@@ -730,16 +735,13 @@ class Rwkv7sGenerationMixin(GenerationMixin):
         streamer: BaseStreamer | None = None,
         **model_kwargs,
     ) -> torch.LongTensor:
-        max_length, eos_token_ids, stop_string_criteria = self._validate_graph_generation(
+        max_length, eos_token_ids, stop_string_criteria, use_autodeco = self._validate_graph_generation(
             input_ids,
             logits_processor,
             stopping_criteria,
             generation_config,
             synced_gpus,
             model_kwargs,
-        )
-        use_autodeco = generation_config.do_sample and bool(
-            getattr(generation_config, "use_autodeco", self.config.use_autodeco)
         )
         key = self._graph_generation_key(
             input_ids,
@@ -788,6 +790,7 @@ class Rwkv7sGenerationMixin(GenerationMixin):
                     input_ids,
                     generation_config,
                     max_length,
+                    use_autodeco,
                     eos_token_ids,
                     stop_string_criteria,
                 )

@@ -13,13 +13,13 @@ specific language governing permissions and limitations under the License.
 rendered properly in your Markdown viewer.
 
 -->
-*This model was contributed to Hugging Face Transformers on 2023-05-09.*
+*This model was contributed to Hugging Face Transformers on 2026-11-26.*
 
 # RWKV-7S
 
 RWKV-7S lives in `transformers.models.rwkv7s`. The model source is
 [`src/transformers/models/rwkv7s/modeling_rwkv7s.py`](https://github.com/rwkv-rs/transformers-rwkv/blob/main/src/transformers/models/rwkv7s/modeling_rwkv7s.py).
-Import it with `from transformers import Rwkv7sForCausalLM, Rwkv7sConfig, Rwkv7sTokenizer, Rwkv7sCache`.
+Import it with `from transformers import Rwkv7sForCausalLM, Rwkv7sConfig, RwkvTokenizer, Rwkv7sCache`.
 `AutoModelForCausalLM` loads converted checkpoints without `trust_remote_code`. Loading an RWKV-4 checkpoint raises an error.
 
 ```bash
@@ -192,10 +192,6 @@ AutoDeco heads.
 
 [[autodoc]] Rwkv7sConfig
 
-## Rwkv7sTokenizer
-
-[[autodoc]] Rwkv7sTokenizer
-
 ## Rwkv7sCache
 
 [[autodoc]] Rwkv7sCache
@@ -229,6 +225,18 @@ AutoDeco heads.
 ## Rwkv7sFeedForward
 
 [[autodoc]] Rwkv7sFeedForward
+
+## Rwkv7sTopkRouter
+
+[[autodoc]] Rwkv7sTopkRouter
+
+## Rwkv7sExperts
+
+[[autodoc]] Rwkv7sExperts
+
+## Rwkv7sMLP
+
+[[autodoc]] Rwkv7sMLP
 
 ## Rwkv7sDecoderLayer
 

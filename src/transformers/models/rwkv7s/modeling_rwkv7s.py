@@ -22,7 +22,9 @@ from torch import nn
 from torch.nn import functional as F
 
 from ... import initialization as init
+from ...activations import ACT2FN
 from ...cache_utils import Cache, LinearAttentionLayer
+from ...integrations import use_experts_implementation
 from ...integrations.flash_rwkv2 import flash_rwkv2_linear_spec, load_flash_rwkv2
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
@@ -629,99 +631,94 @@ class Rwkv7sAttention(nn.Module):
         )
 
 
+class Rwkv7sMLP(nn.Module):
+    """Squared-ReLU shared expert MLP (`NemotronHMLP`)."""
+
+    def __init__(self, config: Rwkv7sConfig):
+        super().__init__()
+        self.up_proj = nn.Linear(config.hidden_size, config.shared_expert_intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.shared_expert_intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = ACT2FN["relu2"]
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.up_proj(hidden_states)))
+
+
+class Rwkv7sTopkRouter(nn.Module):
+    """Aux-loss-free sigmoid top-k router (`DeepseekV3TopkRouter` / `NemotronHTopkRouter`)."""
+
+    def __init__(self, config: Rwkv7sConfig):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.norm_topk_prob = config.norm_topk_prob
+        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, dtype=torch.float32))
+        self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts, dtype=torch.float32))
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states.float(), self.weight.float())
+        scores = router_logits.sigmoid()
+        topk_indices = torch.topk(scores + self.e_score_correction_bias.float(), k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_indices)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * self.routed_scaling_factor
+        return router_logits, topk_weights, topk_indices
+
+
+@use_experts_implementation(has_gate=False)
+class Rwkv7sExperts(nn.Module):
+    """Non-gated squared-ReLU (`relu2`) MoE experts stored as 3D tensors (`NemotronHExperts`)."""
+
+    def __init__(self, config: Rwkv7sConfig):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.up_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
+        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = ACT2FN["relu2"]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states, dtype=top_k_weights.dtype)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts + 1).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            current_hidden_states = F.linear(current_state, self.up_proj[expert_idx])
+            current_hidden_states = self.act_fn(current_hidden_states)
+            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states.to(hidden_states.dtype)
+
+
 class Rwkv7sFeedForward(nn.Module):
-    """ChannelMix, called `RWKV_CMix_x070` in RWKV-LM and `RWKV7FeedForward` in FLA and hf_rwkv."""
+    """Token-shifted squared-ReLU MoE ChannelMix (`x_k` shift + sigmoid router + routed and shared `relu2` experts)."""
 
     def __init__(self, config: Rwkv7sConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.x_k = nn.Parameter(torch.empty(config.hidden_size))
-        self.key = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.value = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-
-    def _training_forward(
-        self,
-        hidden_states: torch.Tensor,
-        feed_forward_shift: torch.Tensor | None,
-        use_unfused_projections: bool,
-        cu_seqlens: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if use_unfused_projections:
-            previous = (
-                F.pad(hidden_states[:, :-1], (0, 0, 1, 0))
-                if feed_forward_shift is None
-                else torch.cat((feed_forward_shift[:, None], hidden_states[:, :-1]), dim=1)
-            )
-            if cu_seqlens is not None:
-                previous = previous.index_fill(1, cu_seqlens[:-1].long(), 0)
-            x = hidden_states.float()
-            mixed = (x + (previous.float() - x) * self.x_k.float()).to(hidden_states.dtype)
-            features = self.key(mixed.to(self.x_k.dtype)).relu().square()
-            output = self.value(features).to(hidden_states.dtype)
-            return output, hidden_states[:, -1] if feed_forward_shift is not None else None
-
-        flash_rwkv2 = load_flash_rwkv2()
-        key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
-        value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
-        rows = hidden_states.squeeze(0) if cu_seqlens is not None else hidden_states
-        output = flash_rwkv2.pretrain_cmix_bf16(
-            rows.contiguous(),
-            self.x_k,
-            key_weight,
-            value_weight,
-            initial_shift=feed_forward_shift.contiguous() if feed_forward_shift is not None else None,
-            cu_seqlens=cu_seqlens,
-            return_final_state=feed_forward_shift is not None,
-            key_lora_a=key_a,
-            key_lora_b=key_b,
-            key_lora_scale=key_scale,
-            key_use_nora=key_nora,
-            value_lora_a=value_a,
-            value_lora_b=value_b,
-            value_lora_scale=value_scale,
-            value_use_nora=value_nora,
-        )
-        if cu_seqlens is not None:
-            output = output.unsqueeze(0)
-        return output if feed_forward_shift is not None else (output, None)
-
-    def _inference_forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        layer_norm: nn.LayerNorm,
-        feed_forward_shift: torch.Tensor,
-        inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        flash_rwkv2 = load_flash_rwkv2()
-        key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
-        value_weight, value_a, value_b, value_scale, value_nora = flash_rwkv2_linear_spec(self.value)
-        cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
-        hidden_states, residual = flash_rwkv2.infer_cmix_forward_varlen(
-            hidden_states.contiguous(),
-            residual.contiguous(),
-            layer_norm.weight,
-            layer_norm.bias,
-            self.x_k,
-            key_weight,
-            value_weight.t(),
-            shift_state_pool=feed_forward_shift,
-            cu_seqlens=cu_seqlens,
-            state_indices=state_indices,
-            max_seqlen=max_seqlen,
-            eps=self.config.layer_norm_epsilon,
-            validated_metadata=ticket,
-            key_lora_a=key_a,
-            key_lora_b=key_b,
-            key_lora_scale=key_scale,
-            key_use_nora=key_nora,
-            value_lora_a=value_a,
-            value_lora_b=value_b,
-            value_lora_scale=value_scale,
-            value_use_nora=value_nora,
-        )
-        return hidden_states, residual
+        self.gate = Rwkv7sTopkRouter(config)
+        self.experts = Rwkv7sExperts(config)
+        self.shared_experts = Rwkv7sMLP(config)
 
     def forward(
         self,
@@ -730,17 +727,47 @@ class Rwkv7sFeedForward(nn.Module):
         residual: torch.Tensor | None = None,
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
-        use_unfused_projections: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
-            return self._training_forward(
-                hidden_states,
-                feed_forward_shift,
-                use_unfused_projections,
-                cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
+            cu_seqlens = kwargs.pop("cu_seq_lens_q", None)
+            normed = hidden_states
+            previous = (
+                F.pad(normed[:, :-1], (0, 0, 1, 0))
+                if feed_forward_shift is None
+                else torch.cat((feed_forward_shift[:, None], normed[:, :-1]), dim=1)
             )
-        return self._inference_forward(hidden_states, residual, layer_norm, feed_forward_shift, inference_metadata)
+            if cu_seqlens is not None:
+                previous = previous.index_fill(1, cu_seqlens[:-1].long(), 0)
+            state_out = normed[:, -1] if feed_forward_shift is not None else None
+        else:
+            _, state_indices, max_seqlen, _ = inference_metadata
+            state_out = hidden_states + residual
+            normed = (
+                load_flash_rwkv2()
+                .infer_embedding_ln0_forward_varlen(
+                    state_out.contiguous(),
+                    layer_norm.weight,
+                    layer_norm.bias,
+                    eps=self.config.layer_norm_epsilon,
+                )
+                .view(state_indices.numel(), max_seqlen, -1)
+            )
+            previous = (
+                feed_forward_shift[:, None, :]
+                if max_seqlen == 1
+                else torch.cat((feed_forward_shift[:, None, :], normed[:, :-1, :]), dim=1)
+            )
+
+        x = normed.float()
+        flat = (x + (previous.float() - x) * self.x_k.float()).to(normed.dtype).reshape(-1, normed.shape[-1])
+        if hidden_states.ndim == 2:
+            feed_forward_shift.copy_(normed[:, -1, :])
+        _, topk_weights, topk_indices = self.gate(flat)
+        output = (self.experts(flat, topk_indices, topk_weights) + self.shared_experts(flat.to(self.x_k.dtype))).to(
+            normed.dtype
+        )
+        return output.view_as(hidden_states), state_out
 
 
 class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
@@ -791,7 +818,6 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
                     eps=self.post_attention_layernorm.eps,
                 ),
                 feed_forward_shift,
-                use_unfused_projections=use_unfused_projections,
                 **kwargs,
             )
             hidden_states = hidden_states + feed_forward_output
@@ -845,12 +871,12 @@ class Rwkv7sCausalLMOutputWithPast(CausalLMOutputWithPast):
 class Rwkv7sAutoDeco(nn.Module):
     """AutoDeco dynamic temperature and top-p heads (`TempHead` + `TopPHead` in RWKV-AUTODECO)."""
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int = 64):
         super().__init__()
-        self.temp_fc1 = nn.Linear(hidden_size, 64)
-        self.temp_fc2 = nn.Linear(64, 1)
-        self.top_p_fc1 = nn.Linear(hidden_size + 5, 64)
-        self.top_p_fc2 = nn.Linear(64, 1)
+        self.temp_fc1 = nn.Linear(hidden_size, intermediate_size)
+        self.temp_fc2 = nn.Linear(intermediate_size, 1)
+        self.top_p_fc1 = nn.Linear(hidden_size + 5, intermediate_size)
+        self.top_p_fc2 = nn.Linear(intermediate_size, 1)
 
     def forward(self, hidden_states: torch.Tensor, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = hidden_states.detach()
@@ -873,6 +899,7 @@ class Rwkv7sAutoDeco(nn.Module):
         return temp, top_p
 
 
+@auto_docstring
 class Rwkv7sPreTrainedModel(PreTrainedModel):
     config: Rwkv7sConfig
     base_model_prefix = "model"
@@ -880,6 +907,7 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["Rwkv7sDecoderLayer"]
     _is_stateful = True
     _can_compile_fullgraph = False
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "gate.weight"]
 
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -942,13 +970,20 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
             ddd = torch.arange(channels, device=module.x_k.device, dtype=torch.float32) / channels
             ratio = 1.0 - module.layer_idx / self.config.num_hidden_layers
             init.copy_(module.x_k, (1 - ddd.pow(ratio**4)).to(module.x_k.dtype))
-            init.orthogonal_(module.key.weight)
-            init.zeros_(module.value.weight)
+            init.orthogonal_(module.shared_experts.up_proj.weight)
+            init.zeros_(module.shared_experts.down_proj.weight)
+        elif isinstance(module, Rwkv7sTopkRouter):
+            init.normal_(module.weight, mean=0.0, std=0.02)
+            init.zeros_(module.e_score_correction_bias)
+        elif isinstance(module, Rwkv7sExperts):
+            init.normal_(module.up_proj, mean=0.0, std=0.02)
+            init.normal_(module.down_proj, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
             init.ones_(module.weight)
             init.zeros_(module.bias)
 
 
+@auto_docstring
 class Rwkv7sModel(Rwkv7sPreTrainedModel):
     def __init__(self, config: Rwkv7sConfig):
         super().__init__(config)
@@ -970,8 +1005,6 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 layer.linear_attn.k_proj,
                 layer.linear_attn.v_proj,
                 layer.linear_attn.o_proj,
-                layer.mlp.key,
-                layer.mlp.value,
             )
         )
 
@@ -1055,7 +1088,6 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         cache: Cache | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
-        output_hidden_states: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Rwkv7sModelOutputWithPast:
         if (input_ids is None) == (inputs_embeds is None):
@@ -1081,6 +1113,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         if use_cache is None:
             use_cache = cache is not None or (not training_path and self.config.use_cache)
         training_path = training_path or use_unfused_projections or cu_seq_lens_q is not None
+        output_hidden_states = kwargs.pop("output_hidden_states", None)
         output_hidden_states = (
             self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         )
@@ -1357,9 +1390,12 @@ __all__ = [
     "Rwkv7sCache",
     "Rwkv7sCausalLMOutputWithPast",
     "Rwkv7sDecoderLayer",
+    "Rwkv7sExperts",
     "Rwkv7sFeedForward",
     "Rwkv7sForCausalLM",
+    "Rwkv7sMLP",
     "Rwkv7sModel",
     "Rwkv7sModelOutputWithPast",
     "Rwkv7sPreTrainedModel",
+    "Rwkv7sTopkRouter",
 ]

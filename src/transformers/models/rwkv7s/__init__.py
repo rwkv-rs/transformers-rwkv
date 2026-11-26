@@ -26,7 +26,6 @@ from ...utils.import_utils import define_import_structure
 if TYPE_CHECKING:
     from .configuration_rwkv7s import *
     from .modeling_rwkv7s import *
-    from .tokenization_rwkv7s import *
 else:
     import sys
 

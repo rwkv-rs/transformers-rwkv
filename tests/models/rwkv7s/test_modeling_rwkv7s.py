@@ -47,7 +47,10 @@ def tiny_config(**kwargs) -> Rwkv7sConfig:
         "context_length": 32,
         "hidden_size": 64,
         "num_hidden_layers": 2,
-        "intermediate_size": 256,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 64,
+        "shared_expert_intermediate_size": 64,
         "head_size": 64,
         "decay_low_rank_dim": 32,
         "a_low_rank_dim": 32,
@@ -154,9 +157,7 @@ class Rwkv7sBF16ProviderTest(unittest.TestCase):
         torch.manual_seed(121)
         for heads in (40, 64):
             with self.subTest(heads=heads):
-                config = tiny_config(
-                    hidden_size=64 * heads, intermediate_size=None, num_hidden_layers=1, wkv_mode="fp16"
-                )
+                config = tiny_config(hidden_size=64 * heads, num_hidden_layers=1, wkv_mode="fp16")
                 model = Rwkv7sForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
                 for parameter in model.parameters():
                     if parameter.ndim >= 2:
@@ -467,7 +468,7 @@ class Rwkv7sBF16ProviderTest(unittest.TestCase):
     def test_trainer_right_padding_eval_save_reload_and_resume(self):
         from transformers import DataCollatorForLanguageModeling, Trainer, TrainingArguments
 
-        from .test_tokenization_rwkv7s import make_tokenizer
+        from ..rwkv.test_tokenization_rwkv import make_tokenizer
 
         tokenizer = make_tokenizer()
         tokenizer.pad_token = tokenizer.eos_token
@@ -539,7 +540,7 @@ class Rwkv7sNoRATrainingTest(unittest.TestCase):
                     lora_alpha=16,
                     lora_dropout=0.0,
                     use_nora=use_nora,
-                    target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
+                    target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "lm_head"],
                 ),
             )
             model.train()
@@ -617,7 +618,7 @@ class Rwkv7sNoRATrainingTest(unittest.TestCase):
                 task_type=TaskType.CAUSAL_LM,
                 r=8,
                 lora_alpha=8,
-                target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "key", "value", "lm_head"],
+                target_modules=["r_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "lm_head"],
             ),
         )
         with torch.no_grad():
@@ -647,7 +648,7 @@ class Rwkv7sNoRATrainingTest(unittest.TestCase):
                     for parameter in base.parameters():
                         if parameter.ndim >= 2:
                             parameter.normal_(std=0.03)
-                config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=["r_proj", "key"], **options)
+                config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=["r_proj", "up_proj"], **options)
                 model = get_peft_model(base, config)
                 if not options:
                     model.add_adapter("second", config)
@@ -695,7 +696,7 @@ class Rwkv7sNoRATrainingTest(unittest.TestCase):
             )
             prepare_model_for_kbit_training(quantized, gradient_checkpointing_kwargs={"use_reentrant": True})
             model = get_peft_model(
-                quantized, LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=["r_proj", "key"])
+                quantized, LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, target_modules=["r_proj", "up_proj"])
             ).train()
             self.assertFalse(quantized.model._supports_fused_projections())
             ids = torch.randint(1, base.config.vocab_size, (2, 7), device="cuda")
@@ -893,6 +894,34 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
         )
         self.assertEqual(len(model._rwkv7s_generation_graphs), 2)
         self.assertIsNone(next(reversed(model._rwkv7s_generation_graphs.values())).decode_graph.autodeco_temperature)
+
+    def test_moe_router_bias_and_experts_backends(self):
+        torch.manual_seed(135)
+        model = Rwkv7sForCausalLM(tiny_config(num_experts=4, num_experts_per_tok=2)).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.05)
+        ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
+
+        outputs = {}
+        for impl in ("eager", "batched_mm", "grouped_mm"):
+            model.config._experts_implementation = impl
+            with torch.no_grad():
+                outputs[impl] = model.eval()(ids, use_cache=False).logits
+        torch.testing.assert_close(outputs["batched_mm"], outputs["eager"], atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(outputs["grouped_mm"], outputs["eager"], atol=2e-2, rtol=2e-2)
+
+        # Aux-loss-free e_score_correction_bias steers expert selection without changing sigmoid weights.
+        router = model.model.layers[0].mlp.gate
+        x = torch.randn(4, model.config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            router.e_score_correction_bias.copy_(torch.tensor([10.0, -10.0, 10.0, -10.0], device="cuda"))
+            _, weights, indices = router(x)
+        self.assertEqual(set(indices.flatten().tolist()), {0, 2})
+        torch.testing.assert_close(weights.sum(dim=-1), torch.ones(4, device="cuda"), atol=1e-5, rtol=0)
 
 
 if __name__ == "__main__":

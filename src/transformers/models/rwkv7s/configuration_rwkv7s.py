@@ -27,8 +27,18 @@ class Rwkv7sConfig(PreTrainedConfig):
         Architecture generation stored in converted checkpoints. Only RWKV-7S is accepted.
     context_length (`int`, *optional*, defaults to 4096):
         Maximum sequence length used during pretraining. Recurrent inference can continue beyond this length.
-    intermediate_size (`int`, *optional*):
-        Width of the RWKV-7S ChannelMix activation. Defaults to four times `hidden_size`.
+    num_experts (`int`, *optional*, defaults to 8):
+        Number of routed squared-ReLU MoE experts per layer.
+    num_experts_per_tok (`int`, *optional*, defaults to 2):
+        Number of routed experts activated per token.
+    moe_intermediate_size (`int`, *optional*):
+        Intermediate width of each routed squared-ReLU expert. Defaults to `hidden_size`.
+    shared_expert_intermediate_size (`int`, *optional*):
+        Intermediate width of the always-active squared-ReLU shared expert. Defaults to `hidden_size`.
+    routed_scaling_factor (`float`, *optional*, defaults to 1.0):
+        Scaling factor applied to the selected routed expert weights.
+    norm_topk_prob (`bool`, *optional*, defaults to `True`):
+        Whether to normalize the top-k sigmoid router weights so they sum to 1 before scaling.
     head_size (`int`, *optional*, defaults to 64):
         Width of each RWKV-7S recurrent head.
     group_norm_epsilon (`float`, *optional*, defaults to 0.00064):
@@ -59,7 +69,12 @@ class Rwkv7sConfig(PreTrainedConfig):
     context_length: int = 4096
     hidden_size: int = 4096
     num_hidden_layers: int = 32
-    intermediate_size: int | None = None
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    moe_intermediate_size: int | None = None
+    shared_expert_intermediate_size: int | None = None
+    routed_scaling_factor: float = 1.0
+    norm_topk_prob: bool = True
     head_size: int = 64
     num_attention_heads: int | None = None
     layer_norm_epsilon: float = 1e-5
@@ -80,8 +95,12 @@ class Rwkv7sConfig(PreTrainedConfig):
     def __post_init__(self, **kwargs):
         if self.architecture_version != "rwkv7s" or {"attention_hidden_size", "rescale_every"}.intersection(kwargs):
             raise ValueError("This `rwkv7s` implementation requires an RWKV-7S checkpoint.")
-        if self.intermediate_size is None:
-            self.intermediate_size = 4 * self.hidden_size
+        if self.num_experts < 1 or not 1 <= self.num_experts_per_tok <= self.num_experts:
+            raise ValueError("`num_experts_per_tok` must satisfy 1 <= num_experts_per_tok <= num_experts.")
+        if self.moe_intermediate_size is None:
+            self.moe_intermediate_size = self.hidden_size
+        if self.shared_expert_intermediate_size is None:
+            self.shared_expert_intermediate_size = self.hidden_size
         if self.head_size not in (64, 128, 256) or self.hidden_size % self.head_size:
             raise ValueError("`head_size` must be 64, 128, or 256 and divide `hidden_size`.")
         self.num_attention_heads = self.hidden_size // self.head_size
