@@ -194,9 +194,9 @@ class RwkvStructureTest(unittest.TestCase):
                 "infer_sampling_six_parameter_forward_varlen",
             )
         )
-        self.assertEqual(module.__version__, "0.2.0a1")
+        self.assertEqual(module.__version__, "0.2.0a4")
         with mock.patch.object(module, "__version__", "0.1.0a19"):
-            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.2\.0a1"):
+            with self.assertRaisesRegex(RuntimeError, r"requires FlashRWKV2==0\.2\.0a4"):
                 load_flash_rwkv2("pretrain_cmix_bf16")
         with self.assertRaisesRegex(RuntimeError, "public operators"):
             load_flash_rwkv2("operator_that_does_not_exist")
