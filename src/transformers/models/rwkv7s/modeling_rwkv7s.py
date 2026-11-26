@@ -522,6 +522,7 @@ class Rwkv7sAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flash_rwkv2 = load_flash_rwkv2()
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
+        saved_tmix = getattr(cache, "saved_tmix_norm", None)
         residual, xr, xw, xk, xv, xa, xg = flash_rwkv2.infer_tmix_postnorm_tokenshift_forward_varlen(
             hidden_states.contiguous(),
             residual.contiguous(),
@@ -539,6 +540,7 @@ class Rwkv7sAttention(nn.Module):
             max_seqlen=max_seqlen,
             eps=self.config.layer_norm_epsilon,
             validated_metadata=ticket,
+            save_normalized=None if saved_tmix is None else saved_tmix[self.layer_idx],
         )
 
         r_weight, r_lora_a, r_lora_b, r_lora_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj)
@@ -755,6 +757,7 @@ class Rwkv7sFeedForward(nn.Module):
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
         input_ids: torch.LongTensor | None = None,
+        saved_cmix_norm: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
@@ -781,6 +784,8 @@ class Rwkv7sFeedForward(nn.Module):
                 )
                 .view(state_indices.numel(), max_seqlen, -1)
             )
+            if saved_cmix_norm is not None:
+                saved_cmix_norm.copy_(normed)
             previous = (
                 feed_forward_shift[:, None, :]
                 if max_seqlen == 1
@@ -869,6 +874,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
             inference_metadata=inference_metadata,
             cache=cache,
         )
+        saved_cmix = getattr(cache, "saved_cmix_norm", None)
         hidden_states, residual = self.mlp(
             layer_input,
             feed_forward_shift,
@@ -876,6 +882,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
             layer_norm=self.post_attention_layernorm,
             inference_metadata=inference_metadata,
             input_ids=input_ids,
+            saved_cmix_norm=None if saved_cmix is None else saved_cmix[self.mlp.layer_idx],
         )
         return hidden_states, residual, v_first, None, None
 
@@ -936,6 +943,32 @@ class Rwkv7sAutoDeco(nn.Module):
         return temp, top_p
 
 
+class Rwkv7sMTP(nn.Module):
+    """Shared LightMTP head (`RwkvMTPBlock` in irwkv), looped `mtp_depth` times with shared `lm_head`."""
+
+    def __init__(self, config: Rwkv7sConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        intermediate_size = config.mtp_intermediate_size
+        eps = config.layer_norm_epsilon
+        self.norm_h = nn.LayerNorm(hidden_size, eps=eps)
+        self.norm_e = nn.LayerNorm(hidden_size, eps=eps)
+        self.proj = nn.Linear(2 * hidden_size, hidden_size, bias=False)
+        self.norm_mlp = nn.LayerNorm(hidden_size, eps=eps)
+        self.gate = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.norm_out = nn.LayerNorm(hidden_size, eps=eps)
+
+    def forward(self, hidden_states: torch.Tensor, token_embeds: torch.Tensor) -> torch.Tensor:
+        dtype = self.proj.weight.dtype
+        hidden = hidden_states.to(dtype)
+        fused = self.proj(torch.cat((self.norm_e(token_embeds.to(dtype)), self.norm_h(hidden)), dim=-1))
+        hidden = hidden + fused
+        mlp_in = self.norm_mlp(hidden)
+        return hidden + self.down(F.silu(self.gate(mlp_in)) * self.up(mlp_in))
+
+
 @auto_docstring
 class Rwkv7sPreTrainedModel(PreTrainedModel):
     config: Rwkv7sConfig
@@ -944,7 +977,7 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["Rwkv7sDecoderLayer"]
     _is_stateful = True
     _can_compile_fullgraph = False
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "gate.weight"]
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mlp.gate.weight"]
 
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -1329,7 +1362,73 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.autodeco = Rwkv7sAutoDeco(config.hidden_size)
+        self.mtp = Rwkv7sMTP(config)
         self.post_init()
+
+    def _project_lm_head(
+        self, hidden_states: torch.Tensor, head_spec, use_unfused_projections: bool, *, detach_head: bool = False
+    ) -> torch.Tensor:
+        if use_unfused_projections:
+            if detach_head:
+                weight = self.lm_head.weight.detach()
+                return F.linear(hidden_states.to(weight.dtype), weight)
+            return self.lm_head(hidden_states.to(self.model.norm.weight.dtype))
+        weight, lora_a, lora_b, scale, use_nora = head_spec
+        if detach_head:
+            weight = weight.detach()
+            lora_a = None if lora_a is None else lora_a.detach()
+            lora_b = None if lora_b is None else lora_b.detach()
+        return load_flash_rwkv2().pretrain_head_linear_bf16(
+            hidden_states.contiguous(), weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
+        )
+
+    def _mtp_loss(
+        self,
+        hidden_states: torch.Tensor,
+        token_embeds: torch.Tensor,
+        labels: torch.Tensor,
+        head_spec,
+        use_unfused_projections: bool,
+        *,
+        detach_head: bool = False,
+        shift_labels: torch.Tensor | None = None,
+        cu_seq_lens_q: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        targets = shift_labels if shift_labels is not None else F.pad(labels, (0, 1), value=-100)[..., 1:]
+        targets = targets.to(hidden_states.device)
+        seq_ids = None
+        if cu_seq_lens_q is not None:
+            lengths = (cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]).long()
+            seq_ids = torch.repeat_interleave(
+                torch.arange(lengths.numel(), device=hidden_states.device), lengths
+            ).unsqueeze(0)
+
+        h = hidden_states
+        total_loss = None
+        active_steps = 0
+        seq_total = hidden_states.shape[1]
+        for step in range(self.config.mtp_depth):
+            span = seq_total - (step + 2)
+            if span <= 0:
+                break
+            h = self.mtp(h[:, :span], token_embeds[:, step + 1 : step + 1 + span])
+            step_targets = targets[:, step + 1 : step + 1 + span]
+            if seq_ids is not None:
+                same_seq = seq_ids[:, :span] == seq_ids[:, step + 2 : step + 2 + span]
+                step_targets = step_targets.masked_fill(~same_seq, -100)
+            if not (step_targets != -100).any():
+                continue
+            step_logits = self._project_lm_head(
+                self.mtp.norm_out(h), head_spec, use_unfused_projections, detach_head=detach_head
+            )
+            step_loss = F.cross_entropy(
+                step_logits.reshape(-1, self.vocab_size).float(), step_targets.reshape(-1), ignore_index=-100
+            )
+            total_loss = step_loss if total_loss is None else total_loss + step_loss
+            active_steps += 1
+        if total_loss is None:
+            return h.sum().float() * 0.0
+        return total_loss / active_steps
 
     def _autodeco_loss(
         self,
@@ -1388,6 +1487,7 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         train_autodeco: bool | None = None,
+        train_mtp: bool | None = None,
         rosa_ids: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Rwkv7sCausalLMOutputWithPast:
@@ -1395,15 +1495,23 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
         train_autodeco (`bool`, *optional*):
             When `True`, runs the backbone and LM head without gradients and computes the AutoDeco loss when `labels`
             are provided. Defaults to `config.train_autodeco`.
+        train_mtp (`bool`, *optional*):
+            When `True`, runs the backbone without gradients and computes only the LightMTP loss when `labels` are
+            provided. Defaults to `config.train_mtp`.
         rosa_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Precomputed token-level ROSA successor IDs (`-1` when unmatched). Computed automatically when omitted.
         """
         if train_autodeco is None:
             train_autodeco = self.config.train_autodeco
+        if train_mtp is None:
+            train_mtp = self.config.train_mtp
+        if train_autodeco and train_mtp:
+            raise ValueError("`train_autodeco` and `train_mtp` cannot both be True.")
 
         head_spec = flash_rwkv2_linear_spec(self.lm_head)
         use_unfused_projections = head_spec is None or not self.model._supports_fused_projections()
-        with torch.no_grad() if train_autodeco else nullcontext():
+        freeze_backbone = train_autodeco or train_mtp
+        with torch.no_grad() if freeze_backbone else nullcontext():
             outputs: Rwkv7sModelOutputWithPast = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1421,13 +1529,7 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
             )
             if unsqueeze_scalar:
                 selected = selected.unsqueeze(1)
-            if use_unfused_projections:
-                logits = self.lm_head(selected.to(self.model.norm.weight.dtype))
-            else:
-                weight, lora_a, lora_b, scale, use_nora = head_spec
-                logits = load_flash_rwkv2().pretrain_head_linear_bf16(
-                    selected.contiguous(), weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
-                )
+            logits = self._project_lm_head(selected, head_spec, use_unfused_projections)
 
         autodeco_hidden = slice_logits_to_keep(outputs.autodeco_hidden_state, logits_to_keep)
         if unsqueeze_scalar:
@@ -1439,7 +1541,26 @@ class Rwkv7sForCausalLM(Rwkv7sPreTrainedModel, Rwkv7sGenerationMixin):
             if train_autodeco:
                 loss = self._autodeco_loss(logits, temp_logits, top_p_logits, labels, kwargs.get("shift_labels"))
             else:
-                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+                if not train_mtp:
+                    loss = self.loss_function(
+                        logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                    )
+                if train_mtp or self.config.mtp_loss_scaling_factor > 0.0:
+                    with torch.no_grad() if train_mtp else nullcontext():
+                        token_embeds = (
+                            inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
+                        )
+                    mtp_loss = self._mtp_loss(
+                        outputs.last_hidden_state.detach() if train_mtp else outputs.last_hidden_state,
+                        token_embeds.detach() if train_mtp else token_embeds,
+                        labels,
+                        head_spec,
+                        use_unfused_projections,
+                        detach_head=train_mtp,
+                        shift_labels=kwargs.get("shift_labels"),
+                        cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+                    )
+                    loss = mtp_loss if train_mtp else loss + self.config.mtp_loss_scaling_factor * mtp_loss
 
         return Rwkv7sCausalLMOutputWithPast(
             loss=loss,
@@ -1461,6 +1582,7 @@ __all__ = [
     "Rwkv7sFeedForward",
     "Rwkv7sForCausalLM",
     "Rwkv7sMLP",
+    "Rwkv7sMTP",
     "Rwkv7sModel",
     "Rwkv7sModelOutputWithPast",
     "Rwkv7sPreTrainedModel",

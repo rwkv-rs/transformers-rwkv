@@ -62,7 +62,9 @@ def tiny_config(**kwargs) -> Rwkv7sConfig:
 
 
 def lm_parameters(model: "Rwkv7sForCausalLM") -> tuple["torch.nn.Parameter", ...]:
-    return tuple(parameter for name, parameter in model.named_parameters() if not name.startswith("autodeco."))
+    return tuple(
+        parameter for name, parameter in model.named_parameters() if not name.startswith(("autodeco.", "mtp."))
+    )
 
 
 @require_torch
@@ -257,7 +259,7 @@ class Rwkv7sBF16ProviderTest(unittest.TestCase):
                     torch.testing.assert_close(stateful_gradient, expected_gradient, atol=1e-4, rtol=0.02)
                 training.loss.backward()
                 for name, parameter in model.named_parameters():
-                    if name.startswith("autodeco."):
+                    if name.startswith(("autodeco.", "mtp.")):
                         self.assertIsNone(parameter.grad, name)
                     else:
                         self.assertIsNotNone(parameter.grad, name)
@@ -965,6 +967,148 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
             torch.testing.assert_close(
                 generated, torch.cat((ids[:, :6], torch.stack(expected_tokens, dim=1)), dim=1), atol=0, rtol=0
             )
+
+    def test_mtp_training_standalone_and_joint(self):
+        from transformers import DataCollatorWithFlattening
+
+        torch.manual_seed(140)
+        cfg = tiny_config(mtp_depth=3, mtp_intermediate_size=128)
+        model = Rwkv7sForCausalLM(cfg).to(device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            for parameter in model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.05)
+        ids = torch.randint(1, cfg.vocab_size, (2, 10), device="cuda")
+
+        # Standalone MTP training (train_mtp=True) updates only mtp.* parameters.
+        model.train()
+        out = model(ids, labels=ids, use_cache=False, train_mtp=True)
+        self.assertTrue(torch.isfinite(out.loss))
+        out.loss.backward()
+        for name, parameter in model.named_parameters():
+            if name.startswith("mtp."):
+                self.assertIsNotNone(parameter.grad, name)
+                self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                self.assertGreater(parameter.grad.float().norm().item(), 0.0, name)
+            else:
+                self.assertIsNone(parameter.grad, name)
+
+        # Packed sequences respect sequence boundaries in MTP loss.
+        model.zero_grad(set_to_none=True)
+        collator = DataCollatorWithFlattening(return_flash_attn_kwargs=True)
+        packed_batch = {
+            k: v.cuda() if isinstance(v, torch.Tensor) else v
+            for k, v in collator([{"input_ids": list(range(1, 7))}, {"input_ids": list(range(10, 16))}]).items()
+        }
+        packed_out = model(**packed_batch, use_cache=False, train_mtp=True)
+        self.assertTrue(torch.isfinite(packed_out.loss))
+        packed_out.loss.backward()
+        self.assertTrue(all(p.grad is not None for p in model.mtp.parameters()))
+
+        # Joint LM + MTP training updates both backbone and mtp.* parameters.
+        model.zero_grad(set_to_none=True)
+        model.config.mtp_loss_scaling_factor = 0.3
+        joint_out = model(ids, labels=ids, use_cache=False)
+        self.assertTrue(torch.isfinite(joint_out.loss))
+        joint_out.loss.backward()
+        for name, parameter in model.named_parameters():
+            if name.startswith("autodeco."):
+                self.assertIsNone(parameter.grad, name)
+            else:
+                self.assertIsNotNone(parameter.grad, name)
+                self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+
+    @torch.no_grad()
+    def test_mtp_batch_speculative_generation_greedy_and_autodeco(self):
+        from transformers.models.rwkv7s.generation_rwkv7s import _Rwkv7sMtpGenerationRunner, _Rwkv7sRosa
+
+        # Verify O(K) undoable ROSA probe matches clone().extend() without mutating automaton state.
+        rosa = _Rwkv7sRosa()
+        rosa.extend([1, 2, 3, 1, 2, 4, 1, 2])
+        ref = rosa.clone()
+        expected_probe = ref.clone().extend([4, 1, 2, 3])
+        self.assertEqual(rosa.probe([4, 1, 2, 3]), expected_probe)
+        self.assertEqual(rosa.extend([5, 1, 2]), ref.extend([5, 1, 2]))
+
+        torch.manual_seed(141)
+        cfg = tiny_config(num_hidden_layers=3, mtp_depth=3, mtp_intermediate_size=128)
+        model = Rwkv7sForCausalLM(cfg).to(device="cuda", dtype=torch.bfloat16).eval()
+        for parameter in model.parameters():
+            if parameter.ndim >= 2:
+                parameter.normal_(std=0.05)
+        model.model.rosa_gate.fill_(0.5)
+        model.model.layers[0].mlp.s2.normal_(std=0.1)
+
+        ids = torch.randint(1, cfg.vocab_size, (3, 7), device="cuda")
+        for wkv_mode in ("fp32io16", "fp16"):
+            model.config.wkv_mode = wkv_mode
+            baseline = model.generate(ids, max_new_tokens=9, prefill_chunk_size=3, do_sample=False, eos_token_id=None)
+            spec = model.generate(
+                ids, max_new_tokens=9, prefill_chunk_size=3, do_sample=False, use_mtp=True, eos_token_id=None
+            )
+            torch.testing.assert_close(spec, baseline, atol=0, rtol=0)
+
+            runner = next(reversed(model._rwkv7s_generation_graphs.values()))
+            self.assertIsInstance(runner, _Rwkv7sMtpGenerationRunner)
+            # Single-layer shared scratch WKV buffer (O(1) layers instead of O(L * (K + 2)) checkpoints).
+            self.assertEqual(runner.verify_state._scratch_pool.shape, (3, cfg.num_attention_heads, 64, 64))
+
+            # Exercise heterogeneous per-row acceptance lengths (row0=3, row1=1, row2=0) in one batch.
+            truth = baseline[:, ids.shape[1] :]
+            mixed_drafts = torch.stack(
+                (
+                    truth[0, 1:4],
+                    torch.tensor([truth[1, 1].item(), (truth[1, 2].item() + 1) % cfg.vocab_size, 0], device="cuda"),
+                    torch.tensor([(truth[2, 1].item() + 1) % cfg.vocab_size, 0, 0], device="cuda"),
+                ),
+                dim=0,
+            )
+            calls = {"n": 0}
+            orig_replay = runner.draft_graph.replay
+
+            def scripted_draft(hidden, tokens, _orig=orig_replay, _calls=calls, _mixed=mixed_drafts):
+                _calls["n"] += 1
+                return _mixed if _calls["n"] == 1 else _orig(hidden, tokens)
+
+            with mock.patch.object(runner.draft_graph, "replay", side_effect=scripted_draft):
+                spec_mixed = model.generate(
+                    ids, max_new_tokens=9, prefill_chunk_size=3, do_sample=False, use_mtp=True, eos_token_id=None
+                )
+            torch.testing.assert_close(spec_mixed, baseline, atol=0, rtol=0)
+            self.assertGreaterEqual(runner.total_accepted, 4)
+
+        # AutoDeco + MTP speculative sampling runs cleanly and matches greedy in the low-temperature limit.
+        model.config.wkv_mode = "fp32io16"
+        model.autodeco.temp_fc2.weight.zero_()
+        model.autodeco.temp_fc2.bias.fill_(-10.0)
+        model.autodeco.top_p_fc2.weight.zero_()
+        model.autodeco.top_p_fc2.bias.fill_(10.0)
+        greedy_ref = model.generate(ids, max_new_tokens=6, prefill_chunk_size=3, do_sample=False, eos_token_id=None)
+        autodeco_mtp = model.generate(
+            ids,
+            max_new_tokens=6,
+            prefill_chunk_size=3,
+            do_sample=True,
+            use_autodeco=True,
+            use_mtp=True,
+            eos_token_id=None,
+        )
+        self.assertEqual(autodeco_mtp.shape, greedy_ref.shape)
+        self.assertIsInstance(next(reversed(model._rwkv7s_generation_graphs.values())), _Rwkv7sMtpGenerationRunner)
+
+        # Nonzero penalty automatically falls back to single-step Rapid-Sampling runner.
+        penalized = model.generate(
+            ids,
+            max_new_tokens=4,
+            prefill_chunk_size=3,
+            do_sample=True,
+            use_autodeco=True,
+            use_mtp=True,
+            presence_penalty=0.2,
+            eos_token_id=None,
+        )
+        self.assertEqual(penalized.shape, (3, 11))
+        self.assertNotIsInstance(next(reversed(model._rwkv7s_generation_graphs.values())), _Rwkv7sMtpGenerationRunner)
 
 
 if __name__ == "__main__":

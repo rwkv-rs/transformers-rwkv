@@ -195,6 +195,15 @@ training, DataLoader CPU workers can precompute `rosa_ids = compute_rwkv7s_rosa_
 asynchronously and pass `rosa_ids` into `forward()`. During inference and CUDA Graph `generate()`, online suffix
 automatons advance in O(1) amortized time per decode token on CPU using pinned staging buffers.
 
+### LightMTP speculative decoding
+
+`Rwkv7sForCausalLM` attaches a shared [`Rwkv7sMTP`] LightMTP block looped `mtp_depth` times with shared `embed_tokens`
+and `lm_head`. Set `train_mtp=True` to train only the MTP head on a frozen backbone, or set
+`mtp_loss_scaling_factor > 0` for joint LM + MTP training. During `generate(..., use_mtp=True)`, both greedy decoding
+(`do_sample=False`, bit-exact) and zero-penalty AutoDeco sampling (`do_sample=True`, exact greedy-draft rejection
+sampling) run with CUDA-graphed drafting and verification, using a single shared scratch WKV layer plus variable-length
+WKV-only commit to keep high-concurrency VRAM low.
+
 ## Rwkv7sConfig
 
 [[autodoc]] Rwkv7sConfig
@@ -206,6 +215,10 @@ automatons advance in O(1) amortized time per decode token on CPU using pinned s
 ## Rwkv7sAutoDeco
 
 [[autodoc]] Rwkv7sAutoDeco
+
+## Rwkv7sMTP
+
+[[autodoc]] Rwkv7sMTP
 
 ## Rwkv7sModelOutputWithPast
 

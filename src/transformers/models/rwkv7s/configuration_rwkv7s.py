@@ -59,6 +59,15 @@ class Rwkv7sConfig(PreTrainedConfig):
         provided.
     deep_embed_dim (`int`, *optional*, defaults to 32):
         Low-rank projection dimension `r` for `rwkv7a` DeepEmbed (`s_emb` stores `r * r` values per token).
+    mtp_depth (`int`, *optional*, defaults to 4):
+        Number of looped LightMTP draft steps executed with the shared MTP block.
+    mtp_intermediate_size (`int`, *optional*):
+        Intermediate width of the LightMTP SwiGLU MLP. Defaults to `(hidden_size * 7) // 2`.
+    mtp_loss_scaling_factor (`float`, *optional*, defaults to 0.0):
+        Weight applied to the auxiliary MTP loss during joint LM training (`0.0` disables auxiliary MTP loss).
+    train_mtp (`bool`, *optional*, defaults to `False`):
+        Whether `Rwkv7sForCausalLM.forward` freezes the backbone and computes only the MTP loss when `labels` are
+        provided.
     """
 
     model_type = "rwkv7s"
@@ -91,6 +100,10 @@ class Rwkv7sConfig(PreTrainedConfig):
     gate_low_rank_dim: int | None = None
     train_autodeco: bool = False
     deep_embed_dim: int = 32
+    mtp_depth: int = 4
+    mtp_intermediate_size: int | None = None
+    mtp_loss_scaling_factor: float = 0.0
+    train_mtp: bool = False
 
     def __post_init__(self, **kwargs):
         if self.architecture_version != "rwkv7s" or {"attention_hidden_size", "rescale_every"}.intersection(kwargs):
@@ -99,6 +112,16 @@ class Rwkv7sConfig(PreTrainedConfig):
             raise ValueError("`num_experts_per_tok` must satisfy 1 <= num_experts_per_tok <= num_experts.")
         if self.deep_embed_dim <= 0:
             raise ValueError("`deep_embed_dim` must be positive.")
+        if self.mtp_depth < 1:
+            raise ValueError("`mtp_depth` must be >= 1.")
+        if self.mtp_intermediate_size is None:
+            self.mtp_intermediate_size = (self.hidden_size * 7) // 2
+        if self.mtp_intermediate_size <= 0:
+            raise ValueError("`mtp_intermediate_size` must be positive.")
+        if self.mtp_loss_scaling_factor < 0:
+            raise ValueError("`mtp_loss_scaling_factor` must be non-negative.")
+        if self.train_autodeco and self.train_mtp:
+            raise ValueError("`train_autodeco` and `train_mtp` cannot both be True.")
         if self.moe_intermediate_size is None:
             self.moe_intermediate_size = self.hidden_size
         if self.shared_expert_intermediate_size is None:
