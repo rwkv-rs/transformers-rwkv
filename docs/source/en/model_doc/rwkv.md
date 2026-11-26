@@ -24,7 +24,7 @@ key/value tensor for every earlier token. The implementation follows the canonic
 the FlashRWKV2 TileLang provider for both training and inference. The former RWKV-4 implementation and its state/output
 types are not compatible with RWKV-7 checkpoints.
 
-This integration requires CUDA and `FlashRWKV2==0.2.0a1`. Install the RWKV dependencies with:
+This integration requires CUDA and `FlashRWKV2==0.2.0a4`. Install the RWKV dependencies with:
 
 ```bash
 pip install "transformers[rwkv]"
@@ -118,7 +118,7 @@ reordering materialize the pending update before exposing or moving the tensor. 
 the cache, or clone it to keep a snapshot. CUDA Graph warmup and restore copy the state through the handle.
 
 Budget private state using the provider handle's `memory_layout["private_bytes_per_slot"]` for each layer.
-With FlashRWKV2 0.2.0a1, the D64 layout uses 51,360 bytes per slot at 40 heads. At 64 heads, it uses
+With FlashRWKV2 0.2.0a4, the D64 layout uses 51,360 bytes per slot at 40 heads. At 64 heads, it uses
 98,560 bytes on a 128-SM RTX 4090 and 82,176 on an RTX PRO 6000. These paths use zero fixed workspace.
 FP32 state, including training and gradient-enabled evaluation, and other FP16 geometries use zero private log bytes.
 
