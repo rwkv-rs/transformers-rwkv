@@ -90,6 +90,7 @@ SPECIAL_CASES_TO_ALLOW = {
     "OpenAIPrivacyFilterConfig": ["classifier_dropout", "router_aux_loss_coef"],
     "Qwen4ExpTextConfig": ["split_ngram_parts"],  # Used by Concatenate during checkpoint conversion
     "RwkvConfig": ["architecture_version"],  # Checked when loading the configuration
+    "Rwkv7sConfig": ["architecture_version"],  # Checked when loading the configuration
     "NougatConfig": ["decoder", "encoder"],
     "PI0Config": ["vlm_projection_dim"],
     "EuroBertConfig": ["is_causal"],  # not used directly, allows causal-bidirectional switch

@@ -462,6 +462,7 @@ if TYPE_CHECKING:
     from .rt_detr import *
     from .rt_detr_v2 import *
     from .rwkv import *
+    from .rwkv7s import *
     from .sam import *
     from .sam2 import *
     from .sam2_video import *

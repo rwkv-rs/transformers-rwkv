@@ -943,6 +943,8 @@
         title: RoFormer
       - local: model_doc/rwkv
         title: RWKV
+      - local: model_doc/rwkv7s
+        title: RWKV7S
       - local: model_doc/sarvam_mla
         title: SarvamMLA
       - local: model_doc/sarvam_moe
