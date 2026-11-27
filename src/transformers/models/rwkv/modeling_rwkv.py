@@ -108,12 +108,7 @@ class RwkvCache(Cache):
         return query_length, self._seen_tokens
 
     def layer_states(
-        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self._layer_states(layer_idx, hidden_states, training=training, materialize=True)
-
-    def _layer_states(
-        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool, materialize: bool
+        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool = True, materialize: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer = self.layers[layer_idx]
         batch_size = hidden_states.shape[0]
@@ -183,10 +178,7 @@ class RwkvCache(Cache):
     def recurrent_metadata(
         self, flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, int, object]:
-        key = (device, batch_size, sequence_length, torch.cuda.current_stream(device).cuda_stream)
-        if key not in self._inference_metadata:
-            self._inference_metadata[key] = _recurrent_metadata(flash_rwkv2, batch_size, sequence_length, device)
-        return self._inference_metadata[key]
+        return _recurrent_metadata(self._inference_metadata, flash_rwkv2, batch_size, sequence_length, device)
 
     def recurrent_forward(
         self,
@@ -251,35 +243,34 @@ class RwkvCache(Cache):
         return self._copy(detach=True)
 
     def reset(self, batch_indices: torch.LongTensor | None = None) -> None:
-        if batch_indices is None:
-            for layer in self.layers:
-                for state_idx in range(layer.number_of_states):
-                    for states_name in ("conv_states", "recurrent_states"):
-                        state = getattr(layer, states_name)[state_idx]
-                        if state is not None:
-                            if torch.is_grad_enabled() and state.requires_grad:
-                                getattr(layer, states_name)[state_idx] = torch.zeros_like(state)
-                            else:
-                                state.zero_()
-                    layer.has_previous_state[state_idx] = False
-            if self._stream_lengths is not None:
-                self._stream_lengths.zero_()
-            self._seen_tokens = 0
-        else:
-            for layer in self.layers:
-                for state_idx in range(layer.number_of_states):
-                    for states_name in ("conv_states", "recurrent_states"):
-                        state = getattr(layer, states_name)[state_idx]
-                        if state is None:
-                            continue
+        for layer in self.layers:
+            for state_idx in range(layer.number_of_states):
+                for states_name in ("conv_states", "recurrent_states"):
+                    state = getattr(layer, states_name)[state_idx]
+                    if state is None:
+                        continue
+                    out_of_place = torch.is_grad_enabled() and state.requires_grad
+                    if batch_indices is None:
+                        if out_of_place:
+                            getattr(layer, states_name)[state_idx] = torch.zeros_like(state)
+                        else:
+                            state.zero_()
+                    else:
                         indices = batch_indices.to(state.device)
-                        if torch.is_grad_enabled() and state.requires_grad:
+                        if out_of_place:
                             getattr(layer, states_name)[state_idx] = state.index_fill(0, indices, 0)
                         else:
                             state.index_fill_(0, indices, 0)
-            if self._stream_lengths is not None:
+                if batch_indices is None:
+                    layer.has_previous_state[state_idx] = False
+        if self._stream_lengths is not None:
+            if batch_indices is None:
+                self._stream_lengths.zero_()
+            else:
                 self._stream_lengths.index_fill_(0, batch_indices.to(self._stream_lengths.device), 0)
-                self._seen_tokens = int(self._stream_lengths.max().item())
+        self._seen_tokens = (
+            0 if batch_indices is None or self._stream_lengths is None else int(self._stream_lengths.max().item())
+        )
         self._inference_metadata.clear()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
@@ -939,12 +930,8 @@ class RwkvModel(RwkvPreTrainedModel):
         output_hidden_states: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...] | None]:
         if inputs_embeds is None:
-            batch_size, sequence_length = input_ids.shape
-        else:
-            batch_size, sequence_length = inputs_embeds.shape[:2]
-
-        if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        batch_size, sequence_length = inputs_embeds.shape[:2]
         inputs_embeds = inputs_embeds.reshape(-1, self.config.hidden_size).contiguous()
         flash_rwkv2 = load_flash_rwkv2()
         hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
@@ -960,15 +947,15 @@ class RwkvModel(RwkvPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += ((hidden_states + residual).view(batch_size, sequence_length, -1),)
 
+        is_rwkv_cache = isinstance(cache, RwkvCache)
         v_first = None
         for layer_idx, decoder_layer in enumerate(self.layers):
-            state_reference = hidden_states.view(batch_size, sequence_length, -1)
-            if isinstance(cache, RwkvCache):
-                attention_shift, wkv_state, feed_forward_shift = cache._layer_states(
-                    layer_idx, state_reference, training=False, materialize=False
+            if is_rwkv_cache:
+                attention_shift, wkv_state, feed_forward_shift = cache.layer_states(
+                    layer_idx, hidden_states.view(batch_size, sequence_length, -1), training=False, materialize=False
                 )
             else:
-                attention_shift, wkv_state, feed_forward_shift = cache.layer_states(layer_idx, state_reference)
+                attention_shift, wkv_state, feed_forward_shift = cache.layer_states(layer_idx)
             hidden_states, residual, v_first, _, _ = decoder_layer(
                 hidden_states,
                 residual,
@@ -979,13 +966,13 @@ class RwkvModel(RwkvPreTrainedModel):
                 inference_metadata,
                 cache,
             )
-            if isinstance(cache, RwkvCache):
+            if is_rwkv_cache:
                 cache.mark_layer_updated(layer_idx)
 
             if output_hidden_states:
                 all_hidden_states += ((hidden_states + residual).view(batch_size, sequence_length, -1),)
 
-        if isinstance(cache, RwkvCache):
+        if is_rwkv_cache:
             cache.advance(sequence_length, batch_size, hidden_states.device)
         return hidden_states, residual, all_hidden_states
 
@@ -1190,11 +1177,13 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
             raise ValueError("RWKV LightMTP requires one looped `lightmlp` block with a shared LM head.")
         if config["hidden_size"] != self.config.hidden_size:
             raise ValueError("The LightMTP sidecar hidden size must match the RWKV base model.")
-        depth, intermediate_size, eps = config["mtp_depth"], config["intermediate_size"], config["norm_eps"]
+        depth = config["mtp_depth"]
+        intermediate_size = config["intermediate_size"]
+        eps = config.get("norm_eps", self.config.layer_norm_epsilon)
         if depth < 1 or intermediate_size < 1 or not math.isfinite(eps) or eps <= 0:
             raise ValueError("LightMTP depth, intermediate size and norm epsilon must be positive.")
 
-        weights = load_file(model_dir / config["weight_file"])
+        weights = load_file(model_dir / config.get("weight_file", "mtp.safetensors"))
         prefix = "mtp.blocks.0."
         if any(not key.startswith(prefix) for key in weights):
             raise ValueError(f"LightMTP sidecar tensor names must start with `{prefix}`.")
@@ -1205,6 +1194,8 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         self.config.mtp_depth = depth
         self.config.mtp_intermediate_size = intermediate_size
         self.config.mtp_norm_epsilon = eps
+        if (graphs := getattr(self, "_rwkv_generation_graphs", None)) is not None:
+            graphs.clear()
 
     def _project_lm_head(self, hidden_states: torch.Tensor, head_spec, *, detach_head: bool = False) -> torch.Tensor:
         if head_spec is None:
@@ -1219,7 +1210,12 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
             lora_a = None if lora_a is None else lora_a.detach()
             lora_b = None if lora_b is None else lora_b.detach()
         return load_flash_rwkv2().pretrain_head_linear_bf16(
-            hidden_states.contiguous(), weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
+            hidden_states.to(weight.dtype).contiguous(),
+            weight,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scale=scale,
+            use_nora=use_nora,
         )
 
     def _mtp_loss(

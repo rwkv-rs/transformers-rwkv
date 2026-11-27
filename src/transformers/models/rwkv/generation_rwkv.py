@@ -43,27 +43,45 @@ if TYPE_CHECKING:
     from .modeling_rwkv import RwkvForCausalLM, RwkvModel
 
 
-def _rwkv_prefill_lengths(prompt_length: int, chunk_size: int | None) -> tuple[int, ...]:
-    prefill_length = prompt_length - 1
-    if prefill_length <= 0:
-        return ()
-    if chunk_size is None:
-        return (prefill_length,)
-    full_chunks, remainder = divmod(prefill_length, chunk_size)
-    return (chunk_size,) * full_chunks + ((remainder,) if remainder else ())
+def _recurrent_metadata(
+    cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, object]],
+    flash_rwkv2,
+    batch_size: int,
+    sequence_length: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int, object]:
+    key = (device, batch_size, sequence_length, torch.cuda.current_stream(device).cuda_stream)
+    if key not in cache:
+        cu_seqlens = torch.arange(
+            0, (batch_size + 1) * sequence_length, sequence_length, dtype=torch.int32, device=device
+        )
+        state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+        ticket = flash_rwkv2.prepare_tmix_wkv7_recurrent_metadata(
+            cu_seqlens,
+            state_indices,
+            total_tokens=batch_size * sequence_length,
+            state_pool_size=batch_size,
+            max_seqlen=sequence_length,
+        )
+        cache[key] = (cu_seqlens, state_indices, sequence_length, ticket)
+    return cache[key]
 
 
-def _recurrent_metadata(flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device):
-    cu_seqlens = torch.arange(0, (batch_size + 1) * sequence_length, sequence_length, dtype=torch.int32, device=device)
-    state_indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-    ticket = flash_rwkv2.prepare_tmix_wkv7_recurrent_metadata(
-        cu_seqlens,
-        state_indices,
-        total_tokens=batch_size * sequence_length,
-        state_pool_size=batch_size,
-        max_seqlen=sequence_length,
-    )
-    return cu_seqlens, state_indices, sequence_length, ticket
+def _capture_graph(
+    device: torch.device, capture_stream: torch.cuda.Stream, graph_pool, fn, restore
+) -> torch.cuda.CUDAGraph:
+    graph = torch.cuda.CUDAGraph()
+    generation_stream = torch.cuda.current_stream(device)
+    capture_stream.wait_stream(generation_stream)
+    with torch.cuda.stream(capture_stream):
+        restore()
+        fn()
+        restore()
+        with torch.cuda.graph(graph, pool=graph_pool, stream=capture_stream, capture_error_mode="thread_local"):
+            fn()
+        restore()
+    generation_stream.wait_stream(capture_stream)
+    return graph
 
 
 def _recurrent_forward(
@@ -129,16 +147,13 @@ class _RwkvGraphState:
         _materialize_recurrent_state(self.recurrent_states[layer_idx], pool)
         return pool
 
-    def layer_states(self, layer_idx: int, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, object, torch.Tensor]:
+    def layer_states(self, layer_idx: int) -> tuple[torch.Tensor, object, torch.Tensor]:
         return self.attention_shift[layer_idx], self.recurrent_states[layer_idx], self.feed_forward_shift[layer_idx]
 
     def recurrent_metadata(
         self, flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, int, object]:
-        key = (device, batch_size, sequence_length, torch.cuda.current_stream(device).cuda_stream)
-        if key not in self._inference_metadata:
-            self._inference_metadata[key] = _recurrent_metadata(flash_rwkv2, batch_size, sequence_length, device)
-        return self._inference_metadata[key]
+        return _recurrent_metadata(self._inference_metadata, flash_rwkv2, batch_size, sequence_length, device)
 
     def recurrent_forward(
         self,
@@ -198,7 +213,7 @@ class _RwkvVerifyState:
         self.rows = torch.arange(batch_size, dtype=torch.int32, device=self.scratch_S.device)
         self.positions = torch.arange(num_tokens, dtype=torch.int32, device=self.scratch_S.device)
 
-    def layer_states(self, layer_idx: int, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, object, torch.Tensor]:
+    def layer_states(self, layer_idx: int) -> tuple[torch.Tensor, object, torch.Tensor]:
         self.layer_idx = layer_idx
         self.scratch_attention_shift.copy_(self.main.attention_shift[layer_idx])
         self.scratch_feed_forward_shift.copy_(self.main.feed_forward_shift[layer_idx])
@@ -284,21 +299,13 @@ class _RwkvPrefillGraph:
         self.input_ids = torch.zeros(
             (batch_size, sequence_length), dtype=torch.long, device=model.embed_tokens.weight.device
         )
-        self.graph = torch.cuda.CUDAGraph()
-        generation_stream = torch.cuda.current_stream(self.input_ids.device)
-        capture_stream.wait_stream(generation_stream)
-        with torch.cuda.stream(capture_stream):
-            model._forward_state_only(self.input_ids, None, state, False)
-            state.zero_()
-            with torch.cuda.graph(
-                self.graph,
-                pool=graph_pool,
-                stream=capture_stream,
-                capture_error_mode="thread_local",
-            ):
-                model._forward_state_only(self.input_ids, None, state, False)
-            state.zero_()
-        generation_stream.wait_stream(capture_stream)
+        self.graph = _capture_graph(
+            self.input_ids.device,
+            capture_stream,
+            graph_pool,
+            lambda: model._forward_state_only(self.input_ids, None, state, False),
+            state.zero_,
+        )
 
     def replay(self, input_ids: torch.LongTensor) -> None:
         self.input_ids.copy_(input_ids)
@@ -359,34 +366,30 @@ class _RwkvDecodeGraph:
         for criteria in self.stop_string_criteria:
             criteria(self.stop_suffix, None)
 
-        self.graph = torch.cuda.CUDAGraph()
         sampling_snapshot = self.sampling_states.clone() if self.sampling_states is not None else None
-        generation_stream = torch.cuda.current_stream(device)
-        capture_stream.wait_stream(generation_stream)
-        with torch.cuda.stream(capture_stream):
-            self._forward(model)
-            self._restore_capture_inputs(sampling_snapshot)
-            with torch.cuda.graph(
-                self.graph,
-                pool=graph_pool,
-                stream=capture_stream,
-                capture_error_mode="thread_local",
-            ):
-                self._forward(model)
-            self._restore_capture_inputs(sampling_snapshot)
-        generation_stream.wait_stream(capture_stream)
+        self.graph = _capture_graph(
+            device,
+            capture_stream,
+            graph_pool,
+            lambda: self._forward(model),
+            lambda: self._restore_capture_inputs(sampling_snapshot),
+        )
 
-    def _restore_capture_inputs(self, sampling_snapshot: torch.Tensor | None) -> None:
+    def _reset_state(self) -> None:
         self.state.zero_()
-        if sampling_snapshot is not None:
-            self.sampling_states.copy_(sampling_snapshot)
+        if self.penalties is not None:
             self.penalties.zero_()
-        self.input_ids.zero_()
         self.completion.fill_(self.pad_token_id)
         self.completion_index.zero_()
         self.completion_lengths.zero_()
         self.unfinished.fill_(True)
         self.stop_suffix.fill_(self.vocab_size)
+
+    def _restore_capture_inputs(self, sampling_snapshot: torch.Tensor | None) -> None:
+        self._reset_state()
+        if sampling_snapshot is not None:
+            self.sampling_states.copy_(sampling_snapshot)
+        self.input_ids.zero_()
 
     def _forward(self, model: RwkvForCausalLM) -> None:
         hidden_states, residual, _ = model.model._forward_state_only(self.input_ids, None, self.state, False)
@@ -436,18 +439,12 @@ class _RwkvDecodeGraph:
         self.completion_index.add_(1)
 
     def prepare(self, prompt: torch.LongTensor, seed: int) -> None:
-        self.state.zero_()
+        self._reset_state()
         self.input_ids.copy_(prompt[:, -1:])
-        self.completion.fill_(self.pad_token_id)
-        self.completion_index.zero_()
-        self.completion_lengths.zero_()
-        self.unfinished.fill_(True)
-        self.stop_suffix.fill_(self.vocab_size)
         suffix = prompt[:, -self.stop_suffix.shape[1] :]
         self.stop_suffix[:, -suffix.shape[1] :].copy_(suffix)
         if self.sampling_states is not None:
             self.sampling_states.copy_(self.flash_rwkv2.setup_sampling_states(seed, self.batch_size))
-            self.penalties.zero_()
 
     def replay(self) -> None:
         self.graph.replay()
@@ -484,21 +481,13 @@ class _RwkvMtpDecodeGraph:
             use_nora=use_nora,
         )
         self.draft.capture(model.model.embed_tokens, decode.batch_size)
-
-        self.graph = torch.cuda.CUDAGraph()
-        generation_stream = torch.cuda.current_stream(device)
-        capture_stream.wait_stream(generation_stream)
-        with torch.cuda.stream(capture_stream):
-            decode.state.zero_()
-            decode.completion_lengths.zero_()
-            decode.unfinished.fill_(True)
-            decode.stop_suffix.fill_(decode.vocab_size)
-            self._forward(model, head_spec)
-            with torch.cuda.graph(
-                self.graph, pool=graph_pool, stream=capture_stream, capture_error_mode="thread_local"
-            ):
-                self._forward(model, head_spec)
-        generation_stream.wait_stream(capture_stream)
+        self.graph = _capture_graph(
+            device,
+            capture_stream,
+            graph_pool,
+            lambda: self._forward(model, head_spec),
+            lambda: decode._restore_capture_inputs(None),
+        )
 
     def _forward(self, model: RwkvForCausalLM, head_spec) -> None:
         decode = self.decode
@@ -516,7 +505,7 @@ class _RwkvMtpDecodeGraph:
         for step in range(width):
             # Match ordinary decode's head shape and keep at most one logits plane live.
             logits = model._project_lm_head(hidden_states[:, step], head_spec)
-            predictions[:, step].copy_(logits.argmax(dim=-1))
+            torch.argmax(logits, dim=-1, out=predictions[:, step])
             del logits
 
         matches = predictions[:, :-1] == self.input_ids[:, 1:]
@@ -607,7 +596,15 @@ class _RwkvGenerationModelRunner:
         mtp_depth: int,
     ) -> None:
         batch_size, prompt_length = input_ids.shape
-        self.prefill_lengths = _rwkv_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
+        prefill_length = prompt_length - 1
+        chunk_size = generation_config.prefill_chunk_size
+        if prefill_length <= 0:
+            self.prefill_lengths: tuple[int, ...] = ()
+        elif chunk_size is None:
+            self.prefill_lengths = (prefill_length,)
+        else:
+            full_chunks, remainder = divmod(prefill_length, chunk_size)
+            self.prefill_lengths = (chunk_size,) * full_chunks + ((remainder,) if remainder else ())
         max_new_tokens = max_length - prompt_length
         flash_rwkv2 = load_flash_rwkv2()
         self.state = _RwkvGraphState(
@@ -732,37 +729,8 @@ class _RwkvGenerationCache(dict[tuple, _RwkvGenerationModelRunner]):
 class RwkvGenerationMixin(GenerationMixin):
     _supported_generation_modes = [GenerationMode.GREEDY_SEARCH, GenerationMode.SAMPLE]
 
-    def adjust_generation_fn(
-        self,
-        generation_config,
-        from_auto_class,
-        from_pipeline,
-        pretrained_model_name_or_path,
-        cache_dir,
-        force_download,
-        proxies,
-        local_files_only,
-        token,
-        revision,
-        subfolder,
-        trust_remote_code,
-        **kwargs,
-    ):
-        super().adjust_generation_fn(
-            generation_config,
-            from_auto_class,
-            from_pipeline,
-            pretrained_model_name_or_path,
-            cache_dir,
-            force_download,
-            proxies,
-            local_files_only,
-            token,
-            revision,
-            subfolder,
-            trust_remote_code,
-            **kwargs,
-        )
+    def adjust_generation_fn(self, *args, **kwargs):
+        super().adjust_generation_fn(*args, **kwargs)
         self.generation_config.presence_penalty = getattr(self.generation_config, "presence_penalty", 0.0)
         self.generation_config.frequency_penalty = getattr(self.generation_config, "frequency_penalty", 0.0)
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
@@ -776,7 +744,7 @@ class RwkvGenerationMixin(GenerationMixin):
                 or generation_config.assistant_early_exit is not None
             ):
                 raise ValueError("RWKV-7 assisted generation supports only built-in LightMTP (`use_mtp=True`).")
-            if self.mtp is None or generation_config.do_sample:
+            if self.mtp is None or self.config.mtp_depth < 1 or generation_config.do_sample:
                 raise ValueError("LightMTP requires a loaded MTP head and greedy generation (`do_sample=False`).")
             generation_mode = GenerationMode.GREEDY_SEARCH
         super()._validate_generation_mode(generation_mode, generation_config, generation_mode_kwargs)
@@ -794,24 +762,6 @@ class RwkvGenerationMixin(GenerationMixin):
             generation_config = copy.copy(generation_config)
             generation_config.top_k = 0
         return super()._get_logits_processor(generation_config, *args, **kwargs)
-
-    @staticmethod
-    def _validate_graph_logits_processors(
-        logits_processor: LogitsProcessorList, generation_config: GenerationConfig
-    ) -> None:
-        expected = []
-        if generation_config.do_sample:
-            if generation_config.temperature is not None and generation_config.temperature != 1.0:
-                expected.append(TemperatureLogitsWarper)
-            if generation_config.top_k not in (None, 0, -1):
-                expected.append(TopKLogitsWarper)
-            if generation_config.top_p is not None and generation_config.top_p < 1.0:
-                expected.append(TopPLogitsWarper)
-        if [type(processor) for processor in logits_processor] != expected:
-            raise ValueError(
-                "RWKV-7 CUDA graph generation supports only Rapid-Sampling and its six parameters; "
-                f"custom logits processors are not supported, got {[type(p).__name__ for p in logits_processor]}."
-            )
 
     def _validate_graph_generation(
         self,
@@ -875,43 +825,20 @@ class RwkvGenerationMixin(GenerationMixin):
         stop_string_criteria = tuple(
             criteria for criteria in stopping_criteria if isinstance(criteria, StopStringCriteria)
         )
-        self._validate_graph_logits_processors(logits_processor, generation_config)
+        expected_processors = []
+        if generation_config.do_sample:
+            if generation_config.temperature is not None and generation_config.temperature != 1.0:
+                expected_processors.append(TemperatureLogitsWarper)
+            if generation_config.top_k not in (None, 0, -1):
+                expected_processors.append(TopKLogitsWarper)
+            if generation_config.top_p is not None and generation_config.top_p < 1.0:
+                expected_processors.append(TopPLogitsWarper)
+        if [type(processor) for processor in logits_processor] != expected_processors:
+            raise ValueError(
+                "RWKV-7 CUDA graph generation supports only Rapid-Sampling and its six parameters; "
+                f"custom logits processors are not supported, got {[type(p).__name__ for p in logits_processor]}."
+            )
         return max_length, eos_token_ids, stop_string_criteria
-
-    @staticmethod
-    def _graph_generation_key(
-        input_ids: torch.LongTensor,
-        generation_config: GenerationConfig,
-        max_length: int,
-        eos_token_ids: torch.Tensor | None,
-        stop_string_criteria: tuple[StopStringCriteria, ...],
-        tokenizer,
-        wkv_mode: str,
-    ) -> tuple:
-        eos_key = None if eos_token_ids is None else tuple(eos_token_ids.tolist())
-        pad_token_id = generation_config._pad_token_tensor
-        pad_key = None if pad_token_id is None else int(pad_token_id.item())
-        stop_key = tuple(
-            (criteria.stop_strings, tokenizer if tokenizer is not None else criteria)
-            for criteria in stop_string_criteria
-        )
-        return (
-            input_ids.device,
-            *input_ids.shape,
-            max_length,
-            generation_config.prefill_chunk_size,
-            generation_config.do_sample,
-            getattr(generation_config, "presence_penalty", 0.0),
-            getattr(generation_config, "frequency_penalty", 0.0),
-            getattr(generation_config, "penalty_decay", 0.996),
-            generation_config.temperature,
-            generation_config.top_k,
-            generation_config.top_p,
-            pad_key,
-            eos_key,
-            stop_key,
-            wkv_mode,
-        )
 
     def _sample(
         self: RwkvForCausalLM,
@@ -933,19 +860,32 @@ class RwkvGenerationMixin(GenerationMixin):
         )
         mtp_depth = 0
         if self.mtp is not None and not generation_config.do_sample:
-            mtp_depth = min(self.config.mtp_depth, max_length - input_ids.shape[1] - 1)
+            mtp_depth = max(0, min(self.config.mtp_depth, max_length - input_ids.shape[1] - 1))
         use_mtp = generation_config.use_mtp is not False and mtp_depth > 0
-        key = self._graph_generation_key(
-            input_ids,
-            generation_config,
+        tokenizer = model_kwargs.get("tokenizer")
+        pad_token_id = generation_config._pad_token_tensor
+        key = (
+            input_ids.device,
+            *input_ids.shape,
             max_length,
-            eos_token_ids,
-            stop_string_criteria,
-            model_kwargs.get("tokenizer"),
+            generation_config.prefill_chunk_size,
+            generation_config.do_sample,
+            getattr(generation_config, "presence_penalty", 0.0),
+            getattr(generation_config, "frequency_penalty", 0.0),
+            getattr(generation_config, "penalty_decay", 0.996),
+            generation_config.temperature,
+            generation_config.top_k,
+            generation_config.top_p,
+            None if pad_token_id is None else int(pad_token_id.item()),
+            None if eos_token_ids is None else tuple(eos_token_ids.tolist()),
+            tuple(
+                (criteria.stop_strings, tokenizer if tokenizer is not None else criteria)
+                for criteria in stop_string_criteria
+            ),
             self.config.wkv_mode,
-        )
-        key += (mtp_depth,)
-        key += tuple(
+            mtp_depth,
+            self.mtp.norm_h.eps if mtp_depth else None,
+        ) + tuple(
             (
                 name,
                 module.get_base_layer().weight.data_ptr(),

@@ -225,6 +225,49 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 self.assertEqual(first_prefixes, [width] + [1] * (batch_size - 1))
                 model._rwkv_generation_graphs.clear()
 
+        # Capturing the MTP graph must restore decode and recurrent state even when warmup hits EOS=0.
+        ids = torch.tensor([[5, 5, 5, 5]], device="cuda")
+        expected_short = model.generate(
+            ids, max_new_tokens=2, do_sample=False, eos_token_id=0, pad_token_id=0, use_mtp=False
+        )
+        runner = next(iter(model._rwkv_generation_graphs.values()))
+        from transformers.models.rwkv.generation_rwkv import _RwkvMtpDecodeGraph
+
+        runner.mtp_graph = _RwkvMtpDecodeGraph(model, runner.decode_graph, runner.capture_stream, runner.graph_pool)
+        self.assertTrue(runner.decode_graph.unfinished.all().item())
+        self.assertEqual(runner.decode_graph.completion_lengths.tolist(), [0])
+        self.assertEqual(runner.state.attention_shift.abs().max().item(), 0)
+        actual_short = model.generate(
+            ids, max_new_tokens=2, do_sample=False, eos_token_id=0, pad_token_id=0, use_mtp=True
+        )
+        torch.testing.assert_close(actual_short, expected_short, rtol=0, atol=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            model_dir = Path(directory)
+            (model_dir / "mtp_config.json").write_text(
+                json.dumps(
+                    {
+                        "mtp_type": "lightmlp",
+                        "mtp_depth": 2,
+                        "mtp_loop": True,
+                        "hidden_size": config.hidden_size,
+                        "intermediate_size": config.mtp_intermediate_size,
+                        "norm_eps": 2e-5,
+                    }
+                )
+            )
+            save_file(model.mtp.state_dict(prefix="mtp.blocks.0."), model_dir / "mtp.safetensors")
+            model.load_mtp_sidecar(model_dir)
+            self.assertEqual(len(model._rwkv_generation_graphs), 0)
+            torch.testing.assert_close(
+                model.generate(ids, max_new_tokens=4, do_sample=False, eos_token_id=None, use_mtp=True),
+                model.generate(ids, max_new_tokens=4, do_sample=False, eos_token_id=None, use_mtp=False),
+                rtol=0,
+                atol=0,
+            )
+            self.assertEqual(next(iter(model._rwkv_generation_graphs.values())).mtp_graph.draft.eps, 2e-5)
+            model._rwkv_generation_graphs.clear()
+
     def test_fp16_state_inference_preserves_fp32_training(self):
         torch.manual_seed(117)
         model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
