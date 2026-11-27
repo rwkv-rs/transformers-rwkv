@@ -118,12 +118,8 @@ class _Rwkv7sRosa:
                 self.link[q] = self.link[cur] = clone
 
         self.last = cur
-        matched, v = -1, cur
-        while v != -1:
-            if self.length[v] > 0 and self.endpos[v] >= 0:
-                matched = self.tokens[self.endpos[v] + 1]
-                break
-            v = self.link[v]
+        link = self.link[cur]
+        matched = self.tokens[self.endpos[link] + 1] if link > 0 else -1
         v = cur
         while v != -1 and self.endpos[v] < pos:
             if undo is not None:

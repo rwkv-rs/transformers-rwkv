@@ -733,7 +733,7 @@ class Rwkv7sExperts(nn.Module):
 
 
 class Rwkv7sFeedForward(nn.Module):
-    """Token-shifted squared-ReLU MoE ChannelMix with `rwkv7a` low-rank DeepEmbed channelwise scaling."""
+    """Token-shifted squared-ReLU MoE ChannelMix with `rwkv7a` DeepEmbed and per-layer token-level ROSA."""
 
     def __init__(self, config: Rwkv7sConfig, layer_idx: int):
         super().__init__()
@@ -748,6 +748,8 @@ class Rwkv7sFeedForward(nn.Module):
         self.s1 = nn.Parameter(torch.empty(config.hidden_size, rank))
         self.s2 = nn.Parameter(torch.empty(rank, config.hidden_size))
         self.s0 = nn.Parameter(torch.ones(config.hidden_size))
+        self.rosa_emb = nn.Embedding(config.vocab_size, config.rosa_dim)
+        self.rosa_proj = nn.Linear(config.rosa_dim, config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -757,6 +759,7 @@ class Rwkv7sFeedForward(nn.Module):
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
         input_ids: torch.LongTensor | None = None,
+        rosa_tokens: torch.LongTensor | None = None,
         saved_cmix_norm: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
@@ -806,6 +809,9 @@ class Rwkv7sFeedForward(nn.Module):
             emb = self.s_emb(input_ids.reshape(-1)).view(-1, rank, rank).to(x_flat.dtype)
             ss = torch.bmm((x_flat @ self.s1.to(x_flat.dtype)).unsqueeze(1), emb).squeeze(1)
             output = output * ((ss @ self.s2.to(x_flat.dtype)) + self.s0.to(x_flat.dtype))
+        if rosa_tokens is not None:
+            rosa_hidden = self.rosa_emb(rosa_tokens.clamp_min(0)).to(self.x_k.dtype)
+            output = output + self.rosa_proj(rosa_hidden).to(normed.dtype) * (rosa_tokens >= 0).unsqueeze(-1)
         return output.view_as(hidden_states), state_out
 
 
@@ -832,6 +838,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
         cache: Rwkv7sCache | _Rwkv7sGraphState | None = None,
         use_unfused_projections: bool = False,
         input_ids: torch.LongTensor | None = None,
+        rosa_tokens: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
@@ -859,6 +866,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
                 ),
                 feed_forward_shift,
                 input_ids=input_ids,
+                rosa_tokens=rosa_tokens,
                 **kwargs,
             )
             hidden_states = hidden_states + feed_forward_output
@@ -882,6 +890,7 @@ class Rwkv7sDecoderLayer(GradientCheckpointingLayer):
             layer_norm=self.post_attention_layernorm,
             inference_metadata=inference_metadata,
             input_ids=input_ids,
+            rosa_tokens=rosa_tokens,
             saved_cmix_norm=None if saved_cmix is None else saved_cmix[self.mlp.layer_idx],
         )
         return hidden_states, residual, v_first, None, None
@@ -1048,6 +1057,8 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
             init.normal_(module.s1, mean=0.0, std=0.02)
             init.zeros_(module.s2)
             init.ones_(module.s0)
+            init.normal_(module.rosa_emb.weight, mean=0.0, std=0.02)
+            init.zeros_(module.rosa_proj.weight)
         elif isinstance(module, Rwkv7sTopkRouter):
             init.normal_(module.weight, mean=0.0, std=0.02)
             init.zeros_(module.e_score_correction_bias)
@@ -1055,7 +1066,6 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
             init.normal_(module.up_proj, mean=0.0, std=0.02)
             init.normal_(module.down_proj, mean=0.0, std=0.02)
         elif isinstance(module, Rwkv7sModel):
-            init.zeros_(module.rosa_gate)
             init.zeros_(module.loop_gate)
         elif isinstance(module, nn.LayerNorm):
             init.ones_(module.weight)
@@ -1068,8 +1078,6 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embedding_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self.rosa_embed = nn.Embedding(config.vocab_size + 1, config.hidden_size, padding_idx=config.vocab_size)
-        self.rosa_gate = nn.Parameter(torch.zeros(config.hidden_size))
         self.loop_gate = nn.Parameter(torch.zeros(config.hidden_size, dtype=torch.float32))
         self.layers = nn.ModuleList(
             [Rwkv7sDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -1114,9 +1122,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
             self.embedding_norm.bias,
             eps=self.config.layer_norm_epsilon,
         )
-        if rosa_ids is not None:
-            rosa_tokens = torch.where(rosa_ids < 0, self.config.vocab_size, rosa_ids).reshape(-1)
-            hidden_states = hidden_states + (self.rosa_embed(rosa_tokens) * self.rosa_gate).to(hidden_states.dtype)
+        rosa_tokens = None if rosa_ids is None else rosa_ids.reshape(-1)
         residual = torch.zeros_like(hidden_states)
         inference_metadata = cache.recurrent_metadata(flash_rwkv2, batch_size, sequence_length, hidden_states.device)
 
@@ -1147,6 +1153,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 inference_metadata,
                 cache,
                 input_ids=input_ids,
+                rosa_tokens=rosa_tokens,
             )
             if isinstance(cache, Rwkv7sCache):
                 cache.mark_layer_updated(layer_idx)
@@ -1221,7 +1228,6 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         output_hidden_states = (
             self.config.output_hidden_states if output_hidden_states is None else output_hidden_states
         )
-        _ = position_ids
 
         batch_size, sequence_length = inputs.shape[:2]
         if (
@@ -1254,6 +1260,8 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
             cache = Rwkv7sCache(self.config)
 
         if rosa_ids is not None:
+            if cache is not None and input_ids is not None:
+                cache.step_rosa(input_ids)
             rosa_ids = rosa_ids.to(device=inputs.device)
         elif input_ids is not None:
             rosa_ids = (
@@ -1273,9 +1281,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                 self.embedding_norm.bias.to(torch.bfloat16),
                 eps=self.config.layer_norm_epsilon,
             )
-            if rosa_ids is not None:
-                rosa_tokens = torch.where(rosa_ids < 0, self.config.vocab_size, rosa_ids)
-                hidden_states = hidden_states + (self.rosa_embed(rosa_tokens) * self.rosa_gate).to(hidden_states.dtype)
+            rosa_tokens = None if rosa_ids is None else rosa_ids.reshape(-1)
             all_hidden_states = () if output_hidden_states else None
             if output_hidden_states:
                 all_hidden_states += (hidden_states.view(batch_size, sequence_length, -1),)
@@ -1300,6 +1306,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
                     None,
                     use_unfused_projections=use_unfused_projections,
                     input_ids=input_ids,
+                    rosa_tokens=rosa_tokens,
                     cu_seq_lens_q=cu_seq_lens_q,
                 )
                 if cache is not None:

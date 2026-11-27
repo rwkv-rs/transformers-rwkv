@@ -64,6 +64,8 @@ class Rwkv7sConfig(PreTrainedConfig):
         provided.
     deep_embed_dim (`int`, *optional*, defaults to 32):
         Low-rank projection dimension `r` for `rwkv7a` DeepEmbed (`s_emb` stores `r * r` values per token).
+    rosa_dim (`int`, *optional*, defaults to 64):
+        Low-rank embedding width for per-layer token-level ROSA (`rosa_emb` -> `rosa_proj`) injected in each FFN.
     mtp_depth (`int`, *optional*, defaults to 4):
         Number of looped LightMTP draft steps executed with the shared MTP block.
     mtp_intermediate_size (`int`, *optional*):
@@ -107,6 +109,7 @@ class Rwkv7sConfig(PreTrainedConfig):
     gate_low_rank_dim: int | None = None
     train_autodeco: bool = False
     deep_embed_dim: int = 32
+    rosa_dim: int = 64
     mtp_depth: int = 4
     mtp_intermediate_size: int | None = None
     mtp_loss_scaling_factor: float = 0.0
@@ -133,6 +136,8 @@ class Rwkv7sConfig(PreTrainedConfig):
             raise ValueError("`num_experts_per_tok` must satisfy 1 <= num_experts_per_tok <= num_experts.")
         if self.deep_embed_dim <= 0:
             raise ValueError("`deep_embed_dim` must be positive.")
+        if self.rosa_dim <= 0:
+            raise ValueError("`rosa_dim` must be positive.")
         if self.mtp_depth < 1:
             raise ValueError("`mtp_depth` must be >= 1.")
         if self.mtp_intermediate_size is None:

@@ -1063,14 +1063,21 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
         ids = torch.tensor([[1, 2, 3, 1, 2, 4, 1, 2], [5, 6, 5, 6, 7, 5, 6, 8]], device="cuda")
         with torch.no_grad():
             base_logits = model(ids, use_cache=False).logits
-            # Precomputed CPU rosa_ids matches automatic computation bit-for-bit, even with nonzero rosa_gate.
-            model.model.rosa_gate.fill_(0.5)
+            # Precomputed CPU rosa_ids matches automatic computation bit-for-bit across every layer.
+            for layer in model.model.layers:
+                layer.mlp.rosa_proj.weight.normal_(std=0.1)
             model.model.layers[0].mlp.s2.normal_(std=0.1)
             auto_out = model(ids, use_cache=False).logits
             precomputed = compute_rwkv7s_rosa_ids(ids.cpu())
             precomputed_out = model(ids, rosa_ids=precomputed, use_cache=False).logits
             torch.testing.assert_close(precomputed_out, auto_out, atol=0, rtol=0)
             self.assertFalse(torch.allclose(auto_out, base_logits))
+
+            # Prefilling with precomputed rosa_ids keeps cache ROSA states in sync for subsequent auto steps.
+            mixed_cache = Rwkv7sCache(cfg)
+            model(ids[:, :6], rosa_ids=precomputed[:, :6], cache=mixed_cache)
+            mixed_tail = model(ids[:, 6:], cache=mixed_cache).logits
+            torch.testing.assert_close(mixed_tail, auto_out[:, 6:], atol=0, rtol=0)
 
             # CUDA Graph generation with active DeepEmbed + active ROSA matches eager step-by-step bit-for-bit.
             cache = Rwkv7sCache(cfg)
@@ -1156,7 +1163,6 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
         for parameter in model.parameters():
             if parameter.ndim >= 2:
                 parameter.normal_(std=0.05)
-        model.model.rosa_gate.fill_(0.5)
         model.model.layers[0].mlp.s2.normal_(std=0.1)
 
         ids = torch.randint(1, cfg.vocab_size, (3, 7), device="cuda")

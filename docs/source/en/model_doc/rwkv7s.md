@@ -195,13 +195,14 @@ Set `prefill_chunk_size` to control the prefill capture size.
 `temperature` and `top_p` tensors are predicted inside the CUDA Graph decode step and passed directly to FlashRWKV2
 sampling. Set `train_autodeco=True` to freeze the backbone forward and train the AutoDeco heads.
 
-### DeepEmbed and token-level ROSA
+### DeepEmbed and per-layer token-level ROSA
 
-RWKV-7S includes `rwkv7a`-style low-rank DeepEmbed (`deep_embed_dim=32`) on each MoE FFN and token-level ROSA injected
-after `embedding_norm`. Both are identity-initialized (`s2=0, s0=1` and `rosa_gate=0`) for post-training. During
-training, DataLoader CPU workers can precompute `rosa_ids = compute_rwkv7s_rosa_ids(input_ids, cu_seqlens)`
-asynchronously and pass `rosa_ids` into `forward()`. During inference and CUDA Graph `generate()`, online suffix
-automatons advance in O(1) amortized time per decode token on CPU using pinned staging buffers.
+RWKV-7S includes `rwkv7a`-style low-rank DeepEmbed (`deep_embed_dim=32`) and low-rank per-layer token-level ROSA
+(`rosa_dim=64`, `rosa_emb -> rosa_proj`) on every MoE FFN layer. Both are identity-initialized (`s2=0, s0=1` and
+`rosa_proj=0`) for post-training. During training, DataLoader CPU workers can precompute
+`rosa_ids = compute_rwkv7s_rosa_ids(input_ids, cu_seqlens)` asynchronously once per batch and pass `rosa_ids` into
+`forward()`. During inference and CUDA Graph `generate()`, online suffix automatons advance in O(1) amortized time per
+decode token on CPU using pinned staging buffers while every layer reads its own ROSA table inside the same CUDA Graph.
 
 ### LightMTP speculative decoding
 
