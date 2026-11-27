@@ -977,7 +977,7 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["Rwkv7sDecoderLayer"]
     _is_stateful = True
     _can_compile_fullgraph = False
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mlp.gate.weight"]
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "mlp.gate.weight", "loop_gate"]
 
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -1056,6 +1056,7 @@ class Rwkv7sPreTrainedModel(PreTrainedModel):
             init.normal_(module.down_proj, mean=0.0, std=0.02)
         elif isinstance(module, Rwkv7sModel):
             init.zeros_(module.rosa_gate)
+            init.zeros_(module.loop_gate)
         elif isinstance(module, nn.LayerNorm):
             init.ones_(module.weight)
             init.zeros_(module.bias)
@@ -1069,6 +1070,7 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         self.embedding_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.rosa_embed = nn.Embedding(config.vocab_size + 1, config.hidden_size, padding_idx=config.vocab_size)
         self.rosa_gate = nn.Parameter(torch.zeros(config.hidden_size))
+        self.loop_gate = nn.Parameter(torch.zeros(config.hidden_size, dtype=torch.float32))
         self.layers = nn.ModuleList(
             [Rwkv7sDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -1125,6 +1127,8 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
         second_last_idx = len(self.layers) - 2
         autodeco_hidden = None
         v_first = None
+        loop_start, loop_end = self.config.loop_layer_index_start, self.config.loop_layer_index_end
+        loop_mid = (loop_start + loop_end) // 2
         for layer_idx, decoder_layer in enumerate(self.layers):
             state_reference = hidden_states.view(batch_size, sequence_length, -1)
             if isinstance(cache, Rwkv7sCache):
@@ -1157,6 +1161,15 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
 
             if output_hidden_states:
                 all_hidden_states += ((hidden_states + residual).view(batch_size, sequence_length, -1),)
+
+            if layer_idx == loop_start - 1:
+                prelude_hidden, prelude_residual = hidden_states, residual
+            elif layer_idx == loop_mid - 1:
+                delta = (hidden_states.float() + residual.float()) - (
+                    prelude_hidden.float() + prelude_residual.float()
+                )
+                hidden_states = prelude_hidden + (delta * self.loop_gate.float()).to(prelude_hidden.dtype)
+                residual = prelude_residual
 
         if isinstance(cache, Rwkv7sCache):
             cache.advance(sequence_length, batch_size, hidden_states.device)
@@ -1270,6 +1283,8 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
             second_last_idx = len(self.layers) - 2
             prev_hidden_states = None
             v_first = None
+            loop_start, loop_end = self.config.loop_layer_index_start, self.config.loop_layer_index_end
+            loop_mid = (loop_start + loop_end) // 2
             for layer_idx, decoder_layer in enumerate(self.layers):
                 attention_shift = wkv_state = feed_forward_shift = None
                 if cache is not None:
@@ -1300,6 +1315,12 @@ class Rwkv7sModel(Rwkv7sPreTrainedModel):
 
                 if output_hidden_states:
                     all_hidden_states += (hidden_states.view(batch_size, sequence_length, -1),)
+
+                if layer_idx == loop_start - 1:
+                    prelude_hidden = hidden_states
+                elif layer_idx == loop_mid - 1:
+                    delta = hidden_states.float() - prelude_hidden.float()
+                    hidden_states = prelude_hidden + (delta * self.loop_gate.float()).to(prelude_hidden.dtype)
 
             if cache is not None:
                 cache.advance(sequence_length, batch_size, hidden_states.device)

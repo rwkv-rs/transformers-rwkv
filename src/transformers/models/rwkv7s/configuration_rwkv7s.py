@@ -27,6 +27,11 @@ class Rwkv7sConfig(PreTrainedConfig):
         Architecture generation stored in converted checkpoints. Only RWKV-7S is accepted.
     context_length (`int`, *optional*, defaults to 4096):
         Maximum sequence length used during pretraining. Recurrent inference can continue beyond this length.
+    loop_layer_index_start (`int`, *optional*):
+        Index of the first core layer. Defaults to 1 for models with at least four layers and 0 otherwise.
+    loop_layer_index_end (`int`, *optional*):
+        Index after the last core layer. Defaults to the largest index `<= num_hidden_layers - 1` yielding an even
+        number of core layers from `loop_layer_index_start` (or 0 when `loop_layer_index_start == 0`).
     num_experts (`int`, *optional*, defaults to 8):
         Number of routed squared-ReLU MoE experts per layer.
     num_experts_per_tok (`int`, *optional*, defaults to 2):
@@ -78,6 +83,8 @@ class Rwkv7sConfig(PreTrainedConfig):
     context_length: int = 4096
     hidden_size: int = 4096
     num_hidden_layers: int = 32
+    loop_layer_index_start: int | None = None
+    loop_layer_index_end: int | None = None
     num_experts: int = 8
     num_experts_per_tok: int = 2
     moe_intermediate_size: int | None = None
@@ -108,6 +115,20 @@ class Rwkv7sConfig(PreTrainedConfig):
     def __post_init__(self, **kwargs):
         if self.architecture_version != "rwkv7s" or {"attention_hidden_size", "rescale_every"}.intersection(kwargs):
             raise ValueError("This `rwkv7s` implementation requires an RWKV-7S checkpoint.")
+        if self.loop_layer_index_start is None:
+            self.loop_layer_index_start = 1 if self.num_hidden_layers >= 4 else 0
+        if self.loop_layer_index_end is None:
+            if self.loop_layer_index_start == 0:
+                self.loop_layer_index_end = 0
+            else:
+                end = self.num_hidden_layers - 1
+                self.loop_layer_index_end = end - (end - self.loop_layer_index_start) % 2
+        start, end = self.loop_layer_index_start, self.loop_layer_index_end
+        if (start, end) != (0, 0) and (not 1 <= start < end <= self.num_hidden_layers - 1 or (end - start) % 2):
+            raise ValueError(
+                "`loop_layer_index_start` and `loop_layer_index_end` must both be 0 or define a positive, even "
+                "number of core layers with at least one layer before and after them."
+            )
         if self.num_experts < 1 or not 1 <= self.num_experts_per_tok <= self.num_experts:
             raise ValueError("`num_experts_per_tok` must satisfy 1 <= num_experts_per_tok <= num_experts.")
         if self.deep_embed_dim <= 0:

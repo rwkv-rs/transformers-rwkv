@@ -63,7 +63,10 @@ def tiny_config(**kwargs) -> Rwkv7sConfig:
 
 def lm_parameters(model: "Rwkv7sForCausalLM") -> tuple["torch.nn.Parameter", ...]:
     return tuple(
-        parameter for name, parameter in model.named_parameters() if not name.startswith(("autodeco.", "mtp."))
+        parameter
+        for name, parameter in model.named_parameters()
+        if not name.startswith(("autodeco.", "mtp."))
+        and (name != "model.loop_gate" or model.config.loop_layer_index_start < model.config.loop_layer_index_end)
     )
 
 
@@ -78,6 +81,123 @@ class Rwkv7sConfigTest(unittest.TestCase):
     def test_rwkv4_config_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "requires an RWKV-7S checkpoint"):
             Rwkv7sConfig.from_dict({"model_type": "rwkv7s", "rescale_every": 6})
+
+    def test_cross_loop_range(self):
+        for num_layers, expected in [(1, (0, 0)), (2, (0, 0)), (3, (0, 0)), (4, (1, 3)), (5, (1, 3)), (6, (1, 5))]:
+            with self.subTest(num_layers=num_layers):
+                config = tiny_config(num_hidden_layers=num_layers)
+                self.assertEqual((config.loop_layer_index_start, config.loop_layer_index_end), expected)
+        for start, end in [(0, 0), (2, 4)]:
+            config = tiny_config(num_hidden_layers=6, loop_layer_index_start=start, loop_layer_index_end=end)
+            self.assertEqual((config.loop_layer_index_start, config.loop_layer_index_end), (start, end))
+        self.assertEqual(tiny_config(num_hidden_layers=5, loop_layer_index_start=2).loop_layer_index_end, 4)
+        for start, end in [(0, 4), (2, 2), (3, 1), (1, 4), (1, 6)]:
+            with self.subTest(start=start, end=end), self.assertRaisesRegex(ValueError, "loop_layer_index_start"):
+                tiny_config(num_hidden_layers=6, loop_layer_index_start=start, loop_layer_index_end=end)
+
+
+@require_torch_gpu
+class Rwkv7sCrossLoopTest(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(142)
+        self.model = Rwkv7sForCausalLM._from_config(tiny_config(num_hidden_layers=4), dtype=torch.bfloat16).cuda()
+        with torch.no_grad():
+            for parameter in self.model.parameters():
+                if parameter.ndim >= 2:
+                    parameter.normal_(std=0.05)
+            self.model.model.layers[2].load_state_dict(self.model.model.layers[1].state_dict())
+        self.ids = torch.randint(1, self.model.config.vocab_size, (2, 7), device="cuda")
+
+    @torch.no_grad()
+    def test_zero_gate_matches_single_round(self):
+        reference = Rwkv7sForCausalLM._from_config(tiny_config(num_hidden_layers=3), dtype=torch.bfloat16).cuda()
+        state_dict = self.model.state_dict()
+        for name in reference.model.layers[2].state_dict():
+            state_dict[f"model.layers.2.{name}"] = state_dict.pop(f"model.layers.3.{name}")
+        reference.load_state_dict(state_dict)
+
+        self.assertEqual(self.model.model.loop_gate.dtype, torch.float32)
+        torch.testing.assert_close(
+            self.model.model.loop_gate, torch.zeros_like(self.model.model.loop_gate), atol=0, rtol=0
+        )
+        for training in (True, False):
+            with self.subTest(training=training), torch.set_grad_enabled(training):
+                actual = self.model.train(training)(self.ids, use_cache=False, output_hidden_states=True)
+                expected = reference.train(training)(self.ids, use_cache=False, output_hidden_states=True)
+                torch.testing.assert_close(actual.logits, expected.logits, atol=0, rtol=0)
+                for hidden, index in zip(actual.hidden_states, (0, 1, 2, 2, 3), strict=True):
+                    torch.testing.assert_close(hidden, expected.hidden_states[index], atol=0, rtol=0)
+
+        kwargs = {"max_new_tokens": 7, "prefill_chunk_size": 3, "do_sample": False, "eos_token_id": None}
+        for use_mtp in (False, True):
+            with self.subTest(use_mtp=use_mtp):
+                torch.testing.assert_close(
+                    self.model.generate(self.ids, use_mtp=use_mtp, **kwargs),
+                    reference.generate(self.ids, use_mtp=use_mtp, **kwargs),
+                )
+                actual = next(reversed(self.model._rwkv7s_generation_graphs.values()))
+                expected = next(reversed(reference._rwkv7s_generation_graphs.values()))
+                actual_graph = actual.verify_graph if use_mtp else actual.decode_graph
+                expected_graph = expected.verify_graph if use_mtp else expected.decode_graph
+                torch.testing.assert_close(actual_graph.logits, expected_graph.logits, atol=0, rtol=0)
+
+    def test_cross_loop_gradients(self):
+        self.model.train()
+        gate = self.model.model.loop_gate
+        core_1 = self.model.model.layers[1].linear_attn.o_proj.weight
+        core_2 = self.model.model.layers[2].linear_attn.o_proj.weight
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.1)
+
+        self.model(self.ids, labels=self.ids, use_cache=False).loss.backward()
+        torch.testing.assert_close(core_1.grad, torch.zeros_like(core_1))
+        for grad in (gate.grad, core_2.grad):
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertTrue(torch.any(grad != 0))
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        self.assertTrue(torch.any(gate != 0))
+        self.model(self.ids, labels=self.ids, use_cache=False).loss.backward()
+        self.assertTrue(torch.isfinite(core_1.grad).all())
+        self.assertTrue(torch.any(core_1.grad != 0))
+
+    @torch.no_grad()
+    def test_nonzero_gate_matches_eager(self):
+        model = self.model.eval()
+        zero_gate = model(self.ids, use_cache=False).logits
+        model.model.loop_gate.copy_(torch.linspace(-0.25, 0.75, model.config.hidden_size, device="cuda"))
+        full = model(self.ids, use_cache=False).logits
+        self.assertFalse(torch.equal(full, zero_gate))
+
+        cache = Rwkv7sCache(model.config)
+        chunks = [model(chunk, cache=cache).logits for chunk in self.ids.split((3, 3, 1), dim=1)]
+        torch.testing.assert_close(torch.cat(chunks, dim=1), full, atol=0, rtol=0)
+
+        logits = chunks[-1][:, -1]
+        completion = [logits.argmax(dim=-1, keepdim=True)]
+        for _ in range(6):
+            logits = model(completion[-1], cache=cache).logits[:, -1]
+            completion.append(logits.argmax(dim=-1, keepdim=True))
+        expected = torch.cat((self.ids, *completion), dim=1)
+        kwargs = {"max_new_tokens": 7, "prefill_chunk_size": 3, "do_sample": False, "eos_token_id": None}
+        for use_mtp in (False, True):
+            with self.subTest(use_mtp=use_mtp):
+                torch.testing.assert_close(model.generate(self.ids, use_mtp=use_mtp, **kwargs), expected)
+                if not use_mtp:
+                    runner = next(reversed(model._rwkv7s_generation_graphs.values()))
+                    torch.testing.assert_close(runner.decode_graph.logits, logits, atol=0, rtol=0)
+
+        # Two new tokens require exactly one verification, starting from the prompt's cache.
+        kwargs["max_new_tokens"] = 2
+        torch.testing.assert_close(
+            model.generate(self.ids, use_mtp=True, **kwargs), expected[:, : self.ids.shape[1] + 2]
+        )
+        verify_graph = next(reversed(model._rwkv7s_generation_graphs.values())).verify_graph
+        cache = model(self.ids).cache
+        verified = torch.cat(
+            [model(token, cache=cache).logits for token in verify_graph.input_ids.split(1, dim=1)], dim=1
+        )
+        torch.testing.assert_close(verify_graph.logits, verified, atol=0, rtol=0)
 
 
 @require_torch_gpu
@@ -259,7 +379,7 @@ class Rwkv7sBF16ProviderTest(unittest.TestCase):
                     torch.testing.assert_close(stateful_gradient, expected_gradient, atol=1e-4, rtol=0.02)
                 training.loss.backward()
                 for name, parameter in model.named_parameters():
-                    if name.startswith(("autodeco.", "mtp.")):
+                    if name.startswith(("autodeco.", "mtp.")) or name == "model.loop_gate":
                         self.assertIsNone(parameter.grad, name)
                     else:
                         self.assertIsNotNone(parameter.grad, name)
@@ -1012,7 +1132,7 @@ class Rwkv7sAutoDecoTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(joint_out.loss))
         joint_out.loss.backward()
         for name, parameter in model.named_parameters():
-            if name.startswith("autodeco."):
+            if name.startswith("autodeco.") or name == "model.loop_gate":
                 self.assertIsNone(parameter.grad, name)
             else:
                 self.assertIsNotNone(parameter.grad, name)

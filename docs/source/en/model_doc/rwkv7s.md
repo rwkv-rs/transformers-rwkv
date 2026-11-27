@@ -32,6 +32,14 @@ pip install "transformers[rwkv]"
 | `Rwkv7sFeedForward` | ChannelMix | `RWKV_CMix_x070` | `RWKV7FeedForward` |
 | `Rwkv7sDecoderLayer` | TimeMix and ChannelMix block | `Block` | `RWKV7Block` |
 
+## Cross-loop residual
+
+The two-round RWKV-7S decoder runs its layers in the order `Prelude -> Core_1 -> Core_2 -> Coda`.
+`loop_layer_index_start` and `loop_layer_index_end` define the half-open core range, split evenly between the two
+rounds. A learned FP32 gate adds a per-channel fraction of the first round's change to the Prelude output at the
+entry to `Core_2`. With the gate initialized to zero and `Core_2` initialized from the original core weights, the
+two-round model starts with the same logits as the single-round model.
+
 ## Inference
 
 ```python
