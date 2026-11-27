@@ -52,6 +52,25 @@ outputs = model.generate(**inputs, tokenizer=tokenizer, max_new_tokens=128)
 print(tokenizer.decode(outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))
 ```
 
+### LightMTP speculative decoding
+
+An RWKV-7 model with a LightMTP head uses speculative decoding for greedy `generate()` calls. To attach an irwkv
+sidecar, load the base model first, then pass the local model directory containing `mtp_config.json` and
+`mtp.safetensors` to `load_mtp_sidecar()`.
+
+```python
+model.load_mtp_sidecar(model_dir)
+outputs = model.generate(input_ids, max_new_tokens=128, do_sample=False, use_mtp=True)
+```
+
+The sidecar describes one shared `lightmlp` block with `mtp_loop: true` and `shared_lm_head: true`. Its weights
+use the `mtp.blocks.0.*` prefix. `save_pretrained()` saves the attached head and its configuration with the base model.
+
+FlashRWKV2 `0.2.0a5` drafts on a CUDA Graph and verifies the batch with one layer of reusable WKV scratch space.
+Each row commits its own accepted prefix. Greedy generation returns the same tokens as single-token decoding with
+either `wkv_mode="fp32io16"` or `wkv_mode="fp16"`. Use `use_mtp=False` to select single-token decoding explicitly.
+Sampling uses the standard Rapid-Sampling path.
+
 ## Training
 
 RWKV-7 uses CUDA and BF16 activations. A dense batch contains token IDs and labels of shape `[batch, length]`.
@@ -62,6 +81,11 @@ model.train()
 loss = model(input_ids=input_ids, labels=labels, use_cache=False).loss
 loss.backward()
 ```
+
+To train LightMTP, set `mtp_depth` to a positive value when creating the model or attach an existing sidecar. Set
+`train_mtp=True` on the model config or pass it to `forward()` to train just the LightMTP block. Set
+`mtp_loss_scaling_factor` to a positive value with `train_mtp=False` to add the auxiliary loss to the base model's
+next-token loss and update both together. The auxiliary loss respects masked labels and packed sequence boundaries.
 
 ### Packing
 
@@ -201,6 +225,11 @@ Set `prefill_chunk_size` to control the prefill capture size.
 
 [[autodoc]] RwkvForCausalLM
     - forward
+    - load_mtp_sidecar
+
+## RwkvMTP
+
+[[autodoc]] RwkvMTP
 
 ## RwkvAttention
 

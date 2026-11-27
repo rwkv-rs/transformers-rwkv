@@ -13,9 +13,13 @@
 # limitations under the License.
 """PyTorch RWKV-7 model backed exclusively by FlashRWKV2."""
 
+import json
 import math
+from contextlib import nullcontext
+from pathlib import Path
 
 import torch
+from safetensors.torch import load_file
 from torch import nn
 from torch.nn import functional as F
 
@@ -35,6 +39,7 @@ from .generation_rwkv import (
     _recurrent_forward,
     _recurrent_metadata,
     _RwkvGraphState,
+    _RwkvVerifyState,
 )
 
 
@@ -103,12 +108,7 @@ class RwkvCache(Cache):
         return query_length, self._seen_tokens
 
     def layer_states(
-        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self._layer_states(layer_idx, hidden_states, training=training, materialize=True)
-
-    def _layer_states(
-        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool, materialize: bool
+        self, layer_idx: int, hidden_states: torch.Tensor, *, training: bool = True, materialize: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer = self.layers[layer_idx]
         batch_size = hidden_states.shape[0]
@@ -178,10 +178,7 @@ class RwkvCache(Cache):
     def recurrent_metadata(
         self, flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, int, object]:
-        key = (device, batch_size, sequence_length, torch.cuda.current_stream(device).cuda_stream)
-        if key not in self._inference_metadata:
-            self._inference_metadata[key] = _recurrent_metadata(flash_rwkv2, batch_size, sequence_length, device)
-        return self._inference_metadata[key]
+        return _recurrent_metadata(self._inference_metadata, flash_rwkv2, batch_size, sequence_length, device)
 
     def recurrent_forward(
         self,
@@ -246,35 +243,34 @@ class RwkvCache(Cache):
         return self._copy(detach=True)
 
     def reset(self, batch_indices: torch.LongTensor | None = None) -> None:
-        if batch_indices is None:
-            for layer in self.layers:
-                for state_idx in range(layer.number_of_states):
-                    for states_name in ("conv_states", "recurrent_states"):
-                        state = getattr(layer, states_name)[state_idx]
-                        if state is not None:
-                            if torch.is_grad_enabled() and state.requires_grad:
-                                getattr(layer, states_name)[state_idx] = torch.zeros_like(state)
-                            else:
-                                state.zero_()
-                    layer.has_previous_state[state_idx] = False
-            if self._stream_lengths is not None:
-                self._stream_lengths.zero_()
-            self._seen_tokens = 0
-        else:
-            for layer in self.layers:
-                for state_idx in range(layer.number_of_states):
-                    for states_name in ("conv_states", "recurrent_states"):
-                        state = getattr(layer, states_name)[state_idx]
-                        if state is None:
-                            continue
+        for layer in self.layers:
+            for state_idx in range(layer.number_of_states):
+                for states_name in ("conv_states", "recurrent_states"):
+                    state = getattr(layer, states_name)[state_idx]
+                    if state is None:
+                        continue
+                    out_of_place = torch.is_grad_enabled() and state.requires_grad
+                    if batch_indices is None:
+                        if out_of_place:
+                            getattr(layer, states_name)[state_idx] = torch.zeros_like(state)
+                        else:
+                            state.zero_()
+                    else:
                         indices = batch_indices.to(state.device)
-                        if torch.is_grad_enabled() and state.requires_grad:
+                        if out_of_place:
                             getattr(layer, states_name)[state_idx] = state.index_fill(0, indices, 0)
                         else:
                             state.index_fill_(0, indices, 0)
-            if self._stream_lengths is not None:
+                if batch_indices is None:
+                    layer.has_previous_state[state_idx] = False
+        if self._stream_lengths is not None:
+            if batch_indices is None:
+                self._stream_lengths.zero_()
+            else:
                 self._stream_lengths.index_fill_(0, batch_indices.to(self._stream_lengths.device), 0)
-                self._seen_tokens = int(self._stream_lengths.max().item())
+        self._seen_tokens = (
+            0 if batch_indices is None or self._stream_lengths is None else int(self._stream_lengths.max().item())
+        )
         self._inference_metadata.clear()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
@@ -492,7 +488,7 @@ class RwkvAttention(nn.Module):
         attention_shift: torch.Tensor,
         wkv_state: object,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
-        cache: RwkvCache | _RwkvGraphState,
+        cache: RwkvCache | _RwkvGraphState | _RwkvVerifyState,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flash_rwkv2 = load_flash_rwkv2()
         cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
@@ -513,6 +509,7 @@ class RwkvAttention(nn.Module):
             max_seqlen=max_seqlen,
             eps=self.config.layer_norm_epsilon,
             validated_metadata=ticket,
+            save_normalized=cache.saved_tmix_norm[self.layer_idx] if isinstance(cache, _RwkvVerifyState) else None,
         )
 
         r_weight, r_lora_a, r_lora_b, r_lora_scale, r_nora = flash_rwkv2_linear_spec(self.r_proj)
@@ -602,7 +599,7 @@ class RwkvAttention(nn.Module):
         residual: torch.Tensor | None = None,
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
-        cache: RwkvCache | _RwkvGraphState | None = None,
+        cache: RwkvCache | _RwkvGraphState | _RwkvVerifyState | None = None,
         use_unfused_projections: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ):
@@ -691,6 +688,7 @@ class RwkvFeedForward(nn.Module):
         layer_norm: nn.LayerNorm,
         feed_forward_shift: torch.Tensor,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object],
+        save_normalized: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         flash_rwkv2 = load_flash_rwkv2()
         key_weight, key_a, key_b, key_scale, key_nora = flash_rwkv2_linear_spec(self.key)
@@ -718,6 +716,7 @@ class RwkvFeedForward(nn.Module):
             value_lora_b=value_b,
             value_lora_scale=value_scale,
             value_use_nora=value_nora,
+            save_normalized=save_normalized,
         )
         return hidden_states, residual
 
@@ -729,6 +728,7 @@ class RwkvFeedForward(nn.Module):
         layer_norm: nn.LayerNorm | None = None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None = None,
         use_unfused_projections: bool = False,
+        save_normalized: torch.Tensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         if hidden_states.ndim == 3:
@@ -738,7 +738,9 @@ class RwkvFeedForward(nn.Module):
                 use_unfused_projections,
                 cu_seqlens=kwargs.pop("cu_seq_lens_q", None),
             )
-        return self._inference_forward(hidden_states, residual, layer_norm, feed_forward_shift, inference_metadata)
+        return self._inference_forward(
+            hidden_states, residual, layer_norm, feed_forward_shift, inference_metadata, save_normalized
+        )
 
 
 class RwkvDecoderLayer(GradientCheckpointingLayer):
@@ -761,7 +763,7 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
         wkv_state: object | None,
         feed_forward_shift: torch.Tensor | None,
         inference_metadata: tuple[torch.Tensor, torch.Tensor, int, object] | None,
-        cache: RwkvCache | _RwkvGraphState | None = None,
+        cache: RwkvCache | _RwkvGraphState | _RwkvVerifyState | None = None,
         use_unfused_projections: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ):
@@ -811,6 +813,9 @@ class RwkvDecoderLayer(GradientCheckpointingLayer):
             residual=attention_output,
             layer_norm=self.post_attention_layernorm,
             inference_metadata=inference_metadata,
+            save_normalized=cache.saved_cmix_norm[self.linear_attn.layer_idx]
+            if isinstance(cache, _RwkvVerifyState)
+            else None,
         )
         return hidden_states, residual, v_first, None, None
 
@@ -921,16 +926,12 @@ class RwkvModel(RwkvPreTrainedModel):
         self,
         input_ids: torch.LongTensor | None,
         inputs_embeds: torch.FloatTensor | None,
-        cache: RwkvCache | _RwkvGraphState,
+        cache: RwkvCache | _RwkvGraphState | _RwkvVerifyState,
         output_hidden_states: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...] | None]:
         if inputs_embeds is None:
-            batch_size, sequence_length = input_ids.shape
-        else:
-            batch_size, sequence_length = inputs_embeds.shape[:2]
-
-        if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        batch_size, sequence_length = inputs_embeds.shape[:2]
         inputs_embeds = inputs_embeds.reshape(-1, self.config.hidden_size).contiguous()
         flash_rwkv2 = load_flash_rwkv2()
         hidden_states = flash_rwkv2.infer_embedding_ln0_forward_varlen(
@@ -946,15 +947,15 @@ class RwkvModel(RwkvPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += ((hidden_states + residual).view(batch_size, sequence_length, -1),)
 
+        is_rwkv_cache = isinstance(cache, RwkvCache)
         v_first = None
         for layer_idx, decoder_layer in enumerate(self.layers):
-            state_reference = hidden_states.view(batch_size, sequence_length, -1)
-            if isinstance(cache, RwkvCache):
-                attention_shift, wkv_state, feed_forward_shift = cache._layer_states(
-                    layer_idx, state_reference, training=False, materialize=False
+            if is_rwkv_cache:
+                attention_shift, wkv_state, feed_forward_shift = cache.layer_states(
+                    layer_idx, hidden_states.view(batch_size, sequence_length, -1), training=False, materialize=False
                 )
             else:
-                attention_shift, wkv_state, feed_forward_shift = cache.layer_states(layer_idx, state_reference)
+                attention_shift, wkv_state, feed_forward_shift = cache.layer_states(layer_idx)
             hidden_states, residual, v_first, _, _ = decoder_layer(
                 hidden_states,
                 residual,
@@ -965,13 +966,13 @@ class RwkvModel(RwkvPreTrainedModel):
                 inference_metadata,
                 cache,
             )
-            if isinstance(cache, RwkvCache):
+            if is_rwkv_cache:
                 cache.mark_layer_updated(layer_idx)
 
             if output_hidden_states:
                 all_hidden_states += ((hidden_states + residual).view(batch_size, sequence_length, -1),)
 
-        if isinstance(cache, RwkvCache):
+        if is_rwkv_cache:
             cache.advance(sequence_length, batch_size, hidden_states.device)
         return hidden_states, residual, all_hidden_states
 
@@ -1119,6 +1120,29 @@ class RwkvModel(RwkvPreTrainedModel):
         )
 
 
+class RwkvMTP(nn.Module):
+    """Shared LightMTP block. Every draft step reuses this block and the base LM head."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int, eps: float):
+        super().__init__()
+        self.norm_h = nn.LayerNorm(hidden_size, eps=eps)
+        self.norm_e = nn.LayerNorm(hidden_size, eps=eps)
+        self.proj = nn.Linear(2 * hidden_size, hidden_size, bias=False)
+        self.norm_mlp = nn.LayerNorm(hidden_size, eps=eps)
+        self.gate = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.norm_out = nn.LayerNorm(hidden_size, eps=eps)
+
+    def forward(self, hidden_states: torch.Tensor, token_embeds: torch.Tensor) -> torch.Tensor:
+        dtype = self.proj.weight.dtype
+        hidden_states = hidden_states.to(dtype)
+        joined = torch.cat((self.norm_e(token_embeds.to(dtype)), self.norm_h(hidden_states)), dim=-1)
+        hidden_states = hidden_states + self.proj(joined)
+        mlp_input = self.norm_mlp(hidden_states)
+        return hidden_states + self.down(F.silu(self.gate(mlp_input)) * self.up(mlp_input))
+
+
 @auto_docstring
 class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -1131,7 +1155,106 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         self.model = RwkvModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.mtp = (
+            RwkvMTP(
+                config.hidden_size, config.mtp_intermediate_size, config.mtp_norm_epsilon or config.layer_norm_epsilon
+            )
+            if config.mtp_depth > 0
+            else None
+        )
         self.post_init()
+
+    def load_mtp_sidecar(self, model_dir: str | Path) -> None:
+        """Attach an irwkv LightMTP sidecar from a local model directory."""
+        model_dir = Path(model_dir)
+        config = json.loads((model_dir / "mtp_config.json").read_text(encoding="utf-8"))
+        if (
+            config["mtp_type"] != "lightmlp"
+            or not config["mtp_loop"]
+            or config.get("num_blocks", 1) != 1
+            or not config.get("shared_lm_head", True)
+        ):
+            raise ValueError("RWKV LightMTP requires one looped `lightmlp` block with a shared LM head.")
+        if config["hidden_size"] != self.config.hidden_size:
+            raise ValueError("The LightMTP sidecar hidden size must match the RWKV base model.")
+        depth = config["mtp_depth"]
+        intermediate_size = config["intermediate_size"]
+        eps = config.get("norm_eps", self.config.layer_norm_epsilon)
+        if depth < 1 or intermediate_size < 1 or not math.isfinite(eps) or eps <= 0:
+            raise ValueError("LightMTP depth, intermediate size and norm epsilon must be positive.")
+
+        weights = load_file(model_dir / config.get("weight_file", "mtp.safetensors"))
+        prefix = "mtp.blocks.0."
+        if any(not key.startswith(prefix) for key in weights):
+            raise ValueError(f"LightMTP sidecar tensor names must start with `{prefix}`.")
+        with torch.device("meta"):
+            head = RwkvMTP(self.config.hidden_size, intermediate_size, eps)
+        head.load_state_dict({key.removeprefix(prefix): tensor for key, tensor in weights.items()}, assign=True)
+        self.mtp = head.to(device=self.lm_head.weight.device, dtype=self.model.norm.weight.dtype).train(self.training)
+        self.config.mtp_depth = depth
+        self.config.mtp_intermediate_size = intermediate_size
+        self.config.mtp_norm_epsilon = eps
+        if (graphs := getattr(self, "_rwkv_generation_graphs", None)) is not None:
+            graphs.clear()
+
+    def _project_lm_head(self, hidden_states: torch.Tensor, head_spec, *, detach_head: bool = False) -> torch.Tensor:
+        if head_spec is None:
+            hidden_states = hidden_states.to(self.model.norm.weight.dtype)
+            if detach_head:
+                parameters = {name: param.detach() for name, param in self.lm_head.named_parameters()}
+                return torch.func.functional_call(self.lm_head, parameters, (hidden_states,))
+            return self.lm_head(hidden_states)
+        weight, lora_a, lora_b, scale, use_nora = head_spec
+        if detach_head:
+            weight = weight.detach()
+            lora_a = None if lora_a is None else lora_a.detach()
+            lora_b = None if lora_b is None else lora_b.detach()
+        return load_flash_rwkv2().pretrain_head_linear_bf16(
+            hidden_states.to(weight.dtype).contiguous(),
+            weight,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scale=scale,
+            use_nora=use_nora,
+        )
+
+    def _mtp_loss(
+        self,
+        hidden_states: torch.Tensor,
+        token_embeds: torch.Tensor,
+        labels: torch.Tensor,
+        head_spec,
+        *,
+        detach_head: bool,
+        shift_labels: torch.Tensor | None,
+        cu_seq_lens_q: torch.Tensor | None,
+    ) -> torch.Tensor:
+        targets = shift_labels if shift_labels is not None else labels[..., 1:]
+        targets = targets.to(hidden_states.device)
+        seq_len = hidden_states.shape[1]
+        if cu_seq_lens_q is not None:
+            positions = torch.arange(seq_len, device=hidden_states.device)
+            seq_ids = torch.searchsorted(cu_seq_lens_q[1:].to(positions.device), positions, right=True)
+
+        num_steps = min(self.config.mtp_depth, seq_len - 2)
+        loss = self.mtp.proj.weight.flatten()[0].float() * 0.0
+        active_steps = 0
+        for step in range(1, num_steps + 1):
+            span = seq_len - step - 1
+            hidden_states = self.mtp(hidden_states[:, :span], token_embeds[:, step : step + span])
+            step_targets = targets[:, step : step + span]
+            if cu_seq_lens_q is not None:
+                step_targets = step_targets.masked_fill(seq_ids[:span] != seq_ids[step + 1 : step + span + 1], -100)
+            count = (step_targets != -100).sum()
+            step_logits = self._project_lm_head(self.mtp.norm_out(hidden_states), head_spec, detach_head=detach_head)
+            loss = loss + F.cross_entropy(
+                step_logits.reshape(-1, self.vocab_size).float(),
+                step_targets.reshape(-1),
+                reduction="sum",
+                ignore_index=-100,
+            ) / count.clamp_min(1)
+            active_steps = active_steps + (count > 0).long()
+        return loss / active_steps.clamp_min(1) if num_steps > 0 else loss
 
     @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache", raise_if_both_names=True)
     @can_return_tuple
@@ -1146,34 +1269,54 @@ class RwkvForCausalLM(RwkvPreTrainedModel, RwkvGenerationMixin):
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
+        train_mtp: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
+        r"""
+        train_mtp (`bool`, *optional*):
+            Compute only the LightMTP loss and freeze the base model and shared LM head in this forward pass.
+            Defaults to `config.train_mtp`.
+        """
+        if train_mtp is None:
+            train_mtp = self.config.train_mtp
+        if train_mtp and self.mtp is None:
+            raise ValueError("`train_mtp` requires `mtp_depth >= 1`.")
         head_spec = flash_rwkv2_linear_spec(self.lm_head)
-        use_unfused_projections = head_spec is None or not self.model._supports_fused_projections()
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            cache=cache,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            _use_unfused_projections=use_unfused_projections,
-            **kwargs,
-        )
-        selected = slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep)
-        if selected.ndim == 2 and isinstance(logits_to_keep, torch.Tensor) and logits_to_keep.ndim == 0:
-            selected = selected.unsqueeze(1)
-        if use_unfused_projections:
-            logits = self.lm_head(selected.to(self.model.norm.weight.dtype))
-        else:
-            weight, lora_a, lora_b, scale, use_nora = head_spec
-            logits = load_flash_rwkv2().pretrain_head_linear_bf16(
-                selected.contiguous(), weight, lora_a=lora_a, lora_b=lora_b, lora_scale=scale, use_nora=use_nora
+        if head_spec is not None and not self.model._supports_fused_projections():
+            head_spec = None
+        with torch.no_grad() if train_mtp else nullcontext():
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                _use_unfused_projections=head_spec is None,
+                **kwargs,
             )
+            selected = slice_logits_to_keep(outputs.last_hidden_state, logits_to_keep)
+            if selected.ndim == 2 and isinstance(logits_to_keep, torch.Tensor) and logits_to_keep.ndim == 0:
+                selected = selected.unsqueeze(1)
+            logits = self._project_lm_head(selected, head_spec)
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            if not train_mtp:
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            if self.mtp is not None and (train_mtp or self.config.mtp_loss_scaling_factor > 0):
+                with torch.no_grad() if train_mtp else nullcontext():
+                    token_embeds = inputs_embeds if inputs_embeds is not None else self.model.embed_tokens(input_ids)
+                mtp_loss = self._mtp_loss(
+                    outputs.last_hidden_state,
+                    token_embeds.detach() if train_mtp else token_embeds,
+                    labels,
+                    head_spec,
+                    detach_head=train_mtp,
+                    shift_labels=kwargs.get("shift_labels"),
+                    cu_seq_lens_q=kwargs.get("cu_seq_lens_q"),
+                )
+                loss = mtp_loss if train_mtp else loss + self.config.mtp_loss_scaling_factor * mtp_loss
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -1189,6 +1332,7 @@ __all__ = [
     "RwkvDecoderLayer",
     "RwkvFeedForward",
     "RwkvForCausalLM",
+    "RwkvMTP",
     "RwkvModel",
     "RwkvPreTrainedModel",
 ]
