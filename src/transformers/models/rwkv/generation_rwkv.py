@@ -70,7 +70,7 @@ def _recurrent_forward(
     flash_rwkv2,
     wkv_mode: str,
     recurrent_state,
-    receptance: torch.Tensor,
+    receptance: torch.Tensor | None,
     decay_logits: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -78,7 +78,7 @@ def _recurrent_forward(
     recurrent_b: torch.Tensor,
     decay_bias: torch.Tensor,
     inference_metadata,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     cu_seqlens, state_indices, max_seqlen, ticket = inference_metadata
     return getattr(flash_rwkv2, f"infer_tmix_wkv7_recurrent_{wkv_mode}_forward_varlen")(
         receptance,
@@ -93,6 +93,7 @@ def _recurrent_forward(
         decay_bias=decay_bias,
         max_seqlen=max_seqlen,
         validated_metadata=ticket,
+        save=False,
     )
 
 
@@ -166,25 +167,108 @@ class _RwkvGraphState:
             inference_metadata,
         )
 
-    def clone(self) -> tuple:
-        return (
-            self.attention_shift.clone(),
-            self.feed_forward_shift.clone(),
-            tuple(state.clone() for state in self.recurrent_states),
-        )
-
-    def copy_(self, snapshot: tuple) -> None:
-        attention_shift, feed_forward_shift, saved_recurrent_states = snapshot
-        self.attention_shift.copy_(attention_shift)
-        self.feed_forward_shift.copy_(feed_forward_shift)
-        for state, saved_state in zip(self.recurrent_states, saved_recurrent_states, strict=True):
-            state.copy_(saved_state)
-
     def zero_(self) -> None:
         self.attention_shift.zero_()
         self.feed_forward_shift.zero_()
         for state in self.recurrent_states:
             state.zero_()
+
+
+class _RwkvVerifyState:
+    """Verify on a single scratch layer and retain only BF16 inputs for commit."""
+
+    def __init__(self, main: _RwkvGraphState, config: RwkvConfig, width: int, flash_rwkv2) -> None:
+        self.main = main
+        self.width = width
+        self.scratch_attention_shift = torch.empty_like(main.attention_shift[0])
+        self.scratch_feed_forward_shift = torch.empty_like(main.feed_forward_shift[0])
+        self.scratch_S = torch.empty_like(main._state_pools[0])
+        prepare_state = getattr(flash_rwkv2, f"prepare_tmix_wkv7_recurrent_{main.wkv_mode}_state_from_tensor")
+        self.scratch_wkv = prepare_state(self.scratch_S)
+        batch_size = self.scratch_S.shape[0]
+        num_tokens = batch_size * width
+        self.saved_wkv = torch.empty(
+            (config.num_hidden_layers, 5, num_tokens, config.num_attention_heads, config.head_size),
+            dtype=torch.bfloat16,
+            device=self.scratch_S.device,
+        )
+        shift_shape = (config.num_hidden_layers, num_tokens, config.hidden_size)
+        self.saved_tmix_norm = self.saved_wkv.new_empty(shift_shape)
+        self.saved_cmix_norm = self.saved_wkv.new_empty(shift_shape)
+        self.rows = torch.arange(batch_size, dtype=torch.int32, device=self.scratch_S.device)
+        self.positions = torch.arange(num_tokens, dtype=torch.int32, device=self.scratch_S.device)
+
+    def layer_states(self, layer_idx: int, _hidden_states: torch.Tensor) -> tuple[torch.Tensor, object, torch.Tensor]:
+        self.layer_idx = layer_idx
+        self.scratch_attention_shift.copy_(self.main.attention_shift[layer_idx])
+        self.scratch_feed_forward_shift.copy_(self.main.feed_forward_shift[layer_idx])
+        self.scratch_wkv.copy_(self.main.recurrent_states[layer_idx])
+        return self.scratch_attention_shift, self.scratch_wkv, self.scratch_feed_forward_shift
+
+    def recurrent_metadata(self, flash_rwkv2, batch_size: int, sequence_length: int, device: torch.device):
+        return self.main.recurrent_metadata(flash_rwkv2, batch_size, sequence_length, device)
+
+    def recurrent_forward(
+        self,
+        flash_rwkv2,
+        receptance: torch.Tensor,
+        decay_logits: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        recurrent_a: torch.Tensor,
+        recurrent_b: torch.Tensor,
+        recurrent_state,
+        decay_bias: torch.Tensor,
+        inference_metadata,
+    ) -> torch.Tensor:
+        inputs = (decay_logits, key, value, recurrent_a, recurrent_b)
+        for destination, tensor in zip(self.saved_wkv[self.layer_idx].unbind(), inputs, strict=True):
+            destination.copy_(tensor)
+        return _recurrent_forward(
+            flash_rwkv2, self.main.wkv_mode, recurrent_state, receptance, *inputs, decay_bias, inference_metadata
+        )
+
+    def commit(self, flash_rwkv2, model: RwkvModel, prefixes: torch.Tensor) -> None:
+        active = prefixes > 0
+        batch_size = self.rows.numel()
+        # Compact active slots and their accepted inputs into fixed-capacity GPU buffers for graph replay.
+        order = torch.where(active, self.rows, batch_size).sort().values
+        slots = order.clamp_max(batch_size - 1)
+        lengths = torch.where(order < batch_size, prefixes[slots.long()], 0)
+        offsets = torch.nn.functional.pad(lengths.cumsum(0, dtype=torch.int32), (1, 0))
+        packed_rows = torch.searchsorted(offsets[1:], self.positions, right=True).clamp_max(batch_size - 1)
+        gather = (slots[packed_rows] * self.width + self.positions - offsets[packed_rows]).clamp_max(
+            self.positions.numel() - 1
+        )
+        ticket = flash_rwkv2.prepare_tmix_wkv7_recurrent_metadata(
+            offsets,
+            slots,
+            state_pool_size=batch_size,
+            token_capacity=self.positions.numel(),
+            sequence_capacity=batch_size,
+            max_seqlen_capacity=self.width,
+            num_active_tokens=offsets[-1:],
+            num_active_sequences=active.sum(dtype=torch.int32).view(1),
+        )
+        metadata = (offsets, slots, self.width, ticket)
+        for layer_idx, layer in enumerate(model.layers):
+            packed = self.saved_wkv[layer_idx].index_select(1, gather)
+            _recurrent_forward(
+                flash_rwkv2,
+                self.main.wkv_mode,
+                self.main.recurrent_states[layer_idx],
+                None,
+                *packed.unbind(),
+                layer.linear_attn.w0,
+                metadata,
+            )
+            del packed
+        last = self.rows * self.width + (prefixes - 1).clamp_min(0)
+        for shift, saved in (
+            (self.main.attention_shift, self.saved_tmix_norm),
+            (self.main.feed_forward_shift, self.saved_cmix_norm),
+        ):
+            shift.copy_(torch.where(active[None, :, None], saved.index_select(1, last), shift))
 
 
 class _RwkvPrefillGraph:
@@ -201,12 +285,11 @@ class _RwkvPrefillGraph:
             (batch_size, sequence_length), dtype=torch.long, device=model.embed_tokens.weight.device
         )
         self.graph = torch.cuda.CUDAGraph()
-        snapshot = state.clone()
         generation_stream = torch.cuda.current_stream(self.input_ids.device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
             model._forward_state_only(self.input_ids, None, state, False)
-            state.copy_(snapshot)
+            state.zero_()
             with torch.cuda.graph(
                 self.graph,
                 pool=graph_pool,
@@ -214,7 +297,7 @@ class _RwkvPrefillGraph:
                 capture_error_mode="thread_local",
             ):
                 model._forward_state_only(self.input_ids, None, state, False)
-            state.copy_(snapshot)
+            state.zero_()
         generation_stream.wait_stream(capture_stream)
 
     def replay(self, input_ids: torch.LongTensor) -> None:
@@ -235,6 +318,7 @@ class _RwkvDecodeGraph:
         capture_stream: torch.cuda.Stream,
         graph_pool,
         flash_rwkv2,
+        mtp_depth: int = 0,
     ) -> None:
         device = model.lm_head.weight.device
         self.vocab_size = model.vocab_size
@@ -251,7 +335,10 @@ class _RwkvDecodeGraph:
         self.flash_rwkv2 = flash_rwkv2
         self.stop_string_criteria = tuple(copy.copy(criteria) for criteria in stop_string_criteria)
         self.input_ids = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-        self.completion = torch.empty((batch_size, max_new_tokens), dtype=torch.long, device=device)
+        self.mtp_depth = mtp_depth
+        self.completion = torch.empty(
+            (batch_size, max_new_tokens + (mtp_depth + 1 if mtp_depth else 0)), dtype=torch.long, device=device
+        )
         self.completion_index = torch.zeros(1, dtype=torch.long, device=device)
         self.completion_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
         self.unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -273,13 +360,12 @@ class _RwkvDecodeGraph:
             criteria(self.stop_suffix, None)
 
         self.graph = torch.cuda.CUDAGraph()
-        state_snapshot = state.clone()
         sampling_snapshot = self.sampling_states.clone() if self.sampling_states is not None else None
         generation_stream = torch.cuda.current_stream(device)
         capture_stream.wait_stream(generation_stream)
         with torch.cuda.stream(capture_stream):
             self._forward(model)
-            self._restore_capture_inputs(state_snapshot, sampling_snapshot)
+            self._restore_capture_inputs(sampling_snapshot)
             with torch.cuda.graph(
                 self.graph,
                 pool=graph_pool,
@@ -287,11 +373,11 @@ class _RwkvDecodeGraph:
                 capture_error_mode="thread_local",
             ):
                 self._forward(model)
-            self._restore_capture_inputs(state_snapshot, sampling_snapshot)
+            self._restore_capture_inputs(sampling_snapshot)
         generation_stream.wait_stream(capture_stream)
 
-    def _restore_capture_inputs(self, state_snapshot: tuple, sampling_snapshot: torch.Tensor | None) -> None:
-        self.state.copy_(state_snapshot)
+    def _restore_capture_inputs(self, sampling_snapshot: torch.Tensor | None) -> None:
+        self.state.zero_()
         if sampling_snapshot is not None:
             self.sampling_states.copy_(sampling_snapshot)
             self.penalties.zero_()
@@ -311,15 +397,10 @@ class _RwkvDecodeGraph:
             model.model.norm.bias,
             eps=model.config.layer_norm_epsilon,
         )
-        weight, lora_a, lora_b, scale, use_nora = flash_rwkv2_linear_spec(model.lm_head)
-        logits = self.flash_rwkv2.pretrain_head_linear_bf16(
-            hidden_states,
-            weight,
-            lora_a=lora_a,
-            lora_b=lora_b,
-            lora_scale=scale,
-            use_nora=use_nora,
-        ).view(self.batch_size, model.vocab_size)
+        if self.mtp_depth:
+            self.hidden_states = hidden_states
+        logits = model._project_lm_head(hidden_states, flash_rwkv2_linear_spec(model.lm_head))
+        logits = logits.view(self.batch_size, model.vocab_size)
         self.logits = logits.float().contiguous()
         if self.do_sample:
             sampled_tokens = self.flash_rwkv2.infer_sampling_six_parameter_forward_varlen(
@@ -372,6 +453,109 @@ class _RwkvDecodeGraph:
         self.graph.replay()
 
 
+class _RwkvMtpDecodeGraph:
+    def __init__(
+        self,
+        model: RwkvForCausalLM,
+        decode: _RwkvDecodeGraph,
+        capture_stream: torch.cuda.Stream,
+        graph_pool,
+    ) -> None:
+        from flashrwkv2.mtp import DraftLoop
+
+        device = decode.input_ids.device
+        flash_rwkv2 = decode.flash_rwkv2
+        width = decode.mtp_depth + 1
+        self.decode = decode
+        self.state = _RwkvVerifyState(decode.state, model.config, width, flash_rwkv2)
+        self.input_ids = torch.zeros((decode.batch_size, width), dtype=torch.long, device=device)
+        self.steps = torch.arange(width, device=device)
+        self.rows = decode.slot_indices.long()
+        head_spec = flash_rwkv2_linear_spec(model.lm_head)
+        weight, lora_a, lora_b, lora_scale, use_nora = head_spec
+        self.draft = DraftLoop.from_state_dict(
+            model.mtp.state_dict(prefix="mtp."),
+            weight,
+            depth=decode.mtp_depth,
+            eps=model.mtp.norm_h.eps,
+            lora_a=lora_a,
+            lora_b=lora_b,
+            lora_scale=lora_scale,
+            use_nora=use_nora,
+        )
+        self.draft.capture(model.model.embed_tokens, decode.batch_size)
+
+        self.graph = torch.cuda.CUDAGraph()
+        generation_stream = torch.cuda.current_stream(device)
+        capture_stream.wait_stream(generation_stream)
+        with torch.cuda.stream(capture_stream):
+            decode.state.zero_()
+            decode.completion_lengths.zero_()
+            decode.unfinished.fill_(True)
+            decode.stop_suffix.fill_(decode.vocab_size)
+            self._forward(model, head_spec)
+            with torch.cuda.graph(
+                self.graph, pool=graph_pool, stream=capture_stream, capture_error_mode="thread_local"
+            ):
+                self._forward(model, head_spec)
+        generation_stream.wait_stream(capture_stream)
+
+    def _forward(self, model: RwkvForCausalLM, head_spec) -> None:
+        decode = self.decode
+        flash_rwkv2 = decode.flash_rwkv2
+        width = self.input_ids.shape[1]
+        hidden_states, residual, _ = model.model._forward_state_only(self.input_ids, None, self.state, False)
+        hidden_states = flash_rwkv2.infer_post_norm_output_forward_varlen(
+            hidden_states,
+            residual,
+            model.model.norm.weight,
+            model.model.norm.bias,
+            eps=model.config.layer_norm_epsilon,
+        ).view(decode.batch_size, width, -1)
+        predictions = torch.empty_like(self.input_ids)
+        for step in range(width):
+            # Match ordinary decode's head shape and keep at most one logits plane live.
+            logits = model._project_lm_head(hidden_states[:, step], head_spec)
+            predictions[:, step].copy_(logits.argmax(dim=-1))
+            del logits
+
+        matches = predictions[:, :-1] == self.input_ids[:, 1:]
+        prefixes = torch.where(matches, width - 1, self.steps[:-1]).amin(dim=1) + 1
+        finished = torch.zeros_like(predictions, dtype=torch.bool)
+        if decode.eos_token_ids is not None:
+            finished.logical_or_(torch.isin(predictions, decode.eos_token_ids))
+        if decode.stop_string_criteria:
+            suffix_length = decode.stop_suffix.shape[1]
+            windows = torch.cat((decode.stop_suffix, predictions), dim=1).unfold(1, suffix_length, 1)
+            suffixes = windows[:, 1:].reshape(-1, suffix_length)
+            for criteria in decode.stop_string_criteria:
+                finished.logical_or_(criteria(suffixes, None).view_as(finished))
+        stop = torch.where(finished, self.steps, width).amin(dim=1) + 1
+        remaining = decode.max_new_tokens - decode.completion_lengths
+        prefixes = torch.minimum(prefixes, torch.minimum(remaining, stop)).masked_fill(~decode.unfinished, 0)
+        self.state.commit(flash_rwkv2, model.model, prefixes)
+
+        valid = self.steps < prefixes[:, None]
+        destination = torch.where(
+            valid, decode.completion_lengths[:, None] + self.steps, decode.max_new_tokens + self.steps
+        )
+        decode.completion.scatter_(1, destination, predictions)
+        decode.completion_lengths.add_(prefixes)
+        decode.unfinished.logical_and_((prefixes < remaining) & (prefixes < stop))
+        if decode.stop_string_criteria:
+            decode.stop_suffix.copy_(windows[self.rows, prefixes])
+        last = (prefixes - 1).clamp_min(0)
+        self.hidden_states = hidden_states[self.rows, last]
+        decode.input_ids[:, 0].copy_(predictions[self.rows, last])
+
+    def replay(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        tokens = self.decode.input_ids[:, 0]
+        self.input_ids[:, 0].copy_(tokens)
+        self.input_ids[:, 1:].copy_(self.draft.replay(hidden_states, tokens))
+        self.graph.replay()
+        return self.hidden_states
+
+
 class _RwkvAsyncTokenStreamer:
     def __init__(self, streamer: BaseStreamer, batch_size: int, max_new_tokens: int, device: torch.device) -> None:
         self.streamer = streamer
@@ -420,6 +604,7 @@ class _RwkvGenerationModelRunner:
         max_length: int,
         eos_token_ids: torch.Tensor | None,
         stop_string_criteria: tuple[StopStringCriteria, ...],
+        mtp_depth: int,
     ) -> None:
         batch_size, prompt_length = input_ids.shape
         self.prefill_lengths = _rwkv_prefill_lengths(prompt_length, generation_config.prefill_chunk_size)
@@ -431,16 +616,16 @@ class _RwkvGenerationModelRunner:
             input_ids.device,
             flash_rwkv2,
         )
-        capture_stream = torch.cuda.Stream(device=input_ids.device)
-        graph_pool = torch.cuda.graph_pool_handle()
+        self.capture_stream = torch.cuda.Stream(device=input_ids.device)
+        self.graph_pool = torch.cuda.graph_pool_handle()
         self.prefill_graphs = {
             sequence_length: _RwkvPrefillGraph(
                 model.model,
                 self.state,
                 batch_size,
                 sequence_length,
-                capture_stream,
-                graph_pool,
+                self.capture_stream,
+                self.graph_pool,
             )
             for sequence_length in dict.fromkeys(self.prefill_lengths)
         }
@@ -452,13 +637,15 @@ class _RwkvGenerationModelRunner:
             generation_config,
             eos_token_ids,
             stop_string_criteria,
-            capture_stream,
-            graph_pool,
+            self.capture_stream,
+            self.graph_pool,
             flash_rwkv2,
+            mtp_depth,
         )
+        self.mtp_graph = None
 
     def generate(
-        self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None
+        self, input_ids: torch.LongTensor, seed: int, streamer: BaseStreamer | None = None, *, use_mtp: bool = False
     ) -> torch.LongTensor:
         self.decode_graph.prepare(input_ids, seed)
         generation_stream = torch.cuda.current_stream(input_ids.device)
@@ -485,15 +672,38 @@ class _RwkvGenerationModelRunner:
         synchronize_stopping = self.decode_graph.eos_token_ids is not None or bool(
             self.decode_graph.stop_string_criteria
         )
-        for _ in range(self.decode_graph.max_new_tokens):
-            self.decode_graph.replay()
-            if produced_tokens == 0:
-                first_token_event.record(generation_stream)
+        if use_mtp:
+            decode = self.decode_graph
+            decode.replay()
+            first_token_event.record(generation_stream)
+            produced_tokens = 1
             if async_streamer is not None:
-                async_streamer.submit(self.decode_graph.completion, produced_tokens, generation_stream)
-            produced_tokens += 1
-            if synchronize_stopping and not bool(self.decode_graph.unfinished.any().item()):
-                break
+                async_streamer.submit(decode.completion, 0, generation_stream)
+            if not synchronize_stopping or bool(decode.unfinished.any().item()):
+                streamed = 1
+                hidden_states = decode.hidden_states
+                while True:
+                    hidden_states = self.mtp_graph.replay(hidden_states)
+                    ready = torch.where(decode.unfinished, decode.completion_lengths, decode.max_new_tokens).min()
+                    produced_tokens, ready = torch.stack((decode.completion_lengths.max(), ready)).tolist()
+                    done = ready == decode.max_new_tokens
+                    if async_streamer is not None:
+                        end = produced_tokens if done else ready
+                        for position in range(streamed, end):
+                            async_streamer.submit(decode.completion, position, generation_stream)
+                        streamed = end
+                    if done:
+                        break
+        else:
+            for _ in range(self.decode_graph.max_new_tokens):
+                self.decode_graph.replay()
+                if produced_tokens == 0:
+                    first_token_event.record(generation_stream)
+                if async_streamer is not None:
+                    async_streamer.submit(self.decode_graph.completion, produced_tokens, generation_stream)
+                produced_tokens += 1
+                if synchronize_stopping and not bool(self.decode_graph.unfinished.any().item()):
+                    break
         end_event.record(generation_stream)
         self.last_generation_events = start_event, first_token_event, end_event
         output = torch.cat((input_ids, self.decode_graph.completion[:, :produced_tokens]), dim=-1)
@@ -502,6 +712,9 @@ class _RwkvGenerationModelRunner:
         return output
 
     def reset(self) -> None:
+        if self.mtp_graph is not None:
+            self.mtp_graph.graph.reset()
+            self.mtp_graph = None
         for prefill_graph in self.prefill_graphs.values():
             prefill_graph.graph.reset()
         self.decode_graph.graph.reset()
@@ -555,6 +768,17 @@ class RwkvGenerationMixin(GenerationMixin):
         self.generation_config.penalty_decay = getattr(self.generation_config, "penalty_decay", 0.996)
 
     def _validate_generation_mode(self, generation_mode, generation_config, generation_mode_kwargs):
+        if generation_mode == GenerationMode.ASSISTED_GENERATION:
+            if (
+                not generation_config.use_mtp
+                or generation_mode_kwargs.get("assistant_model") is not None
+                or generation_config.prompt_lookup_num_tokens is not None
+                or generation_config.assistant_early_exit is not None
+            ):
+                raise ValueError("RWKV-7 assisted generation supports only built-in LightMTP (`use_mtp=True`).")
+            if self.mtp is None or generation_config.do_sample:
+                raise ValueError("LightMTP requires a loaded MTP head and greedy generation (`do_sample=False`).")
+            generation_mode = GenerationMode.GREEDY_SEARCH
         super()._validate_generation_mode(generation_mode, generation_config, generation_mode_kwargs)
         if generation_config.token_healing:
             raise ValueError("RWKV-7 CUDA graph generation does not support token healing.")
@@ -707,6 +931,10 @@ class RwkvGenerationMixin(GenerationMixin):
             synced_gpus,
             model_kwargs,
         )
+        mtp_depth = 0
+        if self.mtp is not None and not generation_config.do_sample:
+            mtp_depth = min(self.config.mtp_depth, max_length - input_ids.shape[1] - 1)
+        use_mtp = generation_config.use_mtp is not False and mtp_depth > 0
         key = self._graph_generation_key(
             input_ids,
             generation_config,
@@ -716,6 +944,7 @@ class RwkvGenerationMixin(GenerationMixin):
             model_kwargs.get("tokenizer"),
             self.config.wkv_mode,
         )
+        key += (mtp_depth,)
         key += tuple(
             (
                 name,
@@ -755,7 +984,14 @@ class RwkvGenerationMixin(GenerationMixin):
                     max_length,
                     eos_token_ids,
                     stop_string_criteria,
+                    mtp_depth,
                 )
                 cache[key] = runner
+            if use_mtp and runner.mtp_graph is None:
+                runner.mtp_graph = _RwkvMtpDecodeGraph(
+                    self, runner.decode_graph, runner.capture_stream, runner.graph_pool
+                )
             seed = torch.empty((), dtype=torch.int64).random_().item()
-            return runner.generate(input_ids, seed, streamer)
+            return runner.generate(input_ids, seed, streamer, use_mtp=use_mtp)
+
+    _assisted_decoding = _sample

@@ -14,6 +14,7 @@
 
 import importlib.util
 import itertools
+import json
 import tempfile
 import threading
 import unittest
@@ -35,6 +36,7 @@ from ...test_configuration_common import ConfigTester
 
 if is_torch_available():
     import torch
+    from safetensors.torch import save_file
 
     from transformers import RwkvForCausalLM, RwkvModel
     from transformers.models.rwkv.modeling_rwkv import RwkvCache
@@ -71,9 +73,158 @@ class RwkvConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires an RWKV-7 checkpoint"):
             RwkvConfig.from_dict({"model_type": "rwkv", "rescale_every": 6})
 
+    def test_mtp_config_validation(self):
+        self.assertEqual(tiny_config().mtp_intermediate_size, 224)
+        for kwargs in (
+            {"mtp_depth": -1},
+            {"mtp_intermediate_size": 0},
+            {"mtp_loss_scaling_factor": -1.0},
+            {"train_mtp": True},
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                tiny_config(**kwargs)
+
+    def test_legacy_checkpoint_and_irwkv_sidecar_loading(self):
+        model = RwkvForCausalLM(tiny_config())
+        reference = RwkvForCausalLM(tiny_config(mtp_depth=3, mtp_intermediate_size=96, mtp_norm_epsilon=2e-5))
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as integrated:
+            model.save_pretrained(directory)
+            model_dir = Path(directory)
+            config_path = model_dir / "config.json"
+            config = json.loads(config_path.read_text())
+            config_path.write_text(json.dumps({key: value for key, value in config.items() if "mtp" not in key}))
+            loaded, info = RwkvForCausalLM.from_pretrained(directory, output_loading_info=True)
+            self.assertEqual(info["missing_keys"], set())
+            self.assertEqual(info["unexpected_keys"], set())
+            self.assertEqual(loaded.config.mtp_depth, 0)
+            self.assertIsNone(loaded.mtp)
+            torch.testing.assert_close(loaded.state_dict(), model.state_dict(), rtol=0, atol=0)
+
+            (model_dir / "mtp_config.json").write_text(
+                json.dumps(
+                    {
+                        "mtp_type": "lightmlp",
+                        "mtp_depth": 3,
+                        "mtp_loop": True,
+                        "hidden_size": 64,
+                        "intermediate_size": 96,
+                        "norm_eps": 2e-5,
+                        "num_blocks": 1,
+                        "shared_lm_head": True,
+                        "weight_file": "mtp.safetensors",
+                    }
+                )
+            )
+            save_file(reference.mtp.state_dict(prefix="mtp.blocks.0."), model_dir / "mtp.safetensors")
+            loaded.load_mtp_sidecar(model_dir)
+            self.assertEqual(loaded.config.mtp_depth, 3)
+            self.assertEqual(loaded.mtp.norm_out.eps, 2e-5)
+            torch.testing.assert_close(loaded.mtp.state_dict(), reference.mtp.state_dict(), rtol=0, atol=0)
+            torch.testing.assert_close(loaded.lm_head.weight, model.lm_head.weight, rtol=0, atol=0)
+            loaded.save_pretrained(integrated)
+            restored = RwkvForCausalLM.from_pretrained(integrated)
+            self.assertEqual(restored.mtp.norm_out.eps, 2e-5)
+            torch.testing.assert_close(restored.state_dict(), loaded.state_dict(), rtol=0, atol=0)
+
 
 @require_torch_gpu
 class RwkvBF16ProviderTest(unittest.TestCase):
+    def test_lightmtp_training(self):
+        torch.manual_seed(117)
+        model = RwkvForCausalLM(tiny_config(mtp_depth=3, train_mtp=True)).cuda().bfloat16().train()
+        ids = torch.randint(1, model.config.vocab_size, (2, 9), device="cuda")
+        labels = ids.clone()
+        labels[0, -2:] = -100
+        output = model(ids, labels=labels, use_cache=False)
+        self.assertTrue(output.loss.isfinite())
+        output.loss.backward()
+        for parameter in model.mtp.parameters():
+            self.assertTrue(parameter.grad.isfinite().all())
+            self.assertGreater(parameter.grad.abs().sum().item(), 0)
+        self.assertTrue(all(parameter.grad is None for parameter in model.model.parameters()))
+        self.assertIsNone(model.lm_head.weight.grad)
+
+        model.zero_grad(set_to_none=True)
+        base_loss = model(ids, labels=labels, use_cache=False, train_mtp=False).loss
+        model.config.mtp_loss_scaling_factor = 0.4
+        joint = model(ids, labels=labels, use_cache=False, train_mtp=False)
+        torch.testing.assert_close(joint.loss, base_loss + 0.4 * output.loss, rtol=0, atol=0)
+        joint.loss.backward()
+        self.assertGreater(model.lm_head.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.mtp.proj.weight.grad.abs().sum().item(), 0)
+
+    @torch.no_grad()
+    def test_lightmtp_batch_generation_and_state_memory(self):
+        torch.manual_seed(117)
+        config = tiny_config(hidden_size=128, num_hidden_layers=8, mtp_depth=3, mtp_intermediate_size=128)
+        model = RwkvForCausalLM(config).cuda().bfloat16().eval()
+        # The base predicts its input token. Bias the drafter toward token 1 so only the first row accepts drafts.
+        for name, parameter in model.named_parameters():
+            if name.startswith("model.layers.") and parameter.ndim == 2:
+                parameter.normal_(std=0.005)
+        for weight in (model.model.embed_tokens.weight, model.lm_head.weight):
+            weight.copy_(torch.eye(model.config.vocab_size, config.hidden_size, device="cuda", dtype=torch.bfloat16))
+        model.mtp.proj.weight.zero_()
+        model.mtp.down.weight.zero_()
+        model.mtp.norm_out.bias[1] = 20
+        for batch_size, mode in itertools.product((1, 4), ("fp32io16", "fp16")):
+            with self.subTest(batch_size=batch_size, mode=mode):
+                config.wkv_mode = mode
+                ids = torch.arange(1, batch_size + 1, device="cuda")[:, None].expand(-1, 4).contiguous()
+                kwargs = {"max_new_tokens": 8, "do_sample": False, "eos_token_id": None, "prefill_chunk_size": 2}
+                expected = model.generate(ids, use_mtp=False, **kwargs)
+                torch.testing.assert_close(expected[:, ids.shape[1] :], ids[:, :1].expand(-1, 8), rtol=0, atol=0)
+                runner = next(iter(model._rwkv_generation_graphs.values()))
+                expected_wkv = [
+                    runner.state.get_recurrent_state(layer).clone() for layer in range(config.num_hidden_layers)
+                ]
+                expected_attention = runner.state.attention_shift.clone()
+                expected_ffn = runner.state.feed_forward_shift.clone()
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
+                actual = model.generate(ids, use_mtp=True, **kwargs)
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated() - allocated
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertEqual(len(model._rwkv_generation_graphs), 1)
+
+                verify = runner.mtp_graph.state
+                width = config.mtp_depth + 1
+                scratch_bytes = batch_size * config.hidden_size * config.head_size * (2 if mode == "fp16" else 4)
+                saved_bytes = 7 * config.num_hidden_layers * batch_size * width * config.hidden_size * 2
+                self.assertEqual(verify.scratch_wkv.memory_layout["total_nbytes"], scratch_bytes)
+                self.assertEqual(
+                    verify.saved_wkv.nbytes + verify.saved_tmix_norm.nbytes + verify.saved_cmix_norm.nbytes,
+                    saved_bytes,
+                )
+                self.assertGreaterEqual(peak, scratch_bytes + saved_bytes)
+                # The graphs also allocate transient activations and TileLang workspaces.
+                self.assertLess(peak, scratch_bytes + saved_bytes + 2 * 1024**2)
+                for layer, state in enumerate(expected_wkv):
+                    dtype = torch.int16 if mode == "fp16" else torch.int32
+                    self.assertTrue(
+                        torch.equal(runner.state.get_recurrent_state(layer).view(dtype), state.view(dtype))
+                    )
+                torch.testing.assert_close(runner.state.attention_shift, expected_attention, rtol=0, atol=0)
+                torch.testing.assert_close(runner.state.feed_forward_shift, expected_ffn, rtol=0, atol=0)
+
+                replay = runner.mtp_graph.replay
+                first_prefixes = []
+
+                def record_prefixes(hidden_states):
+                    if first_prefixes:
+                        return replay(hidden_states)
+                    lengths = runner.decode_graph.completion_lengths.clone()
+                    hidden_states = replay(hidden_states)
+                    first_prefixes.extend((runner.decode_graph.completion_lengths - lengths).tolist())
+                    return hidden_states
+
+                with mock.patch.object(runner.mtp_graph, "replay", side_effect=record_prefixes):
+                    torch.testing.assert_close(model.generate(ids, **kwargs), expected, rtol=0, atol=0)
+                self.assertEqual(first_prefixes, [width] + [1] * (batch_size - 1))
+                model._rwkv_generation_graphs.clear()
+
     def test_fp16_state_inference_preserves_fp32_training(self):
         torch.manual_seed(117)
         model = RwkvForCausalLM(tiny_config()).to(device="cuda", dtype=torch.bfloat16)
@@ -325,7 +476,7 @@ class RwkvBF16ProviderTest(unittest.TestCase):
                 self.threads.append(threading.get_ident())
 
         torch.manual_seed(116)
-        model = RwkvForCausalLM(tiny_config()).cuda().bfloat16().eval()
+        model = RwkvForCausalLM(tiny_config(mtp_depth=2)).cuda().bfloat16().eval()
         with torch.no_grad():
             for parameter in model.parameters():
                 if parameter.ndim >= 2:
@@ -333,25 +484,30 @@ class RwkvBF16ProviderTest(unittest.TestCase):
             ids = torch.randint(1, model.config.vocab_size, (2, 7), device="cuda")
             first_tokens = model(ids, use_cache=False, logits_to_keep=1).logits[:, -1].argmax(-1)
         self.assertNotEqual(first_tokens[0].item(), first_tokens[1].item())
-        streamer = Streamer()
-        generated = model.generate(
-            ids,
-            max_new_tokens=4,
-            prefill_chunk_size=3,
-            do_sample=False,
-            eos_token_id=first_tokens[0].item(),
-            pad_token_id=0,
-            streamer=streamer,
-        )
-        completion = generated[:, ids.shape[1] :].cpu()
-        self.assertGreater(completion.shape[1], 1)
-        torch.testing.assert_close(completion[:, 0], first_tokens.cpu())
-        torch.testing.assert_close(completion[0, 1:], torch.zeros_like(completion[0, 1:]))
-        torch.testing.assert_close(streamer.values[0], ids.cpu())
-        self.assertTrue(all(value.is_pinned() for value in streamer.values[1:]))
-        torch.testing.assert_close(torch.stack(streamer.values[1:], dim=1), completion)
-        self.assertEqual(streamer.threads[0], threading.get_ident())
-        self.assertTrue(all(thread != threading.get_ident() for thread in streamer.threads[1:]))
+        completions = []
+        for use_mtp in (False, True):
+            streamer = Streamer()
+            generated = model.generate(
+                ids,
+                max_new_tokens=4,
+                prefill_chunk_size=3,
+                do_sample=False,
+                use_mtp=use_mtp,
+                eos_token_id=first_tokens[0].item(),
+                pad_token_id=0,
+                streamer=streamer,
+            )
+            completion = generated[:, ids.shape[1] :].cpu()
+            completions.append(completion)
+            self.assertGreater(completion.shape[1], 1)
+            torch.testing.assert_close(completion[:, 0], first_tokens.cpu())
+            torch.testing.assert_close(completion[0, 1:], torch.zeros_like(completion[0, 1:]))
+            torch.testing.assert_close(streamer.values[0], ids.cpu())
+            self.assertTrue(all(value.is_pinned() for value in streamer.values[1:]))
+            torch.testing.assert_close(torch.stack(streamer.values[1:], dim=1), completion)
+            self.assertEqual(streamer.threads[0], threading.get_ident())
+            self.assertTrue(all(thread != threading.get_ident() for thread in streamer.threads[1:]))
+        torch.testing.assert_close(*completions, rtol=0, atol=0)
 
     def test_packing_matches_independent_sequences(self):
         from transformers import DataCollatorWithFlattening
